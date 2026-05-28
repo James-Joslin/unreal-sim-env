@@ -1,0 +1,5 @@
+{
+  "name": "Combat Sandbox",
+  "description": "An interactive, combat simulation to test AI behaviors and ONNX models against scripted and player targets.",
+  "requestFramePermissions": []
+}
