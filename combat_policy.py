@@ -57,23 +57,23 @@ import torch.nn.functional as F
 #  Constants (must match C++ NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 198
+OBS_SIZE = 206
 MOVEMENT_ACTIONS = 9
 COMBAT_ACTIONS = 7
 TARGET_ACTIONS = 5
 
 DEFAULT_FRAME_STACK = 3
 
-# Observation layout: feature group boundaries within one 198-float frame.
+# Observation layout: feature group boundaries within one 206-float frame.
 # Unique features = everything EXCEPT hostile/ally entity slots.
-_UNIQUE_RANGES = [(0, 70), (158, 198)]    # self+weapon+arch+target, spatial+threat+nav+group+spawn
+_UNIQUE_RANGES = [(0, 70), (158, 206)]    # self+weapon+arch+target, spatial+threat+nav+group+spawn+extended
 _HOSTILE_START = 70                        # 4 slots × 13 features
 _HOSTILE_SLOTS = 4
 _HOSTILE_SLOT_SIZE = 13
 _ALLY_START = 122                          # 3 slots × 12 features
 _ALLY_SLOTS = 3
 _ALLY_SLOT_SIZE = 12
-_UNIQUE_SIZE = 110                         # 70 + 40
+_UNIQUE_SIZE = 118                         # 70 + 48 (was 110 = 70+40, now +8 new features)
 
 # Logit bounding (same as before).
 LOGIT_SCALE = 3.0
@@ -107,82 +107,88 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 # ─────────────────────────────────────────────────────────────────
 
 class StructuredEncoder(nn.Module):
-    """Encodes one 198-float frame into a compact embedding.
+    """Encodes one 206-float frame into a compact embedding.
 
-    Splits features into unique/hostile/ally groups, encodes each
-    with appropriately-sized networks, and concatenates the results.
-    The hostile and ally encoders use weight sharing across entity slots.
-
-    Output dim = unique_dim + entity_dim + entity_dim (= channel_dim).
+    Splits features into unique/hostile/ally/threat groups, encodes each
+    with weight-shared layers, and concatenates the results.
     """
 
     def __init__(self, entity_dim: int = 16, unique_dim: int = 32):
         super().__init__()
         self.entity_dim = entity_dim
         self.unique_dim = unique_dim
-        self.channel_dim = unique_dim + entity_dim + entity_dim
+        
+        # New permutation-invariant threat dimension
+        self.threat_dim = entity_dim 
+        
+        # Total output dimensions automatically scales (backbones adapt dynamically)
+        self.channel_dim = unique_dim + entity_dim + entity_dim + self.threat_dim
 
-        # Unique features: self + weapon + archetype + target + spatial + threat + nav + group + spawn
+        # Unique features tracking self and global metrics
         self.unique_encoder = nn.Sequential(
-            layer_init(nn.Linear(_UNIQUE_SIZE, unique_dim)),
+            layer_init(nn.Linear(118, unique_dim)),
             nn.GELU(),
         )
 
-        # Shared hostile slot encoder (13 → entity_dim), applied to each of 4 slots.
+        # Shared hostile slot encoder (13 → entity_dim)
         self.hostile_encoder = nn.Sequential(
             layer_init(nn.Linear(_HOSTILE_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-        # Shared ally slot encoder (12 → entity_dim), applied to each of 3 slots.
+        # Shared ally slot encoder (12 → entity_dim)
         self.ally_encoder = nn.Sequential(
             layer_init(nn.Linear(_ALLY_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-    def forward(self, frame: torch.Tensor) -> torch.Tensor:
-        """Encode a single frame (or batch of frames).
+        # ─── ADDED: Shared Dynamic Threat (Projectile) Encoder ───
+        # Each projectile entity is parameterized by: (distance, heading_x, heading_y)
+        self.threat_slot_encoder = nn.Sequential(
+            layer_init(nn.Linear(3, self.threat_dim)),
+            nn.GELU(),
+        )
 
-        Args:
-            frame: [batch, 198] single observation frame.
-        Returns:
-            [batch, channel_dim] embedding.
-        """
+    def forward(self, frame: torch.Tensor) -> torch.Tensor:
         batch = frame.shape[0]
 
-        # ── Extract feature groups ──
-        # Unique: indices [0:70] and [158:198], concatenated.
+        # 1. Unique features (retains absolute proximity ranking for global fallback)
         unique_feats = torch.cat([
             frame[:, 0:70],
-            frame[:, 158:198],
-        ], dim=-1)  # [batch, 110]
-
-        # Hostile slots: [70:122] reshaped to [batch, 4, 13].
-        hostile_feats = frame[:, _HOSTILE_START:_HOSTILE_START + _HOSTILE_SLOTS * _HOSTILE_SLOT_SIZE]
-        hostile_feats = hostile_feats.view(batch, _HOSTILE_SLOTS, _HOSTILE_SLOT_SIZE)
-
-        # Ally slots: [122:158] reshaped to [batch, 3, 12].
-        ally_feats = frame[:, _ALLY_START:_ALLY_START + _ALLY_SLOTS * _ALLY_SLOT_SIZE]
-        ally_feats = ally_feats.view(batch, _ALLY_SLOTS, _ALLY_SLOT_SIZE)
-
-        # ── Encode ──
+            frame[:, 158:OBS_SIZE],
+        ], dim=-1)  # [batch, 118]
         unique_emb = self.unique_encoder(unique_feats)  # [batch, unique_dim]
 
-        # Shared hostile encoder: reshape to [batch*4, 13], encode, reshape back.
+        # 2. Shared Hostile Encoder
+        hostile_feats = frame[:, _HOSTILE_START:_HOSTILE_START + _HOSTILE_SLOTS * _HOSTILE_SLOT_SIZE]
+        hostile_feats = hostile_feats.view(batch, _HOSTILE_SLOTS, _HOSTILE_SLOT_SIZE)
         hostile_flat = hostile_feats.reshape(batch * _HOSTILE_SLOTS, _HOSTILE_SLOT_SIZE)
-        hostile_embs = self.hostile_encoder(hostile_flat)  # [batch*4, entity_dim]
-        hostile_embs = hostile_embs.view(batch, _HOSTILE_SLOTS, self.entity_dim)
-        hostile_pooled = torch.amax(hostile_embs, dim=1)  # [batch, entity_dim]
+        hostile_embs = self.hostile_encoder(hostile_flat).view(batch, _HOSTILE_SLOTS, self.entity_dim)
+        hostile_pooled = hostile_embs.max(dim=1).values  # [batch, entity_dim]
 
-        # Shared ally encoder: reshape to [batch*3, 12], encode, reshape back.
+        # 3. Shared Ally Encoder
+        ally_feats = frame[:, _ALLY_START:_ALLY_START + _ALLY_SLOTS * _ALLY_SLOT_SIZE]
+        ally_feats = ally_feats.view(batch, _ALLY_SLOTS, _ALLY_SLOT_SIZE)
         ally_flat = ally_feats.reshape(batch * _ALLY_SLOTS, _ALLY_SLOT_SIZE)
-        ally_embs = self.ally_encoder(ally_flat)  # [batch*3, entity_dim]
-        ally_embs = ally_embs.view(batch, _ALLY_SLOTS, self.entity_dim)
-        ally_pooled = torch.amax(ally_embs, dim=1) # [batch, entity_dim]
+        ally_embs = self.ally_encoder(ally_flat).view(batch, _ALLY_SLOTS, self.entity_dim)
+        ally_pooled = ally_embs.max(dim=1).values  # [batch, entity_dim]
 
-        # ── Combine ──
-        return torch.cat([unique_emb, hostile_pooled, ally_pooled], dim=-1)
+        # 4. ─── Shared Projectile Threat Encoder with Symmetric Max-Pooling ───
+        # Extract features for Threat 1, 2, and 3: (distance, heading_x, heading_y)
+        t1 = torch.stack([frame[:, 174], frame[:, 176], frame[:, 177]], dim=-1) # nearest
+        t2 = torch.stack([frame[:, 198], frame[:, 199], frame[:, 200]], dim=-1) # second-nearest
+        t3 = torch.stack([frame[:, 201], frame[:, 202], frame[:, 203]], dim=-1) # third-nearest
+        
+        # Reshape to slot tensor: [batch, 3_slots, 3_features]
+        threats_feats = torch.stack([t1, t2, t3], dim=1)
+        threats_flat = threats_feats.reshape(batch * 3, 3)
+        threats_embs = self.threat_slot_encoder(threats_flat).view(batch, 3, self.threat_dim)
+        
+        # Apply max pooling along slot dimension for true translation & swap invariance
+        threats_pooled = threats_embs.max(dim=1).values  # [batch, threat_dim]
 
+        # 5. Concatenate everything adaptively (channels are packed cleanly)
+        return torch.cat([unique_emb, hostile_pooled, ally_pooled, threats_pooled], dim=-1)
 
 # ─────────────────────────────────────────────────────────────────
 #  Delta Encoding Module (no learnable params)

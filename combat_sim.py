@@ -54,7 +54,7 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 #  Constants (match NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 198
+OBS_SIZE = 206  # Was 198. Added: 2nd/3rd projectile (6), threat count (1), kills fraction (1)
 MOVEMENT_ACTIONS = 9
 COMBAT_ACTIONS = 7
 TARGET_ACTIONS = 5
@@ -2257,22 +2257,17 @@ class CombatEnv(gym.Env):
             obs[idx] = 1.0 if is_low_cover else 0; idx += 1
 
         # ── Threat Sensing (8) ───────────────────────────────────
-        # [Audit §1.4] Matches C++ GatherThreatSensing:
-        #   - Scans self._projectiles for incoming enemy projectiles
-        #   - Filters by dot(vel_dir, to_me) > 0.5 (heading toward agent)
-        #   - Reports projectile VELOCITY direction (not direction-to-agent)
-        #   - TTA normalised as clamp(dist/speed, 0, 2) / 2.0
-        #   - Scans targets for melee threats within MeleeThreatDistance
-        scan_radius = 600.0   # C++ DodgeComp->ThreatScanRadius default
-        melee_threat_dist = 350.0  # C++ DodgeComp->MeleeThreatDistance default
+        # [Audit §1.4] Matches C++ GatherThreatSensing.
+        # Now tracks top-3 nearest incoming projectiles for multi-threat evasion.
+        scan_radius = 600.0
+        melee_threat_dist = 350.0
 
-        nearest_proj_dist_n = 1.0   # Normalised (1 = safe/none)
-        nearest_proj_tta_n = 1.0
-        nearest_proj_dir = np.zeros(2, dtype=np.float32)
+        # Collect ALL incoming threats, then sort by distance.
+        incoming_threats = []  # list of (norm_dist, tta_n, dir_x, dir_y)
 
         for p in self._projectiles:
             if not p.alive or p.is_agent_projectile:
-                continue  # Only enemy projectiles
+                continue
             rel = a.pos - p.pos
             dist = np.linalg.norm(rel)
             if dist > scan_radius:
@@ -2280,18 +2275,29 @@ class CombatEnv(gym.Env):
             speed = np.linalg.norm(p.velocity)
             if speed < 1e-3:
                 continue
-            # Check projectile is heading roughly toward agent.
             vel_dir = p.velocity / speed
             to_me = rel / max(dist, 1.0)
             if float(np.dot(vel_dir, to_me)) <= 0.5:
                 continue
             norm_dist = min(dist / scan_radius, 1.0)
-            if norm_dist < nearest_proj_dist_n:
-                nearest_proj_dist_n = norm_dist
-                nearest_proj_dir = vel_dir  # Fix (b): velocity dir, not toward-agent
-                nearest_proj_tta_n = min(dist / speed, 2.0) / 2.0  # Fix (c): /2.0
+            tta_n = min(dist / speed, 2.0) / 2.0
+            incoming_threats.append((norm_dist, tta_n, vel_dir[0], vel_dir[1]))
 
-        # Nearest melee threat (player party characters rushing us).
+        # Sort by distance (nearest first).
+        incoming_threats.sort(key=lambda t: t[0])
+        threat_count = len(incoming_threats)
+
+        # Extract top-3 (pad with safe defaults if fewer).
+        def get_threat(idx):
+            if idx < len(incoming_threats):
+                return incoming_threats[idx]
+            return (1.0, 1.0, 0.0, 0.0)  # safe defaults
+
+        t1 = get_threat(0)  # nearest (goes to existing indices 174-177)
+        t2 = get_threat(1)  # 2nd nearest (goes to new indices 198-200)
+        t3 = get_threat(2)  # 3rd nearest (goes to new indices 201-203)
+
+        # Nearest melee threat.
         nearest_melee_dist_n = 1.0
         nearest_melee_dir = np.zeros(2, dtype=np.float32)
         for t in self.targets:
@@ -2303,18 +2309,18 @@ class CombatEnv(gym.Env):
             norm_dist = min(dist / melee_threat_dist, 1.0)
             if norm_dist < nearest_melee_dist_n:
                 nearest_melee_dist_n = norm_dist
-                # C++ direction: from agent toward threat (GetSafeNormal of TheirPos - MyPos)
                 melee_rel = t.pos - a.pos
                 melee_d = np.linalg.norm(melee_rel)
                 nearest_melee_dir = melee_rel / max(melee_d, 1.0)
 
-        obs[idx] = nearest_proj_dist_n; idx += 1              # 174 proj dist
-        obs[idx] = nearest_proj_tta_n; idx += 1               # 175 proj TTA
-        obs[idx] = nearest_proj_dir[0]; idx += 1              # 176 proj dir X
-        obs[idx] = nearest_proj_dir[1]; idx += 1              # 177 proj dir Y
-        obs[idx] = nearest_melee_dist_n; idx += 1             # 178 melee dist
-        obs[idx] = nearest_melee_dir[0]; idx += 1             # 179 melee dir X
-        obs[idx] = nearest_melee_dir[1]; idx += 1             # 180 melee dir Y
+        # Existing threat features (indices 174-181, unchanged).
+        obs[idx] = t1[0]; idx += 1              # 174 proj 1 dist
+        obs[idx] = t1[1]; idx += 1              # 175 proj 1 TTA
+        obs[idx] = t1[2]; idx += 1              # 176 proj 1 dir X
+        obs[idx] = t1[3]; idx += 1              # 177 proj 1 dir Y
+        obs[idx] = nearest_melee_dist_n; idx += 1  # 178 melee dist
+        obs[idx] = nearest_melee_dir[0]; idx += 1  # 179 melee dir X
+        obs[idx] = nearest_melee_dir[1]; idx += 1  # 180 melee dir Y
         obs[idx] = 1.0 if a.dodge_cooldown_remaining <= 0 else 0; idx += 1  # 181 dodge avail
 
         # ── Navmesh Viability (9) ────────────────────────────────
@@ -2351,9 +2357,25 @@ class CombatEnv(gym.Env):
 
         # ── Spawn Leash (1) ──────────────────────────────────────
         spawn_dist = np.linalg.norm(a.pos - a.spawn_pos)
-        # [Audit §1.9] C++ normalises by CombatLeashRange, not a fixed 5000.
         leash_norm = a.combat_leash_range if a.combat_leash_range > 0 else 5000.0
-        obs[idx] = float(np.clip(spawn_dist / leash_norm, 0.0, 1.0))
+        obs[idx] = float(np.clip(spawn_dist / leash_norm, 0.0, 1.0)); idx += 1
+
+        # ── Extended Threat Sensing (7) ─────────────────────────
+        # 2nd nearest incoming projectile (dist, dir_x, dir_y).
+        obs[idx] = t2[0]; idx += 1                             # 198 proj 2 dist
+        obs[idx] = t2[2]; idx += 1                             # 199 proj 2 dir X
+        obs[idx] = t2[3]; idx += 1                             # 200 proj 2 dir Y
+        # 3rd nearest incoming projectile (dist, dir_x, dir_y).
+        obs[idx] = t3[0]; idx += 1                             # 201 proj 3 dist
+        obs[idx] = t3[2]; idx += 1                             # 202 proj 3 dir X
+        obs[idx] = t3[3]; idx += 1                             # 203 proj 3 dir Y
+        # Total incoming threat count (normalised by 5).
+        obs[idx] = min(threat_count / 5.0, 1.0); idx += 1     # 204 threat count
+
+        # ── Targets Killed Fraction (1) ─────────────────────────
+        total_hostiles = len([t for t in self.targets if not t.is_player_controlled])
+        killed_hostiles = len([t for t in self.targets if not t.is_player_controlled and not t.alive])
+        obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 205 kills fraction
 
         return obs
 
@@ -2984,22 +3006,18 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
             enemy_hp=130, enemy_defence=25,
             target_hp=100, target_defence=25),
 
-        # Stage 5: 3-target introduction. Same arena as stage 4 but with
-        # a 3rd target and slightly more obstacles. This bridges the gap:
-        # the agent learns 3-target prioritisation in the familiar 2500 arena
-        # before stage 6 adds the bigger arena and heavier obstacles.
-        # Previously this was 3000 arena + 8 obstacles — too big a jump
-        # from stage 4's 2500 arena + 4 obstacles. The agent couldn't learn
-        # 3-target priority AND bigger-arena navigation simultaneously.
+        # Stage 5: Archetype-specific. Full weapon kit, varied targets.
         5: CombatEnvConfig(
-            num_enemies=1, num_targets=3, num_obstacles=5,
-            arena_size=2500.0,
+            num_enemies=1, num_targets=3, num_obstacles=8,
+            arena_size=3000.0,
             curriculum_stage=5, archetype=archetype,
             weapon_preset="heavy",
-            target_speed_fraction=0.75,
-            engagement_distance=1500, max_steps=500,
-            enemy_hp=180, enemy_defence=25,
-            target_hp=100, target_defence=25),
+            weapon_pool=["heavy", "scout", "sniper", "tank"],
+            target_speed_fraction=0.8,
+            engagement_distance=1500, max_steps=600,   # [Fix] Was 1000. Defense-in-depth
+            enemy_hp=150, enemy_defence=25,             # against per-step shaping accumulation.
+            target_hp=100, target_defence=25),          # 3 targets × ~100 steps each = ~300 steps
+                                                        # to kill. 600 = 2× expected completion.
 
         # Stage 6: Multi-target coordination. More agent HP to survive.
         6: CombatEnvConfig(
