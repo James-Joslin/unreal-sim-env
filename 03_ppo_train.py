@@ -374,7 +374,7 @@ class PPOConfig:
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.1
+    clip_range: float = 0.06
     vf_clip_range: float = 10.0     # Value function clipping — prevents
                                      # huge value updates at stage transitions.
     entropy_coef: float = 0.01       # Was 0.05. Start of entropy anneal range.
@@ -385,7 +385,7 @@ class PPOConfig:
     num_steps: int = 196             # Steps per env per rollout.
                                      # Total transitions = num_steps × num_envs.
     mini_batch_size: int = 256
-    update_epochs: int = 8           # Was 8. Reduced — action masking makes
+    update_epochs: int = 4           # Was 8. Reduced — action masking makes
                                      # each step more informative, so fewer
                                      # passes are needed. 8 with masking was
                                      # causing overfitting to rollout data.
