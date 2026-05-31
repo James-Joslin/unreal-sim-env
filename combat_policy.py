@@ -2,18 +2,18 @@
 combat_policy.py — Structured policy network with delta encoding and entity-aware processing.
 
 ARCHITECTURE
-    Input: flat [batch, 633] (3 frames x 211 features, from C++ frame stacking)
+    Input: flat [batch, 645] (3 frames x 215 features, from C++ frame stacking)
 
     Stage 1 — Reshape + Delta Encode (baked into ONNX, zero params):
-        Reshape [batch, 633] → [batch, 3, 211]
+        Reshape [batch, 645] → [batch, 3, 215]
         current      = frames[:, 2]                                    (latest)
         velocity     = frames[:, 2] - frames[:, 1]                    (1st derivative)
         acceleration = frames[:, 2] - 2·frames[:, 1] + frames[:, 0]   (2nd derivative)
 
     Stage 2 — Per-Channel Group Encoding (shared weights across 3 channels):
         For each delta channel:
-            Split 211 features → unique (123) + hostile slots (4x13) + ally slots (3x12) + dynamic threat slots (3x3)
-            unique_emb  = Linear(123, unique_dim) → GELU
+            Split 215 features → unique (127) + hostile slots (4x13) + ally slots (3x12) + dynamic threat slots (3x3)
+            unique_emb  = Linear(127, unique_dim) → GELU
             hostile_emb = shared Linear(13, entity_dim) → GELU, x4 slots, max-pool
             ally_emb    = shared Linear(12, entity_dim) → GELU, x3 slots, max-pool
             threat_emb  = shared Linear(3, entity_dim) → GELU, x3 slots, max-pool
@@ -22,15 +22,15 @@ ARCHITECTURE
     Stage 3 — Policy Backbone:
         Concat 3 channels → MLP backbone → 3 policy heads
 
-OBSERVATION LAYOUT (211 per frame)
+OBSERVATION LAYOUT (215 per frame)
     [  0.. 20]  Self State                        (21)     ─┐
     [ 21.. 42]  Weapon State                      (22)      │
-    [ 43.. 49]  Archetype                         ( 7)      ├─ Unique features (123 total)
+    [ 43.. 49]  Archetype                         ( 7)      ├─ Unique features (127 total)
     [ 50.. 69]  Primary Target                    (20)     ─┘ (+ spatial/threat/nav/metrics below)
     [ 70..121]  Hostile Targets                   (52)  ←── 4 slots x 13 (shared hostile encoder)
     [122..157]  Allied Robots                     (36)  ←── 3 slots x 12 (shared ally encoder)
     [158..165]  Spatial Ring                      ( 8)     ─┐
-    [166..173]  Cover Assessment                  ( 8)      │
+    [166..173]  Cover Height                      ( 8)      │
     [174..181]  Threat Sensing (Projectile 1)     ( 8)      ├─ Unique features (continued)
                 (174: dist, 175: speed, 176: dirX, 177: dirY, etc.) // nearest threat
     [182..190]  Navmesh Viability                 ( 9)      │
@@ -42,6 +42,7 @@ OBSERVATION LAYOUT (211 per frame)
     [205..208]  Can Hit Target Per Weapon         ( 4)      (weapon 1, 2, 3, 4) target availability
     [209..209]  Total Ammo Fraction               ( 1)      Ammo conservation state
     [210..210]  Targets Killed Fraction           ( 1)      Kill urgency tracker
+    [211..214]  Arc Clearance Per Weapon          ( 4)      MaxArcableObstacleHeight / 3000
 
 C++ SIDE: Only change FrameStackCount from 8 to 3. Input stays flat TArray<float>.
 
@@ -65,14 +66,14 @@ import torch.nn.functional as F
 #  Constants (must match C++ NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 211
+OBS_SIZE = 215
 MOVEMENT_ACTIONS = 9
 COMBAT_ACTIONS = 7
 TARGET_ACTIONS = 5
 
 DEFAULT_FRAME_STACK = 3
 
-# Observation layout: feature group boundaries within one 211-float frame.
+# Observation layout: feature group boundaries within one 215-float frame.
 # Unique features = everything EXCEPT hostile/ally entity slots.
 _HOSTILE_START = 70                        # 4 slots x 13 features
 _HOSTILE_SLOTS = 4
@@ -80,7 +81,7 @@ _HOSTILE_SLOT_SIZE = 13
 _ALLY_START = 122                          # 3 slots x 12 features
 _ALLY_SLOTS = 3
 _ALLY_SLOT_SIZE = 12
-_UNIQUE_SIZE = 123                         # 70 (self+weapon+arch+target) + 53 (spatial/threat/nav/metrics)
+_UNIQUE_SIZE = 127                         # 70 (self+weapon+arch+target) + 57 (spatial/cover/threat/nav/metrics/arc)
 
 # Logit bounding (same as before).
 LOGIT_SCALE = 3.0
@@ -114,7 +115,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 # ─────────────────────────────────────────────────────────────────
 
 class StructuredEncoder(nn.Module):
-    """Encodes one 211-float frame into a compact embedding.
+    """Encodes one 215-float frame into a compact embedding.
 
     Splits features into unique/hostile/ally/threat groups, encodes each
     with weight-shared layers, and concatenates the results.
@@ -131,7 +132,7 @@ class StructuredEncoder(nn.Module):
         # Total output dimensions automatically scales (backbones adapt dynamically)
         self.channel_dim = unique_dim + entity_dim + entity_dim + self.threat_dim
 
-        # Unique features tracking self and global metrics (123 inputs total)
+        # Unique features tracking self and global metrics (127 inputs total)
         self.unique_encoder = nn.Sequential(
             layer_init(nn.Linear(_UNIQUE_SIZE, unique_dim)),
             nn.GELU(),
@@ -160,12 +161,13 @@ class StructuredEncoder(nn.Module):
         batch = frame.shape[0]
 
         # 1. Unique features (retains absolute ranking and system metrics)
-        # Includes Self, Weapon, Archetype, Primary Target, plus Spatial, Cover, Threat 1,
-        # Navmesh, Group, Spawn, Threat 2 & 3, threat counts, weapon capabilities, and ammo.
+        # Includes Self, Weapon, Archetype, Primary Target, plus Spatial, Cover Height,
+        # Threat 1, Navmesh, Group, Spawn, Threat 2 & 3, threat counts, weapon
+        # capabilities, ammo, targets killed, and arc clearance.
         unique_feats = torch.cat([
             frame[:, 0:70],
             frame[:, 158:OBS_SIZE],
-        ], dim=-1)  # [batch, 123]
+        ], dim=-1)  # [batch, 127]
         unique_emb = self.unique_encoder(unique_feats)  # [batch, unique_dim]
 
         # 2. Shared Hostile Encoder
@@ -209,8 +211,8 @@ class StructuredEncoder(nn.Module):
 class DeltaEncoder(nn.Module):
     """Reshapes flat frame-stacked input and computes temporal deltas.
 
-    Input:  [batch, frame_stack * 211]  (flat, from C++ frame stacking)
-    Output: [batch, 3, 211]  (current, velocity, acceleration)
+    Input:  [batch, frame_stack * 215]  (flat, from C++ frame stacking)
+    Output: [batch, 3, 215]  (current, velocity, acceleration)
 
     Baked into ONNX — C++ feeds raw flat observations unchanged.
     """
@@ -223,7 +225,7 @@ class DeltaEncoder(nn.Module):
     def forward(self, flat_obs: torch.Tensor) -> torch.Tensor:
         batch = flat_obs.shape[0]
 
-        # Reshape: [batch, N*211] → [batch, N, 211]
+        # Reshape: [batch, N*215] → [batch, N, 215]
         frames = flat_obs.view(batch, self.frame_stack, self.obs_size)
 
         # Delta encoding. Frames are oldest-first: [t-2, t-1, t].
@@ -231,7 +233,7 @@ class DeltaEncoder(nn.Module):
         velocity = frames[:, -1] - frames[:, -2]                       # t - (t-1)
         acceleration = frames[:, -1] - 2.0 * frames[:, -2] + frames[:, -3]  # t - 2(t-1) + (t-2)
 
-        # Stack as [batch, 3, 211]: channels = (current, velocity, acceleration).
+        # Stack as [batch, 3, 215]: channels = (current, velocity, acceleration).
         return torch.stack([current, velocity, acceleration], dim=1)
 
 
@@ -284,16 +286,16 @@ class CombatPolicy(nn.Module):
         """Forward pass.
 
         Args:
-            obs: [batch, frame_stack * 211] flat observations from C++.
+            obs: [batch, frame_stack * 215] flat observations from C++.
         Returns:
             (movement_logits, combat_logits, target_logits) — each [batch, N].
         """
-        # Stage 1: Reshape + delta encode → [batch, 3, 211]
-        deltas = self.delta(obs)  # [batch, 3, 211]
+        # Stage 1: Reshape + delta encode → [batch, 3, 215]
+        deltas = self.delta(obs)  # [batch, 3, 215]
 
         # Stage 2: Encode each delta channel through the shared group encoder.
         batch = deltas.shape[0]
-        # Flatten channels: [batch*3, 211] so encoder processes all at once.
+        # Flatten channels: [batch*3, 215] so encoder processes all at once.
         channels_flat = deltas.view(batch * 3, OBS_SIZE)
         embeddings_flat = self.encoder(channels_flat)  # [batch*3, channel_dim]
         embeddings = embeddings_flat.view(batch, 3 * self.encoder.channel_dim)
