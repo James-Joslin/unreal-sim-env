@@ -1161,11 +1161,11 @@ def run_curriculum(archetype="ranged", bc_checkpoint=None, output_dir="checkpoin
     """Run all 7 curriculum stages sequentially."""
 
     stage_timesteps = {
-        1: 50_000,       # 1v1 no obstacles — learn to approach and shoot
+        1: 50_000,        # 1v1 no obstacles — learn to approach and shoot
         2: 100_000,       # 1v1 with obstacles — learn navigation
-        3: 2_000_000,       # 1v2 — learn target switching
-        4: 4_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon management
-        5: 10_000_000,     # 2v3 — multi-target, ally coordination
+        3: 500_000,       # 1v2 — learn target switching
+        4: 6_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon management
+        5: 10_000_000,    # 2v3 — multi-target, ally coordination
         6: 20_000_000,    # 2v3 full arena — complex navigation
         7: 30_000_000,    # 2v4 full arena — everything together
     }

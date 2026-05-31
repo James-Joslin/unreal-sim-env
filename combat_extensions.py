@@ -609,11 +609,11 @@ class CombatEnvExtended(CombatEnv):
                                 target_ally.alive = False
 
     # ═════════════════════════════════════════════════════════════
-    #  Observation Builder (fills ALL 198 features)
+    #  Observation Builder (fills ALL 215 features)
     # ═════════════════════════════════════════════════════════════
 
     def _build_observation(self) -> np.ndarray:
-        """Override: builds the full 198-float observation with all features."""
+        """Override: builds the full 215-float observation with all features."""
         obs = super()._build_observation()
 
         a = self.agent
@@ -642,10 +642,12 @@ class CombatEnvExtended(CombatEnv):
                 obs[56] = 1.0 if facing_dot > -0.17 else 0.0  # ~100° half-cone
 
             # Target acceleration (velocity delta / dt).
+            # C++ GatherPrimaryTarget writes accel at indices 61-62 (after vel at 59-60).
+            # Base env skips these with `idx += 2`. We fill them here.
             prev_vel = self.prev_target_velocities.get(target.target_id, np.zeros(2, dtype=np.float32))
             accel = (target.velocity - prev_vel) / max(self.cfg.decision_interval, 0.01)
-            obs[63] = np.clip(accel[0] / 2000, -1, 1)  # normalised
-            obs[64] = np.clip(accel[1] / 2000, -1, 1)
+            obs[61] = np.clip(accel[0] / 2000, -1, 1)  # normalised
+            obs[62] = np.clip(accel[1] / 2000, -1, 1)
 
         # ── Hostile Targets: priority and threat scores ──────────
         # [Audit §1.3] Sort by priority score (not distance), matching
@@ -660,6 +662,19 @@ class CombatEnvExtended(CombatEnv):
                 obs[base + 9] = self._compute_threat_level(t)    # threat
 
         # ── Allied Robots ────────────────────────────────────────
+        # Matches C++ GatherAlliedRobots per-slot layout (12 floats each):
+        #   +0  occupied
+        #   +1  rel_x / 5000
+        #   +2  rel_y / 5000
+        #   +3  distance / 5000
+        #   +4  HP fraction
+        #   +5  ammo fraction (GetActiveAmmoFraction)
+        #   +6  is in combat (IsInCombat)
+        #   +7  is dodging (IsDodging)
+        #   +8  archetype scalar ((enum+1)/4.0)
+        #   +9  velocity X / ally max_speed
+        #   +10 velocity Y / ally max_speed
+        #   +11 target hostile index (normalised slot, -1 if none)
         alive_allies_sorted = sorted(
             [ally for ally in self.allies if ally.alive],
             key=lambda ally: np.linalg.norm(ally.pos - a.pos))
@@ -676,13 +691,43 @@ class CombatEnvExtended(CombatEnv):
                 obs[base + 2] = np.clip(rel[1] / 5000, -1, 1)        # rel_y
                 obs[base + 3] = min(dist / 5000, 1.0)                  # distance
                 obs[base + 4] = ally.hp_fraction()                      # HP
-                obs[base + 5] = 1.0 if check_los(a.pos, ally.pos, self.obstacles) else 0.0
-                # Archetype one-hot.
-                for ai in range(4):
-                    obs[base + 6 + ai] = 1.0 if ally.archetype == ai else 0.0
-                # Velocity.
-                obs[base + 10] = np.clip(ally.velocity[0] / 600, -1, 1)
-                obs[base + 11] = np.clip(ally.velocity[1] / 600, -1, 1)
+
+                # [+5] Ammo fraction. C++ reads GetActiveAmmoFraction().
+                # Python AlliedRobot has no weapon system — uses cooldown-based
+                # attacks. 1.0 = always ready (infinite "ammo"). If a weapon
+                # system is added to AlliedRobot later, read it here instead.
+                obs[base + 5] = 1.0
+
+                # [+6] Is in combat. C++ reads AllyPerception->IsInCombat().
+                # Python allies only exist during combat encounters, so always 1.0.
+                obs[base + 6] = 1.0
+
+                # [+7] Is dodging. C++ reads DodgeComp->IsDodging().
+                # Python AlliedRobot doesn't implement dodging.
+                obs[base + 7] = 0.0
+
+                # [+8] Archetype as single scalar. C++ encodes as (enum+1)/4:
+                #   Ranged(0)=0.25, Melee(1)=0.5, Healer(2)=0.75, Tank(3)=1.0
+                obs[base + 8] = (ally.archetype + 1) / 4.0
+
+                # [+9,10] Velocity normalised by ally's own max speed.
+                # C++ uses AMC->MaxWalkSpeed per ally.
+                ally_max_spd = ally.max_speed if ally.max_speed > 0 else 450.0
+                obs[base + 9]  = np.clip(ally.velocity[0] / ally_max_spd, -1, 1)
+                obs[base + 10] = np.clip(ally.velocity[1] / ally_max_spd, -1, 1)
+
+                # [+11] Which hostile slot this ally is targeting.
+                # C++ maps the ally's DetectedTarget to our ScoredTargets list,
+                # then normalises: slot_index / (MaxHostileSlots - 1).
+                # -1.0 if no target or target not in our hostile list.
+                target_slot_norm = -1.0
+                if ally.target_idx < len(self.targets):
+                    ally_target = self.targets[ally.target_idx]
+                    for h in range(min(len(sorted_targets), 4)):
+                        if sorted_targets[h] is ally_target:
+                            target_slot_norm = h / 3.0  # MaxHostileSlots - 1 = 3
+                            break
+                obs[base + 11] = target_slot_norm
 
         # ── Threat Sensing ────────────────────────────────────────
         # [Audit §1.4] Now handled correctly by base env's _build_observation

@@ -15,7 +15,7 @@ WHAT IT REPLICATES
     - Line of sight via 2D raycasting against obstacles
     - Cover detection (low vs full height obstacles)
     - Multiple agents and targets
-    - The exact 198-float observation vector from NeuralCombatTypes.h
+    - The 215-float observation vector from NeuralCombatTypes.h
 
 WHAT IT SIMPLIFIES
     - No navmesh — uses simple AABB collision
@@ -54,7 +54,14 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 #  Constants (match NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 206  # Was 198. Added: 2nd/3rd projectile (6), threat count (1), kills fraction (1)
+OBS_SIZE = 215  # Was 198. New features appended at end:
+                # [198-200] 2nd projectile (dist,dirX,dirY)
+                # [201-203] 3rd projectile (dist,dirX,dirY)
+                # [204]     incoming threat count
+                # [205-208] can_hit_target per weapon slot (4)
+                # [209]     total ammo fraction
+                # [210]     targets killed fraction
+                # [211-214] arc clearance per weapon slot (MaxArcableObstacleHeight / 3000)
 MOVEMENT_ACTIONS = 9
 COMBAT_ACTIONS = 7
 TARGET_ACTIONS = 5
@@ -2150,12 +2157,12 @@ class CombatEnv(gym.Env):
             # This is 1.0 when facing target, 0.0 when perpendicular, -1.0 when facing away.
             obs[idx] = float(np.dot(a.facing, rel / max(dist, 1)))
             idx += 1
-            # Target→self facing: how directly the target is looking at us.
-            # 1.0 = facing directly at agent, 0.0 = facing away.
-            # This is the key flanking signal.
+            # Target→self facing: raw dot product [-1,1] matching C++
+            # ComputeRelativeFacing(Target, Self).
+            # 1.0 = facing directly at agent, -1.0 = facing away.
             to_agent_dir = -rel / max(dist, 1)  # unit vector from target toward agent
             target_facing_dot = float(np.dot(target.facing, to_agent_dir))
-            obs[idx] = max(0.0, target_facing_dot); idx += 1
+            obs[idx] = target_facing_dot; idx += 1
             t_vel = target.velocity
             obs[idx] = np.clip(t_vel[0] / 600, -1, 1); idx += 1
             obs[idx] = np.clip(t_vel[1] / 600, -1, 1); idx += 1
@@ -2189,12 +2196,13 @@ class CombatEnv(gym.Env):
                 obs[idx] = t.hp_fraction(); idx += 1
                 obs[idx] = 1.0 if check_los(a.pos, t.pos, self.obstacles) else 0; idx += 1
                 obs[idx] = 1.0 if t.is_player_controlled else 0; idx += 1
-                # Facing: how directly this hostile is looking at agent.
+                # Facing: C++ ComputeRelativeFacing(Target, Owner), raw dot [-1,1].
+                # 1.0 = facing agent, -1.0 = facing away.
                 to_agent = (a.pos - t.pos)
                 to_agent_d = np.linalg.norm(to_agent)
                 if to_agent_d > 1:
                     facing_dot = float(np.dot(t.facing, to_agent / to_agent_d))
-                    obs[idx] = max(0.0, facing_dot)
+                    obs[idx] = facing_dot
                 else:
                     obs[idx] = 1.0
                 idx += 1
@@ -2241,20 +2249,30 @@ class CombatEnv(gym.Env):
                     blocked_dist = t
             obs[idx] = blocked_dist; idx += 1
 
-        # ── Cover Assessment (8) ─────────────────────────────────
-        # [Audit §1.10] C++ checks bBlocked && bClearAbove where
-        # bClearAbove comes from a high-trace at HighTraceHeight (~300 UU).
-        # An obstacle < 300 UU with clearance above = low cover (arc-able).
-        LOW_COVER_MAX_H = 300.0
+        # ── Cover Height (8) ──────────────────────────────────────
+        # Continuous obstacle height per direction, normalised by 500.
+        # Replaces the former binary cover assessment.
+        #   0.0 = open space (no obstacle in this direction)
+        #   0.1–0.6 = low cover of varying height
+        #   0.7 = full wall (350 / 500, matching C++ HighTraceHeight)
+        # The model compares these against ArcClearance per weapon slot
+        # at [211-214] to decide which weapons can fire over which cover.
+        HIGH_TRACE_HEIGHT = 350.0
         for ang in angles:
             rad = math.radians(ang)
             direction = np.array([math.cos(rad), math.sin(rad)], dtype=np.float32)
             probe = a.pos + direction * 1500
-            is_low_cover = False
+            obstacle_height = 0.0
             for o in self.obstacles:
-                if _ray_aabb_intersect(a.pos, probe, o) and o.height < LOW_COVER_MAX_H:
-                    is_low_cover = True; break
-            obs[idx] = 1.0 if is_low_cover else 0; idx += 1
+                if _ray_aabb_intersect(a.pos, probe, o):
+                    if o.height < HIGH_TRACE_HEIGHT:
+                        # Low cover — report actual height.
+                        obstacle_height = max(obstacle_height, o.height)
+                    else:
+                        # Full wall — cap at HighTraceHeight.
+                        obstacle_height = HIGH_TRACE_HEIGHT
+                    break
+            obs[idx] = min(obstacle_height / 500.0, 1.0); idx += 1
 
         # ── Threat Sensing (8) ───────────────────────────────────
         # [Audit §1.4] Matches C++ GatherThreatSensing.
@@ -2281,21 +2299,21 @@ class CombatEnv(gym.Env):
                 continue
             norm_dist = min(dist / scan_radius, 1.0)
             tta_n = min(dist / speed, 2.0) / 2.0
-            incoming_threats.append((norm_dist, tta_n, vel_dir[0], vel_dir[1]))
+            incoming_threats.append((norm_dist, tta_n, float(vel_dir[0]), float(vel_dir[1])))
 
         # Sort by distance (nearest first).
         incoming_threats.sort(key=lambda t: t[0])
         threat_count = len(incoming_threats)
 
         # Extract top-3 (pad with safe defaults if fewer).
-        def get_threat(idx):
+        def _get_threat(idx):
             if idx < len(incoming_threats):
                 return incoming_threats[idx]
             return (1.0, 1.0, 0.0, 0.0)  # safe defaults
 
-        t1 = get_threat(0)  # nearest (goes to existing indices 174-177)
-        t2 = get_threat(1)  # 2nd nearest (goes to new indices 198-200)
-        t3 = get_threat(2)  # 3rd nearest (goes to new indices 201-203)
+        t1 = _get_threat(0)  # nearest (goes to existing indices 174-177)
+        t2 = _get_threat(1)  # 2nd nearest (goes to new indices 198-200)
+        t3 = _get_threat(2)  # 3rd nearest (goes to new indices 201-203)
 
         # Nearest melee threat.
         nearest_melee_dist_n = 1.0
@@ -2360,22 +2378,64 @@ class CombatEnv(gym.Env):
         leash_norm = a.combat_leash_range if a.combat_leash_range > 0 else 5000.0
         obs[idx] = float(np.clip(spawn_dist / leash_norm, 0.0, 1.0)); idx += 1
 
-        # ── Extended Threat Sensing (7) ─────────────────────────
-        # 2nd nearest incoming projectile (dist, dir_x, dir_y).
+        # ══════════════════════════════════════════════════════════
+        #  NEW FEATURES (indices 198-210, appended after SpawnLeash)
+        # ══════════════════════════════════════════════════════════
+
+        # ── Extended Threat (7) ─────────────────────────────────
         obs[idx] = t2[0]; idx += 1                             # 198 proj 2 dist
         obs[idx] = t2[2]; idx += 1                             # 199 proj 2 dir X
         obs[idx] = t2[3]; idx += 1                             # 200 proj 2 dir Y
-        # 3rd nearest incoming projectile (dist, dir_x, dir_y).
         obs[idx] = t3[0]; idx += 1                             # 201 proj 3 dist
         obs[idx] = t3[2]; idx += 1                             # 202 proj 3 dir X
         obs[idx] = t3[3]; idx += 1                             # 203 proj 3 dir Y
-        # Total incoming threat count (normalised by 5).
         obs[idx] = min(threat_count / 5.0, 1.0); idx += 1     # 204 threat count
+
+        # ── Weapon Can-Hit-Target (4) ───────────────────────────
+        # Per weapon slot: 1.0 if weapon has ammo, target in range,
+        # and path to target exists (LOS for direct, or arc for arc weapons
+        # when target is behind cover). Answers "should I switch?" directly.
+        target = self._current_target()
+        target_dist = np.linalg.norm(a.pos - target.pos) if target and target.alive else 9999
+        target_has_los = check_los(a.pos, target.pos, self.obstacles) if target and target.alive else False
+        target_behind_cover = not target_has_los and target is not None and target.alive
+
+        for wi in range(4):
+            if wi < len(a.weapons):
+                w = a.weapons[wi]
+                in_range = target_dist <= w.weapon_range
+                has_path = target_has_los if not w.can_arc else (target_has_los or target_behind_cover)
+                can_hit = w.has_ammo() and in_range and has_path and not w.is_reloading
+                obs[idx] = 1.0 if can_hit else 0.0
+            idx += 1                                           # 205-208
+
+        # ── Total Ammo Fraction (1) ─────────────────────────────
+        if len(a.weapons) > 0:
+            total_ammo = sum(w.ammo_fraction() for w in a.weapons) / len(a.weapons)
+        else:
+            total_ammo = 0.0
+        obs[idx] = total_ammo; idx += 1                        # 209
 
         # ── Targets Killed Fraction (1) ─────────────────────────
         total_hostiles = len([t for t in self.targets if not t.is_player_controlled])
         killed_hostiles = len([t for t in self.targets if not t.is_player_controlled and not t.alive])
-        obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 205 kills fraction
+        obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 210
+
+        # ── Arc Clearance per Weapon (4) ─────────────────────────
+        # MaxArcableObstacleHeight per weapon slot, normalised by 3000 UU.
+        # The model compares these against CoverHeight per direction [166-173]
+        # to decide which weapons can fire over which cover.
+        #   0.0 = weapon cannot arc (or slot empty)
+        #   1.0 = unlimited clearance (max_arc_height <= 0 means no limit)
+        for wi in range(4):
+            if wi < len(a.weapons):
+                w = a.weapons[wi]
+                if w.can_arc:
+                    if w.max_arc_height <= 0:
+                        obs[idx] = 1.0  # unlimited clearance
+                    else:
+                        obs[idx] = min(w.max_arc_height / 3000.0, 1.0)
+            idx += 1                                               # 211-214
 
         return obs
 
@@ -2991,31 +3051,46 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
             enemy_hp=120, enemy_defence=20,
             target_hp=50, target_defence=20),
 
-        # Stage 4: Multi-weapon. Learn ammo management, switching.
-        # [Fix 1] max_steps reduced from 1000 to 400. At 1000 steps, the
-        # 1.4% of episodes that reached timeout accumulated ~1506 avg reward
-        # from per-step shaping — dwarfing kill (20) and win (50-75) bonuses.
-        # This taught the agent that surviving > killing. At 400 steps, max
-        # per-step accumulation is ~380, well below objective rewards.
+        # Stage 3.5: Heavy weapons, easy targets. Isolates weapon
+        # management learning from survivability. Same targets as S3
+        # (50 HP, defence 20, speed 0.6) but heavy weapon kit (cannon +
+        # missiles + melee). The agent learns switching, ammo management,
+        # arc-vs-direct fire, and reload timing against targets it can
+        # already kill — before S4 doubles the target HP.
         4: CombatEnvConfig(
-            num_enemies=1, num_targets=2, num_obstacles=4,
-            arena_size=2500.0,
+            num_enemies=1, num_targets=2, num_obstacles=8,
+            arena_size=3000.0,
             curriculum_stage=4, archetype=archetype,
-            weapon_preset="heavy", target_speed_fraction=0.7,
-            engagement_distance=1500, max_steps=400,
-            enemy_hp=130, enemy_defence=25,
-            target_hp=100, target_defence=25),
+            weapon_preset="heavy", target_speed_fraction=0.8,
+            engagement_distance=1500, max_steps=500,
+            enemy_hp=100, enemy_defence=20,
+            target_hp=75, target_defence=20),
 
-        # Stage 5: Archetype-specific. Full weapon kit, varied targets.
+        # # Stage 4: Multi-weapon. Learn ammo management, switching.
+        # # [Fix 1] max_steps reduced from 1000 to 400. At 1000 steps, the
+        # # 1.4% of episodes that reached timeout accumulated ~1506 avg reward
+        # # from per-step shaping — dwarfing kill (20) and win (50-75) bonuses.
+        # # This taught the agent that surviving > killing. At 400 steps, max
+        # # per-step accumulation is ~380, well below objective rewards.
+        # 4: CombatEnvConfig(
+        #     num_enemies=1, num_targets=2, num_obstacles=4,
+        #     arena_size=2500.0,
+        #     curriculum_stage=4, archetype=archetype,
+        #     weapon_preset="heavy", target_speed_fraction=0.7,
+        #     engagement_distance=1500, max_steps=400,
+        #     enemy_hp=130, enemy_defence=25,
+        #     target_hp=100, target_defence=25),
+
+        # Stage 5: Archetype-specific. Full weapon kit, varied targets. Introducing alliess
         5: CombatEnvConfig(
-            num_enemies=1, num_targets=3, num_obstacles=8,
+            num_enemies=2, num_targets=3, num_obstacles=8,
             arena_size=3000.0,
             curriculum_stage=5, archetype=archetype,
             weapon_preset="heavy",
             weapon_pool=["heavy", "scout", "sniper", "tank"],
             target_speed_fraction=0.8,
             engagement_distance=1500, max_steps=600,   # [Fix] Was 1000. Defense-in-depth
-            enemy_hp=150, enemy_defence=25,             # against per-step shaping accumulation.
+            enemy_hp=200, enemy_defence=25,             # against per-step shaping accumulation.
             target_hp=100, target_defence=25),          # 3 targets × ~100 steps each = ~300 steps
                                                         # to kill. 600 = 2× expected completion.
 
