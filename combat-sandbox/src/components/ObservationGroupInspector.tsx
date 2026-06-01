@@ -4,7 +4,7 @@ const OBS_GROUPS = [
   { name: "Self State", start: 0, end: 21, color: "#58a6ff", labels: [
     "HP%", "Defence", "Speed%", "Stunned", "Slowed", "Buff0", "Buff1", "Buff2", "Buff3", "Buff4", "Buff5",
     "VelDirX", "VelDirY", "CombatTime", "Height", "IsLocked", "LockProgress", "LockReason",
-    "IsDodging", "DodgeReady", "IsInDodge",
+    "IsDodging", "DodgeReady", "IsInvuln",
   ]},
   { name: "Weapon State", start: 21, end: 43, color: "#ffa657", labels: [
     "ActiveIdx", "Ammo%", "CanFire", "IsReloading", "ReloadProg", "Range", "FireCd",
@@ -17,9 +17,9 @@ const OBS_GROUPS = [
     "Arch0", "Arch1", "Arch2", "Arch3", "OptRange", "AnyAmmo", "MeleeReady",
   ]},
   { name: "Primary Target", start: 50, end: 70, color: "#f85149", labels: [
-    "RelX", "RelY", "Dist", "HP%", "InRange", "HasLOS", "IsAlive", "FacingDot",
+    "RelX", "RelY", "Dist", "HP%", "InRange", "HasLOS", "InSightCone", "SelfFacing",
     "TargetFacingMe", "VelX", "VelY", "AccelX", "AccelY",
-    "HitRadius", "IsPlayer", "BehindLowCover", "CoverHeight", "InMelee", "ClosingRate", "Pad",
+    "AngSize", "IsPlayer", "BehindLowCover", "CoverHeight", "InMelee", "ClosingRate", "Pad",
   ]},
   { name: "Hostile 0", start: 70, end: 83, color: "#da3633" },
   { name: "Hostile 1", start: 83, end: 96, color: "#da3633" },
@@ -29,15 +29,21 @@ const OBS_GROUPS = [
   { name: "Ally 1", start: 134, end: 146, color: "#3fb950" },
   { name: "Ally 2", start: 146, end: 158, color: "#3fb950" },
   { name: "Spatial Ring", start: 158, end: 166, color: "#79c0ff" },
-  { name: "Cover Assess", start: 166, end: 174, color: "#a5d6ff" },
+  { name: "Cover Height", start: 166, end: 174, color: "#a5d6ff" },
   { name: "Threat Sense", start: 174, end: 182, color: "#ff7b72" },
   { name: "Navmesh", start: 182, end: 191, color: "#d2a8ff" },
   { name: "Group Summary", start: 191, end: 197, color: "#8b949e" },
   { name: "Spawn/Leash", start: 197, end: 198, color: "#8b949e" },
+  { name: "Ext Threat", start: 198, end: 205, color: "#ff7b72", labels: [
+    "Proj2Dist", "Proj2DirX", "Proj2DirY", "Proj3Dist", "Proj3DirX", "Proj3DirY", "ThreatCount",
+  ]},
+  { name: "Can Hit", start: 205, end: 209, color: "#ffa657", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
+  { name: "Ammo/Kills", start: 209, end: 211, color: "#8b949e", labels: ["TotalAmmo", "KillFrac"] },
+  { name: "Arc Clearance", start: 211, end: 215, color: "#d2a8ff", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
 ];
 
 const HOSTILE_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "HasLOS", "IsPlayer", "FacingMe", "Score", "Threat", "VelX", "VelY", "FacingDot"];
-const ALLY_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "HasLOS", "Type0", "Type1", "Engage", "Ammo", "VelX", "VelY"];
+const ALLY_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "Ammo", "InCombat", "Dodging", "Archetype", "VelX", "VelY", "TgtSlot"];
 
 interface Props {
   obs: Float32Array | null;
@@ -85,7 +91,7 @@ function ObsValue({ value, prevValue, label, idx }: { value: number; prevValue: 
 
 export function ObservationGroupInspector({ obs }: Props) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const prevObsRef = useRef<Float32Array>(new Float32Array(198));
+  const prevObsRef = useRef<Float32Array>(new Float32Array(215));
 
   useEffect(() => {
     if (obs) {
@@ -119,7 +125,7 @@ export function ObservationGroupInspector({ obs }: Props) {
   return (
     <div style={{ background: "#161b22", borderRadius: 6, border: "1px solid #21262d", padding: 10 }}>
       <div style={{ fontSize: 11, fontWeight: 700, color: "#79c0ff", marginBottom: 6 }}>
-        🔬 Observation Inspector <span style={{ fontWeight: 400, fontSize: 9, color: "#8b949e" }}>(198 features)</span>
+        🔬 Observation Inspector <span style={{ fontWeight: 400, fontSize: 9, color: "#8b949e" }}>(215 features)</span>
       </div>
       {OBS_GROUPS.map((group) => {
         const expanded = expandedGroups.has(group.name);

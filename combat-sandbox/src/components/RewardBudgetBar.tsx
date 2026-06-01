@@ -14,8 +14,8 @@ interface Props {
 // Compute theoretical reward budgets (matches Python reward_budget_analysis)
 function computeBudgets(numTargets: number, maxSteps: number, stage: number) {
   const RW = {
-    damage_dealt: 0.25,
-    kill_target: 20.0,
+    damage_dealt: 0.15,            // Synced with reward.py (was 0.25)
+    kill_target: 35.0,             // Synced with reward.py (was 20.0)
     target_low_hp: 3.0,
     episode_win: 50.0,
     episode_timeout: -8.0,
