@@ -12,7 +12,7 @@ ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/di
 // ═══════════════════════════════════════════════════════════════════
 //  Constants (match C++ / Python exactly)
 // ═══════════════════════════════════════════════════════════════════
-const OBS_SIZE = 198;
+const OBS_SIZE = 215;
 const MOVEMENT_ACTIONS = 9;
 const COMBAT_ACTIONS = 7;
 const TARGET_ACTIONS = 5;
@@ -716,13 +716,13 @@ function scoreTarget(sim: SimState, t: Target): number {
 
 // Reward weights (synced with Python reward.py — last updated after phantom damage fix)
 const RW = {
-  damage_dealt: 0.25,
+  damage_dealt: 0.15,              // Was 0.25 — reduced to prevent damage-only farming
   damage_taken: -0.015,
-  kill_reward: 20.0,
-  alive_per_step: -0.02,       // Was 0.000001 — now a survival COST
+  kill_reward: 35.0,               // Was 20.0 — increased so focused kills dominate
+  alive_per_step: -0.02,           // Survival COST — passive play is net-negative
   episode_win: 50.0,
   episode_loss: -5.0,
-  episode_timeout: -8.0,        // Scales with episode length: -8 * (steps/200)
+  episode_timeout: -8.0,           // Scales with episode length: -8 * (steps/200)
   surviving_target: -8.0,
   in_optimal_range: 0.01,
   range_closing: 0.04,
@@ -731,9 +731,14 @@ const RW = {
   flanking_side: 0.003,
   damage_inactivity: -0.05,
   fire_in_optimal_band: 0.06,
-  fire_outside_optimal: -0.01,
+  fire_outside_optimal: -0.02,
   reload_when_empty: 0.02,
-  wasted_shot: -0.03,
+  wasted_shot: -0.0001,            // Was -0.03 — dramatically reduced
+  passive_in_range: -0.08,         // NEW: per-step penalty for not firing when able
+  target_low_hp_bonus: 3.0,        // NEW: one-time reward when target drops below 30%
+  retarget_urgency: -0.06,         // NEW: per-step when selected target dead but others live
+  arc_over_cover: 0.03,            // NEW: bonus for arcing over blocked LOS
+  direct_fire_los: 0.02,           // NEW: bonus for direct weapon with clear LOS
 };
 
 interface RewardEngagementState {
@@ -925,14 +930,14 @@ function calculateFrameReward(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Build 198-float Observation
+//  Build 215-float Observation
 // ═══════════════════════════════════════════════════════════════════
 const TIER_PROFILES = {
-  micro: { name: "Micro", frameStack: 1, decisionInterval: 0.4, spatialTraces: 4, sizeLabel: "Combat_Micro.onnx" },
-  small: { name: "Small", frameStack: 2, decisionInterval: 0.3, spatialTraces: 8, sizeLabel: "Combat_Small.onnx" },
+  micro: { name: "Micro", frameStack: 3, decisionInterval: 0.4, spatialTraces: 4, sizeLabel: "Combat_Micro.onnx" },
+  small: { name: "Small", frameStack: 3, decisionInterval: 0.3, spatialTraces: 8, sizeLabel: "Combat_Small.onnx" },
   medium: { name: "Medium", frameStack: 3, decisionInterval: 0.2, spatialTraces: 8, sizeLabel: "Combat_Medium.onnx" },
-  large: { name: "Large", frameStack: 4, decisionInterval: 0.15, spatialTraces: 8, sizeLabel: "Combat_Large.onnx" },
-  xl: { name: "XL", frameStack: 5, decisionInterval: 0.1, spatialTraces: 12, sizeLabel: "Combat_XL.onnx" },
+  large: { name: "Large", frameStack: 3, decisionInterval: 0.15, spatialTraces: 8, sizeLabel: "Combat_Large.onnx" },
+  xl: { name: "XL", frameStack: 3, decisionInterval: 0.1, spatialTraces: 12, sizeLabel: "Combat_XL.onnx" },
 };
 
 function softmaxSample(logits: number[], mask: boolean[], temp = 1.0): number {
@@ -964,7 +969,7 @@ function softmaxSample(logits: number[], mask: boolean[], temp = 1.0): number {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Build 198-float Observation
+//  Build 215-float Observation
 // ═══════════════════════════════════════════════════════════════════
 function buildObservation(
   sim: SimState,
@@ -1057,7 +1062,7 @@ function buildObservation(
     obs[idx++] = dot(ag.facing, [rel[0] / d, rel[1] / d]);
     const toAgDir = [ag.pos[0] - ct.pos[0], ag.pos[1] - ct.pos[1]];
     const toAgD = Math.sqrt(toAgDir[0] ** 2 + toAgDir[1] ** 2) || 1;
-    obs[idx++] = Math.max(0, dot(ct.facing, [toAgDir[0] / toAgD, toAgDir[1] / toAgD]));
+    obs[idx++] = dot(ct.facing, [toAgDir[0] / toAgD, toAgDir[1] / toAgD]); // [-1,1] raw dot, matches C++
     obs[idx++] = clamp(ct.vel[0] / 600, -1, 1);
     obs[idx++] = clamp(ct.vel[1] / 600, -1, 1);
 
@@ -1105,7 +1110,7 @@ function buildObservation(
       obs[base + 5] = checkLOS(ag.pos, t.pos, sim.obstacles) ? 1 : 0;
       obs[base + 6] = t.role === "player" ? 1 : 0; // is_player_controlled
       const toAg = norm([ag.pos[0] - t.pos[0], ag.pos[1] - t.pos[1]]);
-      obs[base + 7] = clamp(dot(t.facing, toAg), 0, 1);
+      obs[base + 7] = clamp(dot(t.facing, toAg), -1, 1); // raw dot [-1,1], matches C++
       obs[base + 8] = clamp(scoreTarget(sim, t) / 120.0, 0, 1); // score target
       let targetThreat = 0;
       if (ag.threatTable) {
@@ -1136,16 +1141,19 @@ function buildObservation(
     obs[idx++] = minT;
   }
 
+  // ── Cover Height (8) — continuous obstacle height / 500 ──
+  const HIGH_TRACE_HEIGHT = 350;
   for (const ang of SPATIAL_ANGLES) {
     const rad = ang * Math.PI / 180;
     const dx = Math.cos(rad) * 1500, dy = Math.sin(rad) * 1500;
-    let isLow = false;
+    let obsHeight = 0;
     for (const o of sim.obstacles) {
-      if (rayAABB(ag.pos[0], ag.pos[1], dx, dy, o.x, o.y, o.hw, o.hh) !== null && o.height < 300) {
-        isLow = true; break;
+      if (rayAABB(ag.pos[0], ag.pos[1], dx, dy, o.x, o.y, o.hw, o.hh) !== null) {
+        obsHeight = o.height < HIGH_TRACE_HEIGHT ? o.height : HIGH_TRACE_HEIGHT;
+        break;
       }
     }
-    obs[idx++] = isLow ? 1 : 0;
+    obs[idx++] = clamp(obsHeight / 500, 0, 1);
   }
 
   let nearProjDist = 1, nearProjTTA = 1, nearProjDir = [0, 0];
@@ -1199,6 +1207,80 @@ function buildObservation(
   obs[idx++] = aliveH > 0 ? 1 : 0;
 
   obs[idx++] = clamp(dist(ag.pos, ag.spawnPos || [0, 0]) / (ag.leashRange || 2000), 0, 1);
+
+  // ── Extended Threat: Projectiles 2 and 3 (198-203) ──
+  // Collect up to 3 nearest threatening projectiles
+  const threatProjs: { dist: number; dir: [number, number] }[] = [];
+  for (const p of sim.projectiles) {
+    if (p.isAgent) continue;
+    const d = dist(p.pos, ag.pos);
+    if (d > 600) continue;
+    const spd = Math.sqrt(p.vel[0] ** 2 + p.vel[1] ** 2); if (spd < 1) continue;
+    const vd: [number, number] = [p.vel[0] / spd, p.vel[1] / spd];
+    const toMe = norm([ag.pos[0] - p.pos[0], ag.pos[1] - p.pos[1]]);
+    if (dot(vd, toMe) <= 0.5) continue;
+    threatProjs.push({ dist: d / 600, dir: vd });
+  }
+  threatProjs.sort((a, b) => a.dist - b.dist);
+  // Proj 2 (indices 198-200)
+  if (threatProjs.length > 1) {
+    obs[idx++] = threatProjs[1].dist;
+    obs[idx++] = threatProjs[1].dir[0];
+    obs[idx++] = threatProjs[1].dir[1];
+  } else { idx += 3; }
+  // Proj 3 (indices 201-203)
+  if (threatProjs.length > 2) {
+    obs[idx++] = threatProjs[2].dist;
+    obs[idx++] = threatProjs[2].dir[0];
+    obs[idx++] = threatProjs[2].dir[1];
+  } else { idx += 3; }
+  // Threat count (index 204)
+  obs[idx++] = clamp(threatProjs.length / 5, 0, 1);
+
+  // ── Can Hit Target per Weapon (205-208) ──
+  const tgt = sim.targets[ag.activeTargetIdx];
+  const tgtDist = tgt && tgt.alive ? dist(ag.pos, tgt.pos) : 9999;
+  const tgtLOS = tgt && tgt.alive ? checkLOS(ag.pos, tgt.pos, sim.obstacles) : false;
+  let tgtBehindLowCover = false;
+  if (tgt && tgt.alive && !tgtLOS) {
+    for (const o of sim.obstacles) {
+      const dx = tgt.pos[0] - ag.pos[0], dy = tgt.pos[1] - ag.pos[1];
+      if (rayAABB(ag.pos[0], ag.pos[1], dx, dy, o.x, o.y, o.hw, o.hh) !== null && o.height < 350) {
+        tgtBehindLowCover = true; break;
+      }
+    }
+  }
+  for (let wi = 0; wi < 4; wi++) {
+    if (wi < ag.weapons.length) {
+      const w = ag.weapons[wi];
+      const inRange = tgtDist <= w.range;
+      const hasPath = tgtLOS || (w.canArc && tgtBehindLowCover);
+      const canHit = w.ammo > 0 && inRange && hasPath && !w.isReloading;
+      obs[idx++] = canHit ? 1 : 0;
+    } else { idx++; }
+  }
+
+  // ── Total Ammo Fraction (209) ──
+  const totalAmmo = ag.weapons.length > 0
+    ? ag.weapons.reduce((s, w) => s + w.ammo / w.maxAmmo, 0) / ag.weapons.length
+    : 0;
+  obs[idx++] = clamp(totalAmmo, 0, 1);
+
+  // ── Targets Killed Fraction (210) ──
+  const totalHostiles = sim.targets.length;
+  const killedHostiles = sim.targets.filter(t => !t.alive).length;
+  obs[idx++] = totalHostiles > 0 ? killedHostiles / totalHostiles : 0;
+
+  // ── Arc Clearance per Weapon (211-214) ──
+  for (let wi = 0; wi < 4; wi++) {
+    if (wi < ag.weapons.length) {
+      const w = ag.weapons[wi];
+      if (w.canArc) {
+        const maxArc = w.maxArcHeight || 0;
+        obs[idx++] = maxArc <= 0 ? 1.0 : clamp(maxArc / 3000, 0, 1);
+      } else { idx++; }
+    } else { idx++; }
+  }
 
   return obs;
 }
@@ -1542,7 +1624,7 @@ export default function CombatSandbox() {
   const downloadRecordedCSV = () => {
     if (recordedStepsRef.current.length === 0) return;
 
-    // 207 fields total: 5 metadata + 198 observation vector + 3 action vector + 1 reward
+    // 224 fields total: 5 metadata + 215 observation vector + 3 action vector + 1 reward
     const csvHeaders = [
       "EncounterID", "EnemyName", "Archetype", "Frame", "CombatTime",
       ...Array.from({ length: 21 }, (_, i) => `Self_${i}`),

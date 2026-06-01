@@ -2417,6 +2417,18 @@ class CombatEnv(gym.Env):
         obs[idx] = total_ammo; idx += 1                        # 209
 
         # ── Targets Killed Fraction (1) ─────────────────────────
+        # Fraction of hostile targets killed in this encounter.
+        # Matches C++ UpdateTargetDefeatTracking() + GatherTargetsKilled().
+        #
+        # Reset behaviour:
+        #   - Python: implicitly reset on env.reset() — self.targets is
+        #     rebuilt with all targets alive. Dead targets stay in the list
+        #     (alive=False) so this fraction grows during the episode.
+        #   - C++: EncounterKilledHostiles and EncounterTotalHostiles are
+        #     reset in StartObserving() when combat begins. Tracked per
+        #     encounter via weak pointers. Targets that leave without dying
+        #     (actor destroyed) reduce the total; targets that die increase
+        #     the killed count. StopObserving() ends the encounter.
         total_hostiles = len([t for t in self.targets if not t.is_player_controlled])
         killed_hostiles = len([t for t in self.targets if not t.is_player_controlled and not t.alive])
         obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 210
