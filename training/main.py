@@ -80,7 +80,7 @@ Examples:
     parser.add_argument(
         "--frame_stack", type=int, default=3)
     parser.add_argument(
-        "--num_envs", type=int, default=12,
+        "--num_envs", type=int, default=16,
         help="Number of parallel environments")
 
     # ── Curriculum mode ──────────────────────────────────────────

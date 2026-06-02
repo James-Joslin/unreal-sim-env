@@ -32,17 +32,17 @@ class SACConfig:
                                       # being overly random.
 
     # ── Replay buffer ────────────────────────────────────────────
-    buffer_size: int = 500_000        # Transitions. At 12 envs × 5 Hz = 60/s,
+    buffer_size: int = 1_500_000        # Transitions. At 12 envs × 5 Hz = 60/s,
                                       # 500K = ~2.3 hours of experience.
     batch_size: int = 256
     learning_starts: int = 25_000     # Random actions before training begins.
                                       # Fills the buffer with diverse experience.
 
     # ── Update frequency ─────────────────────────────────────────
-    train_freq: int = 4               # Train every N env steps (across all envs).
+    train_freq: int = 12               # Train every N env steps (across all envs).
                                       # With 12 envs, this means 48 transitions
                                       # between gradient updates.
-    gradient_steps: int = 4           # Gradient updates per train call. Higher
+    gradient_steps: int = 12           # Gradient updates per train call. Higher
                                       # replay ratio = more sample-efficient.
 
     # ── Evaluation & saving ──────────────────────────────────────
