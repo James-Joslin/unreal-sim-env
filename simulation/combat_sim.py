@@ -54,7 +54,7 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 #  Constants (match NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 215  # Was 198. New features appended at end:
+OBS_SIZE = 231  # Was 215. +16 from spatial ring and cover height expansion (8→16 rays).
                 # [198-200] 2nd projectile (dist,dirX,dirY)
                 # [201-203] 3rd projectile (dist,dirX,dirY)
                 # [204]     incoming threat count
@@ -880,12 +880,79 @@ def _ray_aabb_intersect_t(p1: np.ndarray, p2: np.ndarray, obs: Obstacle):
     return tmin
 
 
+def _sphere_sweep_aabb_t(
+    p1: np.ndarray, p2: np.ndarray, obs: Obstacle, sweep_radius: float,
+):
+    """Sphere sweep against an AABB. Returns t in [0, 1] or None.
+
+    Equivalent to inflating the AABB by sweep_radius (Minkowski sum of
+    the obstacle box with a circle of sweep_radius) and then doing a
+    standard ray intersection. The returned t is the distance the sphere
+    CENTER travels before the sphere surface first contacts the obstacle.
+    Matches UE5 SweepSingleByChannel behaviour.
+    """
+    x1, y1 = p1; x2, y2 = p2
+    # Expand AABB by sweep radius.
+    bx1 = obs.x - obs.hw - sweep_radius
+    by1 = obs.y - obs.hh - sweep_radius
+    bx2 = obs.x + obs.hw + sweep_radius
+    by2 = obs.y + obs.hh + sweep_radius
+
+    dx = x2 - x1; dy = y2 - y1
+    tmin = 0.0; tmax = 1.0
+
+    for (p, d, lo, hi) in [(x1, dx, bx1, bx2), (y1, dy, by1, by2)]:
+        if abs(d) < 1e-4:
+            if p < lo or p > hi:
+                return None
+        else:
+            t1 = (lo - p) / d; t2 = (hi - p) / d
+            if t1 > t2: t1, t2 = t2, t1
+            tmin = max(tmin, t1); tmax = min(tmax, t2)
+            if tmin > tmax:
+                return None
+    return max(tmin, 0.0)
+
+
 def is_behind_cover(agent_pos, target_pos, obstacles) -> Tuple[bool, float]:
     """Check if LOS is blocked, and if so, estimate cover height."""
     for obs in obstacles:
         if _ray_aabb_intersect(agent_pos, target_pos, obs):
             return True, obs.height
     return False, 0.0
+
+
+# Character body radius for spatial ring ray detection. Larger than
+# AGENT_BODY_RADIUS (30 UU) to account for the full capsule collision
+# of player and AI characters in UE5. Matches C++ CapsuleHalfRadius.
+CHARACTER_DETECT_RADIUS = 45.0
+
+
+def _ray_circle_intersect_t(
+    origin: np.ndarray, direction: np.ndarray,
+    center: np.ndarray, radius: float, trace_len: float,
+):
+    """Returns t in [0, 1] of ray hitting a circle, or None.
+
+    origin:    ray start (2D)
+    direction: unit direction vector (2D)
+    center:    circle center (2D)
+    radius:    circle radius
+    trace_len: max ray length (t is normalised by this)
+    """
+    oc = center - origin
+    proj = float(np.dot(oc, direction))
+    if proj < 0:
+        return None  # Circle is behind the ray.
+    d_sq = float(np.dot(oc, oc)) - proj * proj
+    r_sq = radius * radius
+    if d_sq > r_sq:
+        return None  # Ray misses the circle.
+    t_hit = proj - math.sqrt(r_sq - d_sq)
+    if t_hit < 0:
+        t_hit = 0.0  # Ray starts inside the circle.
+    t_norm = t_hit / trace_len
+    return t_norm if t_norm <= 1.0 else None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2232,31 +2299,78 @@ class CombatEnv(gym.Env):
             # Multi-agent training would populate these.
             idx += 12
 
-        # ── Spatial Ring (8) ─────────────────────────────────────
-        # [Audit §1.6] C++ reports LowHit.Distance / TraceLength (hit surface
-        # distance). _ray_aabb_intersect_t returns t = hit_dist / segment_len,
-        # which is the equivalent normalised value.
+        # ── Spatial Ring (16) ────────────────────────────────────
+        # 16 sphere sweeps at 22.5° spacing. Each sweep uses a sphere
+        # with radius = AGENT_BODY_RADIUS, answering "can my body fit
+        # through there?" rather than "is there a thin sightline?"
+        #
+        # A line trace through a 50 UU gap reports "open", but the agent
+        # (60 UU diameter) can't actually fit. The sphere sweep correctly
+        # reports "blocked". Detects obstacles, arena boundaries, and
+        # live characters (targets + allies).
+        #
+        # Matches C++ SweepSingleByChannel with FCollisionShape::MakeSphere.
         TRACE_LEN = 1500.0
-        angles = [i * 45 for i in range(8)]
+        SWEEP_RADIUS = AGENT_BODY_RADIUS  # 30 UU — agent can't fit if sphere can't
+        half = self._arena_half
+        NUM_SPATIAL_RAYS = 16
+        angles = [i * (360.0 / NUM_SPATIAL_RAYS) for i in range(NUM_SPATIAL_RAYS)]
+
+        # Gather live character positions for sweep-circle tests.
+        char_positions = []
+        for t in self.targets:
+            if t.alive:
+                char_positions.append(t.pos)
+        for ally in getattr(self, 'allies', []):
+            if ally.alive:
+                char_positions.append(ally.pos)
+
+        # Effective character detection radius: character capsule + sweep sphere.
+        char_detect_r = CHARACTER_DETECT_RADIUS + SWEEP_RADIUS
+
+        # Effective arena boundary: the sphere center can't get closer
+        # than SWEEP_RADIUS to the wall.
+        effective_half = half - SWEEP_RADIUS
+
         for ang in angles:
             rad = math.radians(ang)
             direction = np.array([math.cos(rad), math.sin(rad)], dtype=np.float32)
             probe = a.pos + direction * TRACE_LEN
             blocked_dist = 1.0
+
+            # Sweep against obstacles (inflated AABB).
             for o in self.obstacles:
-                t = _ray_aabb_intersect_t(a.pos, probe, o)
+                t = _sphere_sweep_aabb_t(a.pos, probe, o, SWEEP_RADIUS)
                 if t is not None and t < blocked_dist:
                     blocked_dist = t
+
+            # Sweep against arena boundaries (pulled inward by sweep radius).
+            for axis in range(2):
+                d = direction[axis] * TRACE_LEN
+                if abs(d) > 1e-6:
+                    wall = effective_half if d > 0 else -effective_half
+                    t_wall = (wall - a.pos[axis]) / d
+                    if 0 < t_wall < blocked_dist:
+                        blocked_dist = t_wall
+
+            # Sweep against characters (inflated detection radius).
+            for cpos in char_positions:
+                t_char = _ray_circle_intersect_t(
+                    a.pos, direction, cpos, char_detect_r, TRACE_LEN)
+                if t_char is not None and t_char < blocked_dist:
+                    blocked_dist = t_char
+
             obs[idx] = blocked_dist; idx += 1
 
-        # ── Cover Height (8) ──────────────────────────────────────
+        # ── Cover Height (16) ─────────────────────────────────────
         # Continuous obstacle height per direction, normalised by 500.
-        # Replaces the former binary cover assessment.
+        # Only detects OBSTACLES, not characters (you can't hide behind
+        # a moving person). 16 rays matching the spatial ring.
         #   0.0 = open space (no obstacle in this direction)
         #   0.1–0.6 = low cover of varying height
         #   0.7 = full wall (350 / 500, matching C++ HighTraceHeight)
         # The model compares these against ArcClearance per weapon slot
-        # at [211-214] to decide which weapons can fire over which cover.
+        # at [227-230] to decide which weapons can fire over which cover.
         HIGH_TRACE_HEIGHT = 350.0
         for ang in angles:
             rad = math.radians(ang)
@@ -2266,10 +2380,8 @@ class CombatEnv(gym.Env):
             for o in self.obstacles:
                 if _ray_aabb_intersect(a.pos, probe, o):
                     if o.height < HIGH_TRACE_HEIGHT:
-                        # Low cover — report actual height.
                         obstacle_height = max(obstacle_height, o.height)
                     else:
-                        # Full wall — cap at HighTraceHeight.
                         obstacle_height = HIGH_TRACE_HEIGHT
                     break
             obs[idx] = min(obstacle_height / 500.0, 1.0); idx += 1
@@ -2417,6 +2529,18 @@ class CombatEnv(gym.Env):
         obs[idx] = total_ammo; idx += 1                        # 209
 
         # ── Targets Killed Fraction (1) ─────────────────────────
+        # Fraction of hostile targets killed in this encounter.
+        # Matches C++ UpdateTargetDefeatTracking() + GatherTargetsKilled().
+        #
+        # Reset behaviour:
+        #   - Python: implicitly reset on env.reset() — self.targets is
+        #     rebuilt with all targets alive. Dead targets stay in the list
+        #     (alive=False) so this fraction grows during the episode.
+        #   - C++: EncounterKilledHostiles and EncounterTotalHostiles are
+        #     reset in StartObserving() when combat begins. Tracked per
+        #     encounter via weak pointers. Targets that leave without dying
+        #     (actor destroyed) reduce the total; targets that die increase
+        #     the killed count. StopObserving() ends the encounter.
         total_hostiles = len([t for t in self.targets if not t.is_player_controlled])
         killed_hostiles = len([t for t in self.targets if not t.is_player_controlled and not t.alive])
         obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 210
@@ -2476,6 +2600,18 @@ class CombatEnv(gym.Env):
         ) and (
             a.pos[1] < (-half + corner_threshold) or a.pos[1] > (half - corner_threshold)
         )
+
+        # [Fix] Continuous wall proximity: 0.0 = touching wall, 1.0 = at
+        # threshold, >1.0 = safely away. Gives the reward function a
+        # gradient to push the agent away from walls rather than a flat
+        # penalty that provides no directional signal.
+        dist_to_nearest_wall = min(
+            a.pos[0] - (-half),   # left wall
+            half - a.pos[0],      # right wall
+            a.pos[1] - (-half),   # bottom wall
+            half - a.pos[1],      # top wall
+        )
+        wall_proximity = max(0.0, dist_to_nearest_wall / wall_threshold)
 
         # ── Movement state ───────────────────────────────────────
         agent_speed_raw = np.linalg.norm(a.velocity)
@@ -2555,8 +2691,11 @@ class CombatEnv(gym.Env):
             in_optimal_range=in_optimal,
             near_wall=near_wall,
             in_corner=in_corner,
+            wall_proximity=wall_proximity,
             agent_speed=agent_speed_raw,
             moving_away_from_threat=moving_away,
+            active_weapon_wind_up_time=slot.wind_up_time if slot else 0.0,
+            active_weapon_fire_cooldown=slot.fire_cooldown if slot else 0.2,
             alive_allies=sum(1 for ally in getattr(self, 'allies', []) if ally.alive),
             alive_hostiles=sum(1 for t in self.targets if t.alive),
             nearest_ally_distance=min(

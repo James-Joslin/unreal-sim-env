@@ -44,8 +44,6 @@ OBSERVATION LAYOUT (215 per frame)
     [210..210]  Targets Killed Fraction           ( 1)      Kill urgency tracker
     [211..214]  Arc Clearance Per Weapon          ( 4)      MaxArcableObstacleHeight / 3000
 
-C++ SIDE: Only change FrameStackCount from 8 to 3. Input stays flat TArray<float>.
-
 TIER ARCHITECTURE (structured)
     | Tier   | entity | unique | backbone | layers | Approx Params |
     |--------|--------|--------|----------|--------|---------------|
@@ -54,6 +52,7 @@ TIER ARCHITECTURE (structured)
     | Medium | 16     | 32     | 64       | 2      | ~38K          |
     | Large  | 16     | 32     | 96       | 2      | ~48K          |
     | XL     | 24     | 48     | 128      | 3      | ~85K          |
+
 """
 
 import os
@@ -66,7 +65,7 @@ import torch.nn.functional as F
 #  Constants (must match C++ NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 215
+OBS_SIZE = 231
 MOVEMENT_ACTIONS = 9
 COMBAT_ACTIONS = 7
 TARGET_ACTIONS = 5
@@ -81,10 +80,10 @@ _HOSTILE_SLOT_SIZE = 13
 _ALLY_START = 122                          # 3 slots x 12 features
 _ALLY_SLOTS = 3
 _ALLY_SLOT_SIZE = 12
-_UNIQUE_SIZE = 127                         # 70 (self+weapon+arch+target) + 57 (spatial/cover/threat/nav/metrics/arc)
+_UNIQUE_SIZE = 143                         # 70 (self+weapon+arch+target) + 73 (spatial16/cover16/threat/nav/metrics/arc)
 
 # Logit bounding (same as before).
-LOGIT_SCALE = 3.0
+LOGIT_SCALE = 1.0
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -115,7 +114,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 # ─────────────────────────────────────────────────────────────────
 
 class StructuredEncoder(nn.Module):
-    """Encodes one 215-float frame into a compact embedding.
+    """Encodes one 231-float frame into a compact embedding.
 
     Splits features into unique/hostile/ally/threat groups, encodes each
     with weight-shared layers, and concatenates the results.
@@ -167,7 +166,7 @@ class StructuredEncoder(nn.Module):
         unique_feats = torch.cat([
             frame[:, 0:70],
             frame[:, 158:OBS_SIZE],
-        ], dim=-1)  # [batch, 127]
+        ], dim=-1)  # [batch, 143] (was 127 with 8 rays)
         unique_emb = self.unique_encoder(unique_feats)  # [batch, unique_dim]
 
         # 2. Shared Hostile Encoder
@@ -186,12 +185,13 @@ class StructuredEncoder(nn.Module):
 
         # 4. ─── Shared Projectile Threat Encoder with Symmetric Max-Pooling ───
         # Extract features for Threat 1, 2, and 3: (distance, heading_x, heading_y)
-        # Nearest projectile Threat 1 is at index 174 (dist), 176 (dirX), 177 (dirY) of the Threat Sensing block
-        t1 = torch.stack([frame[:, 174], frame[:, 176], frame[:, 177]], dim=-1) # nearest
-        # Second-nearest Threat 2 is at index 198 (dist), 199 (dirX), 200 (dirY)
-        t2 = torch.stack([frame[:, 198], frame[:, 199], frame[:, 200]], dim=-1) # second-nearest
-        # Third-nearest Threat 3 is at index 201 (dist), 202 (dirX), 203 (dirY)
-        t3 = torch.stack([frame[:, 201], frame[:, 202], frame[:, 203]], dim=-1) # third-nearest
+        # Indices shifted +16 from 8→16 spatial ring expansion.
+        # Nearest projectile Threat 1 is at index 190 (dist), 192 (dirX), 193 (dirY) of the Threat Sensing block
+        t1 = torch.stack([frame[:, 190], frame[:, 192], frame[:, 193]], dim=-1) # nearest
+        # Second-nearest Threat 2 is at index 214 (dist), 215 (dirX), 216 (dirY)
+        t2 = torch.stack([frame[:, 214], frame[:, 215], frame[:, 216]], dim=-1) # second-nearest
+        # Third-nearest Threat 3 is at index 217 (dist), 218 (dirX), 219 (dirY)
+        t3 = torch.stack([frame[:, 217], frame[:, 218], frame[:, 219]], dim=-1) # third-nearest
         
         # Reshape to slot tensor: [batch, 3_slots, 3_features]
         threats_feats = torch.stack([t1, t2, t3], dim=1)
@@ -211,8 +211,8 @@ class StructuredEncoder(nn.Module):
 class DeltaEncoder(nn.Module):
     """Reshapes flat frame-stacked input and computes temporal deltas.
 
-    Input:  [batch, frame_stack * 215]  (flat, from C++ frame stacking)
-    Output: [batch, 3, 215]  (current, velocity, acceleration)
+    Input:  [batch, frame_stack * 231]  (flat, from C++ frame stacking)
+    Output: [batch, 3, 231]  (current, velocity, acceleration)
 
     Baked into ONNX — C++ feeds raw flat observations unchanged.
     """
@@ -225,7 +225,7 @@ class DeltaEncoder(nn.Module):
     def forward(self, flat_obs: torch.Tensor) -> torch.Tensor:
         batch = flat_obs.shape[0]
 
-        # Reshape: [batch, N*215] → [batch, N, 215]
+        # Reshape: [batch, N*231] → [batch, N, 231]
         frames = flat_obs.view(batch, self.frame_stack, self.obs_size)
 
         # Delta encoding. Frames are oldest-first: [t-2, t-1, t].
@@ -394,7 +394,7 @@ def load_teacher_from_checkpoint(
 #  Save PPO Checkpoint
 # ─────────────────────────────────────────────────────────────────
 
-def save_ppo_checkpoint(model, optimizer, path, stage, archetype, step,
+def save_checkpoint(model, optimizer, path, stage, archetype, step,
                         frame_stack=DEFAULT_FRAME_STACK, tier="large",
                         obs_normalizer=None):
     """Save a PPO checkpoint with clean policy extraction."""
