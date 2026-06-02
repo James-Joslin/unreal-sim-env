@@ -23,19 +23,9 @@ Everything from normalisation to action output is baked into the ONNX graph. C++
 
 Entity encoders use weight-sharing across slots and max-pooling across the slot dimension for permutation invariance — the model doesn't care which slot a hostile is in.
 
-**3. Policy Backbone**: Concatenates 3 channel embeddings → MLP with LayerNorm → 3 action heads (movement, combat, target). Logits bounded by `tanh × 3.0`.
+**3. Policy Backbone**: Concatenates 3 channel embeddings → MLP with LayerNorm → 3 action heads (movement, combat, target). Logits bounded by `tanh × 1.0`.
 
-## Tiers
-
-| Tier | Entity dim | Unique dim | Backbone | Layers | Params |
-|---|---|---|---|---|---|
-| Micro | 8 | 16 | 32 | 1 | ~9K |
-| Small | 12 | 24 | 48 | 1 | ~18K |
-| Medium | 16 | 32 | 64 | 2 | ~38K |
-| Large | 16 | 32 | 96 | 2 | ~48K |
-| XL | 24 | 48 | 128 | 3 | ~85K |
-
-Training uses Large. Distillation cascades Large → Medium → Small → Micro, and fine-tunes Large → XL.
+Training uses Large Tier model. Distillation cascades Large → Medium → Small → Micro, and fine-tunes Large → XL.
 
 ## ONNX Export
 

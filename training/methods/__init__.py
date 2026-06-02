@@ -42,9 +42,10 @@ def get_trainer_class(name: str) -> Type[BaseTrainer]:
 from .ppo import PPOTrainer
 register_method("ppo", PPOTrainer)
 
-# Future methods:
+# In development
 from .sac import SACTrainer
 register_method("sac", SACTrainer)
-#
-# from .appo import APPOTrainer
-# register_method("appo", APPOTrainer)
+
+# Future methods
+# from .impala import IMPALATrainer
+# register_method("impala", IMPALATrainer)

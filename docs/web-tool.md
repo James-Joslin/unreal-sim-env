@@ -7,7 +7,7 @@ Browser-based testing and debugging environment for the neural combat AI. Runs a
 ```bash
 npm install react react-dom d3 onnxruntime-web
 npm install -D @types/d3 typescript
-npm run dev
+npm run dev:local
 ```
 
 Copy `App.tsx`, `main.tsx`, and `components/` into `src/`. The simulation starts immediately with a scripted fallback AI (no model needed for basic testing).

@@ -122,8 +122,13 @@ class CombatState:
     height_above_ground: float = 0.0
     near_wall: bool = False          # within 150 UU of arena boundary
     in_corner: bool = False          # within 200 UU of TWO arena boundaries
+    wall_proximity: float = 1.0      # continuous: 0.0 = touching wall, 1.0 = at threshold
     agent_speed: float = 0.0        # current speed in UU/s (raw, not normalised)
     moving_away_from_threat: bool = False  # velocity pointing away from nearest target
+
+    # Active weapon timing (for loadout-aware rewards)
+    active_weapon_wind_up_time: float = 0.0  # seconds of wind-up before shot fires
+    active_weapon_fire_cooldown: float = 0.2  # seconds between shots
 
     # Group (for stages 6-7)
     alive_allies: int = 0
@@ -393,6 +398,24 @@ class RewardWeights:
                                       # to aim is valid combat behaviour!
     wall_hugging_penalty: float = -0.02  # Was -0.05
     corner_penalty: float = -0.04       # Was -0.2
+
+    # [Fix] Damage-scaled wall/corner penalty. When taking damage near a
+    # wall, the base penalty is multiplied by (1 + recent_damage * multiplier).
+    # At 3% HP/step damage intake, the corner penalty goes from -0.04 to
+    # ~-0.16 — four times stronger under fire, breaking the local optimum
+    # where the value function preferred corners for damage reduction.
+    corner_damage_multiplier: float = 3.0
+
+    # [Fix] Escape gradient: reward for increasing distance from the
+    # nearest wall while near it. Gives a directional signal — the flat
+    # wall_hugging_penalty tells the agent "walls are bad" but not which
+    # way to go. This points it toward open space.
+    wall_escape_bonus: float = 0.03
+
+    # [Fix] Heavy weapon commit bonus: reward for landing hits with slow
+    # weapons (wind-up >= 0.3s). The long wind-up means the agent
+    # committed to a stationary firing position — reward proportionally.
+    heavy_fire_commit_bonus: float = 0.04
     ally_collision: float = -0.02
     target_diversity: float = 0.1
     min_damage_penalty: float = -5.0  # INCREASED from -1.0. Dealing zero
@@ -511,6 +534,11 @@ class CombatRewardFunction:
         self._steps_since_kill = 999        # steps since last kill (for grace period)
         self._last_kill_count = 0           # targets killed as of last step
         self._targets_seen_low_hp: set = set()  # target IDs already rewarded for low HP
+        # [Fix] Exponential moving average of damage taken, used to scale
+        # wall/corner penalties. Updated in compute_reward. α = 0.3 gives
+        # a ~3 step half-life so the multiplier responds quickly to bursts
+        # of incoming damage but decays when the agent escapes.
+        self._recent_damage_taken: float = 0.0
 
     def _ramp_factor(self) -> float:
         """Returns 0.0→1.0 over the first _ramp_steps of the stage.
@@ -533,6 +561,7 @@ class CombatRewardFunction:
         self._last_kill_count = 0
         self._targets_seen_low_hp = set()
         self._actual_move_streak = 0
+        self._recent_damage_taken = 0.0
         # Note: _global_step does NOT reset — it tracks total steps across episodes.
 
     def compute(
@@ -623,6 +652,11 @@ class CombatRewardFunction:
         damage_taken_frac = max(0.0, prev.self_hp - curr.self_hp)
         r_taken = damage_taken_frac * self.w.take_damage * 100
         info["damage_taken"] = r_taken
+
+        # [Fix] Update EMA of recent damage. α = 0.3 means ~3-step half-life.
+        # Used by anti-degenerate to scale wall/corner penalties under fire.
+        self._recent_damage_taken = (
+            0.3 * damage_taken_frac + 0.7 * self._recent_damage_taken)
 
         # Death.
         r_death = 0.0
@@ -1081,15 +1115,50 @@ class CombatRewardFunction:
         # ── Wall hugging penalty ─────────────────────────────────
         # Penalise being near arena boundaries. This directly counters
         # corner camping since corners are where two walls meet.
+        #
+        # [Fix] Penalties now SCALE with recent damage intake. Under fire,
+        # being near a wall is much worse because the agent has fewer
+        # escape routes. The multiplier is (1 + ema_damage * scale):
+        #   - No damage: 1× base penalty (mild, for general discouragement)
+        #   - 3% HP/step:  ~1 + 0.03*3 = 1.09× → builds over sustained fire
+        #   - After 3 steps at 3%: EMA ≈ 0.027, mult ≈ 1.08
+        #   - After 5 steps at 5%: EMA ≈ 0.048, mult ≈ 1.14
+        # The effect compounds with corner_penalty stacking.
+
+        damage_mult = 1.0 + self._recent_damage_taken * self.w.corner_damage_multiplier * 100
 
         if curr.near_wall:
-            r += self.w.wall_hugging_penalty
-            info["wall_hugging"] = self.w.wall_hugging_penalty
+            wall_pen = self.w.wall_hugging_penalty * damage_mult
+            r += wall_pen
+            info["wall_hugging"] = wall_pen
 
         if curr.in_corner:
             # Corner = near two walls. Stacks with wall_hugging.
-            r += self.w.corner_penalty
-            info["corner_penalty"] = self.w.corner_penalty
+            corner_pen = self.w.corner_penalty * damage_mult
+            r += corner_pen
+            info["corner_penalty"] = corner_pen
+
+        # ── Wall escape gradient ─────────────────────────────────
+        # [Fix] When near a wall, reward increasing distance from it.
+        # The flat penalty tells the agent "walls are bad" but gives no
+        # directional signal once it's already there. This gradient
+        # points toward open space. Scaled by damage_mult so the pull
+        # away from walls is strongest under fire — exactly when the
+        # agent most needs to escape but previously was most likely to
+        # freeze.
+
+        if curr.wall_proximity < 1.0 and prev.wall_proximity < 1.0:
+            escape_delta = curr.wall_proximity - prev.wall_proximity
+            if escape_delta > 0:
+                # Moving away from nearest wall.
+                r += self.w.wall_escape_bonus * damage_mult
+                info["wall_escape"] = self.w.wall_escape_bonus * damage_mult
+            elif escape_delta < -0.05:
+                # Moving deeper toward wall — penalise (proportional to
+                # how fast). Mild, but enough to break ties when the
+                # value function is indifferent between directions.
+                r += self.w.wall_escape_bonus * 0.5 * escape_delta * damage_mult
+                info["wall_approach"] = self.w.wall_escape_bonus * 0.5 * escape_delta * damage_mult
 
         # ── Mobile combat bonuses ────────────────────────────────
         # Reward dealing damage while moving. Strafing (lateral movement)
@@ -1213,7 +1282,14 @@ class CombatRewardFunction:
     def _ranged_rewards(self, prev, curr, action, info) -> float:
         r = 0.0
         _, combat_action, _ = action
-        danger_range = curr.active_weapon_range * 0.3
+
+        # [Fix] Danger range adjusts by weapon speed. Heavy weapons
+        # (fire_cooldown >= 0.8s) have longer effective range and slower
+        # repositioning — shrink the "too close" zone so the agent isn't
+        # penalised for the ranges where heavy weapons actually operate.
+        # Scout weapons keep the original 0.3× threshold.
+        is_heavy_weapon = curr.active_weapon_fire_cooldown >= 0.8
+        danger_range = curr.active_weapon_range * (0.2 if is_heavy_weapon else 0.3)
 
         # Too close.
         if curr.target_distance < danger_range:
@@ -1239,11 +1315,43 @@ class CombatRewardFunction:
             info["ranged_strafe_fire"] = self.w.ranged_strafe_fire
 
         # Standing still when melee threat is closing.
+        #
+        # [Fix] EXEMPT if active weapon has significant wind-up (>= 0.3s).
+        # Heavy weapons REQUIRE standing still during the wind-up animation.
+        # The old penalty punished exactly the behaviour a heavy loadout
+        # needs: planting feet and committing to a slow, powerful shot.
+        # A scout with 0.0s wind-up still gets penalised for standing still.
+        wind_up_exempt = curr.active_weapon_wind_up_time >= 0.3
         if (curr.target_distance < danger_range * 2.0
                 and curr.self_speed < 0.1
-                and curr.target_distance < prev.target_distance):
+                and curr.target_distance < prev.target_distance
+                and not wind_up_exempt):
             r += self.w.ranged_standing_still_threat
             info["ranged_standing_still"] = self.w.ranged_standing_still_threat
+
+        # [Fix] Heavy weapon commit bonus: landing hits with a slow weapon
+        # means the agent committed to a stationary firing position for the
+        # full wind-up duration. Reward proportionally to wind-up time.
+        # This directly counteracts the value function's learned caution
+        # about animation locks — the bonus makes the commitment profitable.
+        #   Cannon (0.5s wind-up):  0.04 * min(0.5/0.5, 2.0) = 0.04
+        #   Railgun (1.0s wind-up): 0.04 * min(1.0/0.5, 2.0) = 0.08
+        #   Scout (0.0s wind-up):   exempt (threshold not met)
+        if (curr.total_damage_all_targets > 0
+                and curr.active_weapon_wind_up_time >= 0.3):
+            commit_scale = min(curr.active_weapon_wind_up_time / 0.5, 2.0)
+            commit_bonus = self.w.heavy_fire_commit_bonus * commit_scale
+            r += commit_bonus
+            info["heavy_fire_commit"] = commit_bonus
+
+        # [Fix] Holding ground bonus: heavy weapons reward maintaining
+        # position when in optimal range. The agent shouldn't kite with
+        # a cannon — it should set up and fire. Light weapons don't get
+        # this because they SHOULD be mobile.
+        if (is_heavy_weapon and curr.in_optimal_range
+                and curr.agent_speed < 50 and curr.target_alive):
+            r += 0.005
+            info["heavy_holding_ground"] = 0.005
 
         return r
 
