@@ -43,6 +43,16 @@ OBSERVATION LAYOUT (215 per frame)
     [209..209]  Total Ammo Fraction               ( 1)      Ammo conservation state
     [210..210]  Targets Killed Fraction           ( 1)      Kill urgency tracker
     [211..214]  Arc Clearance Per Weapon          ( 4)      MaxArcableObstacleHeight / 3000
+
+TIER ARCHITECTURE (structured)
+    | Tier   | entity | unique | backbone | layers | Approx Params |
+    |--------|--------|--------|----------|--------|---------------|
+    | Micro  | 8      | 16     | 32       | 1      | ~9K           |
+    | Small  | 12     | 24     | 48       | 1      | ~18K          |
+    | Medium | 16     | 32     | 64       | 2      | ~38K          |
+    | Large  | 16     | 32     | 96       | 2      | ~48K          |
+    | XL     | 24     | 48     | 128      | 3      | ~85K          |
+
 """
 
 import os
@@ -81,11 +91,11 @@ LOGIT_SCALE = 1.0
 # ─────────────────────────────────────────────────────────────────
 
 TIER_CONFIGS = {
-    "micro":  dict(entity_dim=4,  unique_dim=8, backbone_hidden=16,  backbone_layers=1),
-    "small":  dict(entity_dim=6, unique_dim=12, backbone_hidden=24,  backbone_layers=1),
-    "medium": dict(entity_dim=8, unique_dim=16, backbone_hidden=32,  backbone_layers=2),
-    "large":  dict(entity_dim=8, unique_dim=16, backbone_hidden=48,  backbone_layers=2),
-    "xl":     dict(entity_dim=12, unique_dim=24, backbone_hidden=64, backbone_layers=2),
+    "micro":  dict(entity_dim=8,  unique_dim=16, backbone_hidden=32,  backbone_layers=1),
+    "small":  dict(entity_dim=12, unique_dim=24, backbone_hidden=48,  backbone_layers=1),
+    "medium": dict(entity_dim=16, unique_dim=32, backbone_hidden=64,  backbone_layers=2),
+    "large":  dict(entity_dim=16, unique_dim=32, backbone_hidden=96,  backbone_layers=2),
+    "xl":     dict(entity_dim=24, unique_dim=48, backbone_hidden=128, backbone_layers=3),
 }
 
 
@@ -384,7 +394,7 @@ def load_teacher_from_checkpoint(
 #  Save PPO Checkpoint
 # ─────────────────────────────────────────────────────────────────
 
-def save_ppo_checkpoint(model, optimizer, path, stage, archetype, step,
+def save_checkpoint(model, optimizer, path, stage, archetype, step,
                         frame_stack=DEFAULT_FRAME_STACK, tier="large",
                         obs_normalizer=None):
     """Save a PPO checkpoint with clean policy extraction."""

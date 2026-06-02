@@ -40,7 +40,7 @@ matplotlib.use("Agg")
 from combat_sim import OBS_SIZE, MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 from combat_extensions import make_extended_curriculum_env
 from combat_policy import (
-    CombatPolicy, make_policy, save_ppo_checkpoint,
+    CombatPolicy, make_policy, save_checkpoint,
     load_teacher_from_checkpoint, TIER_CONFIGS,
 )
 from frame_stack import (
@@ -273,7 +273,7 @@ class BaseTrainer(ABC):
             - metadata: tier, stage, archetype, step, frame_stack, method
             - obs_normalizer: running stats (if enabled)
         """
-        save_ppo_checkpoint(
+        save_checkpoint(
             self.model, self.optimizer, path,
             stage=self.stage,
             archetype=self.archetype,

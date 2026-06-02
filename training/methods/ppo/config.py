@@ -1,7 +1,8 @@
 """
 config.py — PPO hyperparameters.
 
-All PPO-specific tuning lives here.
+All PPO-specific tuning lives here. These values have been calibrated
+through extensive experimentation on the combat sim.
 """
 
 from dataclasses import dataclass
@@ -12,12 +13,15 @@ class PPOConfig:
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.06
+    clip_range: float = 0.08
     vf_clip_range: float = 10.0     # Value function clipping — prevents
                                      # huge value updates at stage transitions.
-    entropy_coef: float = 0.01       # Start of entropy anneal range.
-    entropy_coef_final: float = 0.002 # Entropy decays to this. Near-zero late
-                                      # in training lets the policy converge.
+    entropy_coef: float = 0.015      # Start of entropy anneal range.
+                                     # Higher than before (0.01) to maintain
+                                     # exploration with the larger obs space.
+    entropy_coef_final: float = 0.003 # Entropy decays to this. Slightly higher
+                                      # than before (0.002) — the 231-feature
+                                      # obs has more local optima to escape.
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     num_steps: int = 196             # Steps per env per rollout.

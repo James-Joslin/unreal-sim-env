@@ -399,12 +399,11 @@ class RewardWeights:
     wall_hugging_penalty: float = -0.02  # Was -0.05
     corner_penalty: float = -0.04       # Was -0.2
 
-    # [Fix] Damage-scaled wall/corner penalty. When taking damage near a
-    # wall, the base penalty is multiplied by (1 + recent_damage * multiplier).
-    # At 3% HP/step damage intake, the corner penalty goes from -0.04 to
-    # ~-0.16 — four times stronger under fire, breaking the local optimum
-    # where the value function preferred corners for damage reduction.
-    corner_damage_multiplier: float = 3.0
+    # [Fix v2] Damage-scaled wall/corner penalty. When taking damage near
+    # a wall, the base penalty is multiplied by (1 + damage_pct * scale),
+    # capped at 4×. At 3% HP/step the corner penalty goes from -0.04 to
+    # -0.10 — noticeable pressure but stays under 1% of a winning episode.
+    corner_damage_multiplier: float = 0.5
 
     # [Fix] Escape gradient: reward for increasing distance from the
     # nearest wall while near it. Gives a directional signal — the flat
@@ -1116,16 +1115,24 @@ class CombatRewardFunction:
         # Penalise being near arena boundaries. This directly counters
         # corner camping since corners are where two walls meet.
         #
-        # [Fix] Penalties now SCALE with recent damage intake. Under fire,
-        # being near a wall is much worse because the agent has fewer
-        # escape routes. The multiplier is (1 + ema_damage * scale):
-        #   - No damage: 1× base penalty (mild, for general discouragement)
-        #   - 3% HP/step:  ~1 + 0.03*3 = 1.09× → builds over sustained fire
-        #   - After 3 steps at 3%: EMA ≈ 0.027, mult ≈ 1.08
-        #   - After 5 steps at 5%: EMA ≈ 0.048, mult ≈ 1.14
-        # The effect compounds with corner_penalty stacking.
+        # [Fix v2] Damage multiplier is CAPPED to prevent reward explosion.
+        # The v1 formula (EMA * 3.0 * 100) produced 10× at sustained 3%
+        # damage — turning the corner penalty into -0.40/step, which
+        # exceeded kill rewards and destabilised the value function.
+        #
+        # New formula: convert EMA to "% HP per step", scale by weight,
+        # hard cap at 4×. Examples with corner_damage_multiplier = 0.5:
+        #   - No damage:     1.0× (base penalty only)
+        #   - 1% HP/step:    1.5× (mild escalation)
+        #   - 3% HP/step:    2.5× (significant pressure to escape)
+        #   - 5% HP/step:    3.5× (strong pressure)
+        #   - 8%+ HP/step:   4.0× (hard cap — never exceeds this)
 
-        damage_mult = 1.0 + self._recent_damage_taken * self.w.corner_damage_multiplier * 100
+        damage_pct = self._recent_damage_taken * 100.0  # EMA in "percentage points"
+        damage_mult = min(
+            1.0 + damage_pct * self.w.corner_damage_multiplier,
+            4.0  # Hard cap — corner penalty never exceeds 4× base.
+        )
 
         if curr.near_wall:
             wall_pen = self.w.wall_hugging_penalty * damage_mult
@@ -1139,26 +1146,25 @@ class CombatRewardFunction:
             info["corner_penalty"] = corner_pen
 
         # ── Wall escape gradient ─────────────────────────────────
-        # [Fix] When near a wall, reward increasing distance from it.
-        # The flat penalty tells the agent "walls are bad" but gives no
-        # directional signal once it's already there. This gradient
-        # points toward open space. Scaled by damage_mult so the pull
-        # away from walls is strongest under fire — exactly when the
-        # agent most needs to escape but previously was most likely to
-        # freeze.
+        # [Fix v2] Escape bonus is NOT scaled by damage_mult. The v1
+        # version multiplied by damage_mult which created -0.30/step
+        # spikes when the agent moved the wrong way under fire. The
+        # escape gradient should be a gentle nudge, not a cliff.
+        # The wall/corner penalty (above) already provides the "walls
+        # are worse under fire" signal; the escape gradient just
+        # provides direction.
 
         if curr.wall_proximity < 1.0 and prev.wall_proximity < 1.0:
             escape_delta = curr.wall_proximity - prev.wall_proximity
             if escape_delta > 0:
                 # Moving away from nearest wall.
-                r += self.w.wall_escape_bonus * damage_mult
-                info["wall_escape"] = self.w.wall_escape_bonus * damage_mult
+                r += self.w.wall_escape_bonus
+                info["wall_escape"] = self.w.wall_escape_bonus
             elif escape_delta < -0.05:
-                # Moving deeper toward wall — penalise (proportional to
-                # how fast). Mild, but enough to break ties when the
-                # value function is indifferent between directions.
-                r += self.w.wall_escape_bonus * 0.5 * escape_delta * damage_mult
-                info["wall_approach"] = self.w.wall_escape_bonus * 0.5 * escape_delta * damage_mult
+                # Moving deeper toward wall — mild penalty.
+                approach_pen = self.w.wall_escape_bonus * 0.5 * escape_delta
+                r += approach_pen
+                info["wall_approach"] = approach_pen
 
         # ── Mobile combat bonuses ────────────────────────────────
         # Reward dealing damage while moving. Strafing (lateral movement)

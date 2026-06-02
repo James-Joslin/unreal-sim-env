@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug SAC Training",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "training.main",
+            "args": [
+                "--method", "sac",
+                "--curriculum"
+            ],
+            "justMyCode": true
+        }
+    ]
+}
