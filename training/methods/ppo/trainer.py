@@ -561,4 +561,6 @@ class PPOTrainer(BaseTrainer):
               f"Best eval win rate: {self.best_eval_win_rate:.0%}")
 
         vec_env.close()
-        self.writer.close()
+        # Flush but don't close — run_curriculum manages the writer
+        # lifecycle across stages.
+        self.writer.flush()

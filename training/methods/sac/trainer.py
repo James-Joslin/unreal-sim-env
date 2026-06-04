@@ -107,6 +107,15 @@ class SACTrainer(BaseTrainer):
         self.target_entropy_c = ratio * np.log(COMBAT_ACTIONS)
         self.target_entropy_t = ratio * np.log(TARGET_ACTIONS)
 
+        # ── Reward normalizer (running stdev) ────────────────────
+        # Divides rewards by their running standard deviation before
+        # storing in the replay buffer. Keeps Q-value targets bounded
+        # regardless of the raw reward scale. Essential for SAC because
+        # unlike PPO there's no return/advantage normalization.
+        self._reward_running_mean = 0.0
+        self._reward_running_var = 1.0
+        self._reward_count = 1e-4
+
         # BaseTrainer expects self.model and self.optimizer for
         # checkpointing. Point them at the actor.
         self.model = self.actor
@@ -128,10 +137,11 @@ class SACTrainer(BaseTrainer):
         return policy
 
     def default_curriculum_timesteps(self) -> Dict[int, int]:
-        """SAC is more sample-efficient — reduced timestep budgets."""
+        """SAC is more sample-efficient — but needs enough room for
+        learning_starts (5K) plus actual training in every stage."""
         return {
-            1: 25_000,
-            2: 50_000,
+            1: 50_000,         # Was 25K — identical to learning_starts!
+            2: 75_000,         # Was 50K.
             3: 300_000,
             4: 3_000_000,
             5: 6_000_000,
@@ -198,8 +208,14 @@ class SACTrainer(BaseTrainer):
         replay = ReplayBuffer(cfg.buffer_size, self.input_size)
 
         # ── Checkpoint loading ───────────────────────────────────
+        loaded_checkpoint = False
         if self.bc_checkpoint and os.path.exists(self.bc_checkpoint):
             self._load_sac_checkpoint(self.bc_checkpoint)
+            loaded_checkpoint = True
+            # Fresh buffer — don't inherit stale transitions from a
+            # different stage/policy. The loaded policy will fill the
+            # buffer with current-task data during warmup.
+            replay = ReplayBuffer(cfg.buffer_size, self.input_size)
 
         # ── Training state ───────────────────────────────────────
         obs, initial_infos = vec_env.reset()
@@ -227,8 +243,11 @@ class SACTrainer(BaseTrainer):
                 obs_normed = obs
 
             # ── Select actions ───────────────────────────────────
-            if global_step < cfg.learning_starts:
-                # Random actions during warmup.
+            # During warmup, use the LOADED POLICY (not random actions).
+            # Random warmup poisons the buffer with uninformative data
+            # that teaches the critic "all actions are roughly equal."
+            # Only fall back to random if no checkpoint was loaded.
+            if global_step < cfg.learning_starts and not loaded_checkpoint:
                 m_acts = np.random.randint(0, MOVEMENT_ACTIONS, self.num_envs)
                 c_acts = np.random.randint(0, COMBAT_ACTIONS, self.num_envs)
                 t_acts = np.random.randint(0, TARGET_ACTIONS, self.num_envs)
@@ -259,10 +278,29 @@ class SACTrainer(BaseTrainer):
 
             # ── Store transitions ────────────────────────────────
             terminals = np.logical_or(dones, truncateds).astype(np.float32)
+
+            # Normalize rewards to prevent Q-value explosion.
+            # Running stdev keeps Q-targets bounded regardless of
+            # the raw reward scale (kills=35, wins=50+).
+            scaled_rewards = rewards.copy()
+            if cfg.normalize_rewards:
+                for r in rewards:
+                    self._reward_count += 1
+                    delta = r - self._reward_running_mean
+                    self._reward_running_mean += delta / self._reward_count
+                    delta2 = r - self._reward_running_mean
+                    self._reward_running_var += (
+                        delta * delta2 - self._reward_running_var
+                    ) / self._reward_count
+                reward_std = max(np.sqrt(self._reward_running_var), 1e-4)
+                scaled_rewards = rewards / reward_std
+
+            scaled_rewards = scaled_rewards * cfg.reward_scale
+
             replay.add_batch(
                 obs_normed, next_obs_normed,
                 m_acts, c_acts, t_acts,
-                rewards, terminals,
+                scaled_rewards, terminals,
                 next_m_masks, next_c_masks, next_t_masks,
             )
 
@@ -297,8 +335,15 @@ class SACTrainer(BaseTrainer):
                     and global_step % cfg.train_freq < self.num_envs
                     and len(replay) >= cfg.batch_size):
 
+                # Critic-only warmup: train Q-networks before the actor
+                # starts chasing Q-gradients. This gives the critic time
+                # to differentiate Q-values across actions.
+                actor_enabled = (global_step >= cfg.learning_starts
+                                 + cfg.critic_warmup_steps)
+
                 for _ in range(cfg.gradient_steps):
-                    metrics = self._update(replay)
+                    metrics = self._update(
+                        replay, update_actor=actor_enabled)
                     updates_done += 1
 
                 # Log training metrics.
@@ -327,6 +372,12 @@ class SACTrainer(BaseTrainer):
                         "train/entropy_t", metrics["entropy_t"], global_step)
                     self.writer.add_scalar(
                         "train/q_mean", metrics["q_mean"], global_step)
+                    self.writer.add_scalar(
+                        "train/q_gap_m", metrics["q_gap_m"], global_step)
+                    self.writer.add_scalar(
+                        "train/q_gap_c", metrics["q_gap_c"], global_step)
+                    self.writer.add_scalar(
+                        "train/q_gap_t", metrics["q_gap_t"], global_step)
                     self.writer.add_scalar(
                         "train/updates", updates_done, global_step)
 
@@ -400,13 +451,17 @@ class SACTrainer(BaseTrainer):
               f"Best win rate: {self.best_eval_win_rate:.0%}")
 
         vec_env.close()
-        self.writer.close()
+        # Flush but don't close — run_curriculum manages the writer
+        # lifecycle across stages. Closing here would leave the next
+        # stage's writer in a bad state after run_curriculum creates it.
+        self.writer.flush()
 
     # ═════════════════════════════════════════════════════════════
     #  SAC Update Step
     # ═════════════════════════════════════════════════════════════
 
-    def _update(self, replay: ReplayBuffer) -> dict:
+    def _update(self, replay: ReplayBuffer,
+                update_actor: bool = True) -> dict:
         """Single SAC gradient step: critic → actor → α → target."""
         cfg = self.cfg
         batch = replay.sample(cfg.batch_size)
@@ -451,6 +506,13 @@ class SACTrainer(BaseTrainer):
             # Bellman target (shared across heads).
             target = rewards + cfg.gamma * (1 - dones) * (v_m + v_c + v_t)
 
+            # Clip target to prevent extreme values from propagating.
+            # Without this, a single large reward can spike the target
+            # to 200+, causing the critic to overfit to that sample and
+            # destabilise subsequent updates.
+            if cfg.q_target_clip > 0:
+                target = target.clamp(-cfg.q_target_clip, cfg.q_target_clip)
+
         # Current Q-values for taken actions (additive decomposition).
         (cq1_m, cq1_c, cq1_t), (cq2_m, cq2_c, cq2_t) = self.critic(obs)
 
@@ -472,43 +534,80 @@ class SACTrainer(BaseTrainer):
         nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.max_grad_norm)
         self.critic_optimizer.step()
 
-        # ── 2. Actor update ──────────────────────────────────────
-        # Freeze critic to save compute (actor loss doesn't backprop
-        # through Q-networks, only through the policy).
-        for p in self.critic.parameters():
-            p.requires_grad = False
+        # ── 2. Actor update (skipped during critic-only warmup) ───
+        actor_loss_val = 0.0
+        alpha_loss_val = 0.0
+        ent_m_val = 0.0
+        ent_c_val = 0.0
+        ent_t_val = 0.0
+        q_gap_m = 0.0
+        q_gap_c = 0.0
+        q_gap_t = 0.0
 
-        (m_p, c_p, t_p), (m_lp, c_lp, t_lp), (ent_m, ent_c, ent_t) = \
-            self.actor.get_action_probs(obs)
+        if update_actor:
+            # Freeze critic to save compute.
+            for p in self.critic.parameters():
+                p.requires_grad = False
 
-        # Use Q1 only for actor update (standard SAC practice).
-        (aq1_m, aq1_c, aq1_t), _ = self.critic(obs)
+            (m_p, c_p, t_p), (m_lp, c_lp, t_lp), (ent_m, ent_c, ent_t) = \
+                self.actor.get_action_probs(obs)
 
-        # Policy loss: E_s[sum_a π(a|s) * (α * log π(a|s) - Q(s,a))]
-        actor_loss_m = (m_p * (alpha_m.detach() * m_lp - aq1_m)).sum(dim=-1)
-        actor_loss_c = (c_p * (alpha_c.detach() * c_lp - aq1_c)).sum(dim=-1)
-        actor_loss_t = (t_p * (alpha_t.detach() * t_lp - aq1_t)).sum(dim=-1)
-        actor_loss = (actor_loss_m + actor_loss_c + actor_loss_t).mean()
+            # Use Q1 only for actor update (standard SAC practice).
+            (aq1_m, aq1_c, aq1_t), _ = self.critic(obs)
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.max_grad_norm)
-        self.actor_optimizer.step()
+            # [Fix] Center Q-values per head to create advantage-like signal.
+            # Without centering, the actor loss is dominated by the absolute
+            # Q-scale. When Q(s, a_i) ≈ 5.0 for all actions, the α * log π
+            # term (~0.1) is irrelevant and the actor has no gradient to
+            # concentrate probability. Centering removes the mean so the
+            # actor responds to RELATIVE Q-differences across actions.
+            aq1_m_c = aq1_m - aq1_m.mean(dim=-1, keepdim=True)
+            aq1_c_c = aq1_c - aq1_c.mean(dim=-1, keepdim=True)
+            aq1_t_c = aq1_t - aq1_t.mean(dim=-1, keepdim=True)
 
-        # Unfreeze critic.
-        for p in self.critic.parameters():
-            p.requires_grad = True
+            # Policy loss with centered Q-values.
+            actor_loss_m = (m_p * (alpha_m.detach() * m_lp - aq1_m_c)).sum(dim=-1)
+            actor_loss_c = (c_p * (alpha_c.detach() * c_lp - aq1_c_c)).sum(dim=-1)
+            actor_loss_t = (t_p * (alpha_t.detach() * t_lp - aq1_t_c)).sum(dim=-1)
+            actor_loss = (actor_loss_m + actor_loss_c + actor_loss_t).mean()
 
-        # ── 3. Entropy temperature (α) update ────────────────────
-        # α adjusts to maintain target entropy per head.
-        alpha_loss_m = -self.log_alpha_m * (ent_m.mean() - self.target_entropy_m).detach()
-        alpha_loss_c = -self.log_alpha_c * (ent_c.mean() - self.target_entropy_c).detach()
-        alpha_loss_t = -self.log_alpha_t * (ent_t.mean() - self.target_entropy_t).detach()
-        alpha_loss = alpha_loss_m + alpha_loss_c + alpha_loss_t
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.max_grad_norm)
+            self.actor_optimizer.step()
 
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
+            # Unfreeze critic.
+            for p in self.critic.parameters():
+                p.requires_grad = True
+
+            # Diagnostic: Q-gap per head.
+            with torch.no_grad():
+                q_gap_m = (aq1_m.max(dim=-1).values - aq1_m.mean(dim=-1)).mean().item()
+                q_gap_c = (aq1_c.max(dim=-1).values - aq1_c.mean(dim=-1)).mean().item()
+                q_gap_t = (aq1_t.max(dim=-1).values - aq1_t.mean(dim=-1)).mean().item()
+
+            # ── 3. Entropy temperature (α) update ────────────────
+            alpha_loss_m = self.log_alpha_m.exp() * (ent_m.mean() - self.target_entropy_m).detach()
+            alpha_loss_c = self.log_alpha_c.exp() * (ent_c.mean() - self.target_entropy_c).detach()
+            alpha_loss_t = self.log_alpha_t.exp() * (ent_t.mean() - self.target_entropy_t).detach()
+            alpha_loss = alpha_loss_m + alpha_loss_c + alpha_loss_t
+
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
+            # Clamp α to prevent runaway.
+            with torch.no_grad():
+                max_log_alpha = np.log(cfg.alpha_max)
+                self.log_alpha_m.clamp_(max=max_log_alpha)
+                self.log_alpha_c.clamp_(max=max_log_alpha)
+                self.log_alpha_t.clamp_(max=max_log_alpha)
+
+            actor_loss_val = actor_loss.item()
+            alpha_loss_val = alpha_loss.item()
+            ent_m_val = ent_m.mean().item()
+            ent_c_val = ent_c.mean().item()
+            ent_t_val = ent_t.mean().item()
 
         # ── 4. Soft target update (Polyak averaging) ─────────────
         with torch.no_grad():
@@ -520,12 +619,15 @@ class SACTrainer(BaseTrainer):
 
         return {
             "critic_loss": critic_loss.item(),
-            "actor_loss": actor_loss.item(),
-            "alpha_loss": alpha_loss.item(),
-            "entropy_m": ent_m.mean().item(),
-            "entropy_c": ent_c.mean().item(),
-            "entropy_t": ent_t.mean().item(),
+            "actor_loss": actor_loss_val,
+            "alpha_loss": alpha_loss_val,
+            "entropy_m": ent_m_val,
+            "entropy_c": ent_c_val,
+            "entropy_t": ent_t_val,
             "q_mean": q1_taken.mean().item(),
+            "q_gap_m": q_gap_m,
+            "q_gap_c": q_gap_c,
+            "q_gap_t": q_gap_t,
         }
 
     # ═════════════════════════════════════════════════════════════

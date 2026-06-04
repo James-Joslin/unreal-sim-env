@@ -54,7 +54,7 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 #  Constants (match NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 231  # Was 215. +16 from spatial ring and cover height expansion (8→16 rays).
+OBS_SIZE = 215
                 # [198-200] 2nd projectile (dist,dirX,dirY)
                 # [201-203] 3rd projectile (dist,dirX,dirY)
                 # [204]     incoming threat count
@@ -932,25 +932,42 @@ def _ray_circle_intersect_t(
     origin: np.ndarray, direction: np.ndarray,
     center: np.ndarray, radius: float, trace_len: float,
 ):
-    """Returns t in [0, 1] of ray hitting a circle, or None.
+    """Returns t in [0, 1] of a sphere sweep hitting a circle, or None.
 
     origin:    ray start (2D)
     direction: unit direction vector (2D)
     center:    circle center (2D)
-    radius:    circle radius
+    radius:    effective detection radius (character + sweep)
     trace_len: max ray length (t is normalised by this)
+
+    Handles the case where the agent is already inside the detection
+    circle (returns 0.0 = touching). This matches UE5's SweepSingle
+    which reports bStartPenetrating when the sweep shape overlaps a
+    pawn at the start position.
     """
     oc = center - origin
+    dist_sq = float(np.dot(oc, oc))
+    r_sq = radius * radius
+
+    # If the agent is already inside the detection circle, report
+    # immediate contact regardless of ray direction. Without this,
+    # a character whose center is behind the ray (proj < 0) but
+    # within detection range would be missed — a parity bug with
+    # C++ SweepSingle which correctly reports initial overlaps.
+    if dist_sq < r_sq:
+        return 0.0
+
     proj = float(np.dot(oc, direction))
     if proj < 0:
-        return None  # Circle is behind the ray.
-    d_sq = float(np.dot(oc, oc)) - proj * proj
-    r_sq = radius * radius
+        return None  # Circle is behind the ray AND we're outside it.
+
+    d_sq = dist_sq - proj * proj
     if d_sq > r_sq:
         return None  # Ray misses the circle.
+
     t_hit = proj - math.sqrt(r_sq - d_sq)
     if t_hit < 0:
-        t_hit = 0.0  # Ray starts inside the circle.
+        t_hit = 0.0  # Shouldn't happen after the dist_sq check, but safe.
     t_norm = t_hit / trace_len
     return t_norm if t_norm <= 1.0 else None
 
@@ -2299,34 +2316,15 @@ class CombatEnv(gym.Env):
             # Multi-agent training would populate these.
             idx += 12
 
-        # ── Spatial Ring (16) ────────────────────────────────────
-        # 16 sphere sweeps at 22.5° spacing. Each sweep uses a sphere
+        # ── Spatial Ring (8) ─────────────────────────────────────
+        # 8 sphere sweeps at 45° spacing. Each sweep uses a sphere
         # with radius = AGENT_BODY_RADIUS, answering "can my body fit
-        # through there?" rather than "is there a thin sightline?"
-        #
-        # A line trace through a 50 UU gap reports "open", but the agent
-        # (60 UU diameter) can't actually fit. The sphere sweep correctly
-        # reports "blocked". Detects obstacles, arena boundaries, and
-        # live characters (targets + allies).
-        #
-        # Matches C++ SweepSingleByChannel with FCollisionShape::MakeSphere.
+        # through there?" Detects obstacles and arena boundaries only.
         TRACE_LEN = 1500.0
-        SWEEP_RADIUS = AGENT_BODY_RADIUS  # 30 UU — agent can't fit if sphere can't
+        SWEEP_RADIUS = AGENT_BODY_RADIUS  # 30 UU
         half = self._arena_half
-        NUM_SPATIAL_RAYS = 16
+        NUM_SPATIAL_RAYS = 8
         angles = [i * (360.0 / NUM_SPATIAL_RAYS) for i in range(NUM_SPATIAL_RAYS)]
-
-        # Gather live character positions for sweep-circle tests.
-        char_positions = []
-        for t in self.targets:
-            if t.alive:
-                char_positions.append(t.pos)
-        for ally in getattr(self, 'allies', []):
-            if ally.alive:
-                char_positions.append(ally.pos)
-
-        # Effective character detection radius: character capsule + sweep sphere.
-        char_detect_r = CHARACTER_DETECT_RADIUS + SWEEP_RADIUS
 
         # Effective arena boundary: the sphere center can't get closer
         # than SWEEP_RADIUS to the wall.
@@ -2353,24 +2351,11 @@ class CombatEnv(gym.Env):
                     if 0 < t_wall < blocked_dist:
                         blocked_dist = t_wall
 
-            # Sweep against characters (inflated detection radius).
-            for cpos in char_positions:
-                t_char = _ray_circle_intersect_t(
-                    a.pos, direction, cpos, char_detect_r, TRACE_LEN)
-                if t_char is not None and t_char < blocked_dist:
-                    blocked_dist = t_char
-
             obs[idx] = blocked_dist; idx += 1
 
-        # ── Cover Height (16) ─────────────────────────────────────
+        # ── Cover Height (8) ──────────────────────────────────────
         # Continuous obstacle height per direction, normalised by 500.
-        # Only detects OBSTACLES, not characters (you can't hide behind
-        # a moving person). 16 rays matching the spatial ring.
-        #   0.0 = open space (no obstacle in this direction)
-        #   0.1–0.6 = low cover of varying height
-        #   0.7 = full wall (350 / 500, matching C++ HighTraceHeight)
-        # The model compares these against ArcClearance per weapon slot
-        # at [227-230] to decide which weapons can fire over which cover.
+        # 8 rays matching the spatial ring.
         HIGH_TRACE_HEIGHT = 350.0
         for ang in angles:
             rad = math.radians(ang)
