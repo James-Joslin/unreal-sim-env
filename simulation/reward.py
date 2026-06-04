@@ -1321,43 +1321,27 @@ class CombatRewardFunction:
             info["ranged_strafe_fire"] = self.w.ranged_strafe_fire
 
         # Standing still when melee threat is closing.
-        #
-        # [Fix] EXEMPT if active weapon has significant wind-up (>= 0.3s).
-        # Heavy weapons REQUIRE standing still during the wind-up animation.
-        # The old penalty punished exactly the behaviour a heavy loadout
-        # needs: planting feet and committing to a slow, powerful shot.
-        # A scout with 0.0s wind-up still gets penalised for standing still.
-        wind_up_exempt = curr.active_weapon_wind_up_time >= 0.3
+        # Applies to ALL weapons — agents CAN move during wind-up,
+        # they just can't fire again until it completes. Standing still
+        # with a closing threat is always bad regardless of weapon type.
         if (curr.target_distance < danger_range * 2.0
                 and curr.self_speed < 0.1
-                and curr.target_distance < prev.target_distance
-                and not wind_up_exempt):
+                and curr.target_distance < prev.target_distance):
             r += self.w.ranged_standing_still_threat
             info["ranged_standing_still"] = self.w.ranged_standing_still_threat
 
-        # [Fix] Heavy weapon commit bonus: landing hits with a slow weapon
-        # means the agent committed to a stationary firing position for the
-        # full wind-up duration. Reward proportionally to wind-up time.
-        # This directly counteracts the value function's learned caution
-        # about animation locks — the bonus makes the commitment profitable.
-        #   Cannon (0.5s wind-up):  0.04 * min(0.5/0.5, 2.0) = 0.04
-        #   Railgun (1.0s wind-up): 0.04 * min(1.0/0.5, 2.0) = 0.08
-        #   Scout (0.0s wind-up):   exempt (threshold not met)
+        # Heavy weapon commit bonus: landing hits with a slow weapon
+        # (wind-up >= 0.3s) means the agent committed to a fire action
+        # and waited through the wind-up delay. Reward proportionally.
+        # NOTE: this does NOT encourage standing still — the agent
+        # should fire, then reposition during the wind-up/cooldown.
+        # The bonus is for LANDING THE HIT, not for being immobile.
         if (curr.total_damage_all_targets > 0
                 and curr.active_weapon_wind_up_time >= 0.3):
             commit_scale = min(curr.active_weapon_wind_up_time / 0.5, 2.0)
             commit_bonus = self.w.heavy_fire_commit_bonus * commit_scale
             r += commit_bonus
             info["heavy_fire_commit"] = commit_bonus
-
-        # [Fix] Holding ground bonus: heavy weapons reward maintaining
-        # position when in optimal range. The agent shouldn't kite with
-        # a cannon — it should set up and fire. Light weapons don't get
-        # this because they SHOULD be mobile.
-        if (is_heavy_weapon and curr.in_optimal_range
-                and curr.agent_speed < 50 and curr.target_alive):
-            r += 0.005
-            info["heavy_holding_ground"] = 0.005
 
         return r
 

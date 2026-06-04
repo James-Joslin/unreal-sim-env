@@ -16,10 +16,10 @@ class PPOConfig:
     clip_range: float = 0.08
     vf_clip_range: float = 10.0     # Value function clipping — prevents
                                      # huge value updates at stage transitions.
-    entropy_coef: float = 0.015      # Start of entropy anneal range.
+    entropy_coef: float = 0.01      # Start of entropy anneal range.
                                      # Higher than before (0.01) to maintain
                                      # exploration with the larger obs space.
-    entropy_coef_final: float = 0.003 # Entropy decays to this. Slightly higher
+    entropy_coef_final: float = 0.001 # Entropy decays to this. Slightly higher
                                       # than before (0.002) — the 231-feature
                                       # obs has more local optima to escape.
     value_coef: float = 0.5

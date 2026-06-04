@@ -60,7 +60,7 @@ from torch.utils.data import Dataset
 from combat_sim import MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 
 # Must match NeuralCombatTypes.h
-SINGLE_OBS_SIZE = 231
+SINGLE_OBS_SIZE = 215
 METADATA_COLS = 5  # EncounterID, EnemyName, Archetype, Frame, CombatTime
 
 
