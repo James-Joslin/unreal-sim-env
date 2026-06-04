@@ -69,26 +69,37 @@ def evaluate(
 
             # Build action mask (same as training — prevents invalid actions).
             mask_dict = raw_env.build_action_mask()
-            m_mask = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
-            c_mask = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
-            t_mask = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
 
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs_normed).float().unsqueeze(0).to(device)
-                outputs = model(obs_t)
 
-                if is_actor_critic:
-                    m_l, c_l, t_l, _ = outputs
+                # Use autoregressive selection if the model supports it
+                # (applies masks inside the sequential head computation).
+                # Falls back to independent argmax for legacy models.
+                if hasattr(model, 'select_actions'):
+                    m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
+                    c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
+                    t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
+                    m_a, c_a, t_a = model.select_actions(
+                        obs_t, (m_mask_t, c_mask_t, t_mask_t))
+                    m = m_a.item()
+                    c = c_a.item()
+                    t = t_a.item()
                 else:
-                    m_l, c_l, t_l = outputs
-
-                # Apply masks before argmax — matches training pipeline.
-                m_l = m_l.masked_fill(~m_mask, -1e8)
-                c_l = c_l.masked_fill(~c_mask, -1e8)
-                t_l = t_l.masked_fill(~t_mask, -1e8)
-                m = m_l.argmax(1).item()
-                c = c_l.argmax(1).item()
-                t = t_l.argmax(1).item()
+                    outputs = model(obs_t)
+                    if is_actor_critic:
+                        m_l, c_l, t_l, _ = outputs
+                    else:
+                        m_l, c_l, t_l = outputs
+                    m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
+                    c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
+                    t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
+                    m_l = m_l.masked_fill(~m_mask_t, -1e8)
+                    c_l = c_l.masked_fill(~c_mask_t, -1e8)
+                    t_l = t_l.masked_fill(~t_mask_t, -1e8)
+                    m = m_l.argmax(1).item()
+                    c = c_l.argmax(1).item()
+                    t = t_l.argmax(1).item()
 
             obs, reward, done, truncated, _ = env.step(np.array([m, c, t]))
             ep_reward += reward
