@@ -548,7 +548,7 @@ def run_distillation(
 
                 models[tier] = student
 
-            # Export + verify + benchmark.
+            # Export + verify + benchmark + evaluate.
             onnx_path = export_onnx(
                 models[tier], tier, output_dir,
                 frame_stack=fs, obs_normalizer=obs_normalizer)
@@ -557,8 +557,18 @@ def run_distillation(
                 frame_stack=fs, obs_normalizer=obs_normalizer)
             ms = benchmark_onnx(onnx_path, input_size)
 
+            # In-sim evaluation — the real test of distillation quality.
+            eval_stats = _evaluate_tier(
+                models[tier], stages[-1], archetype, fs,
+                obs_normalizer, device, num_eval_episodes=50)
+
             params = sum(p.numel() for p in models[tier].parameters())
-            results[tier] = {"params": params, "ms": ms, "path": onnx_path}
+            results[tier] = {
+                "params": params, "ms": ms, "path": onnx_path,
+                "win_rate": eval_stats["win_rate"],
+                "mean_reward": eval_stats["mean_reward"],
+                "mean_kills": eval_stats["mean_kills"],
+            }
 
         # For iterated amplification, the improved teacher-tier model
         # becomes the policy for the next iteration.
@@ -566,15 +576,39 @@ def run_distillation(
             current_policy = models[teacher_tier]
 
     # ── Summary ──────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"{'Tier':>8} | {'Params':>10} | {'Size':>8} | {'Latency':>10}")
-    print(f"{'-'*48}")
+    print(f"\n{'='*70}")
+    print(f"{'Tier':>8} | {'Params':>10} | {'Size':>8} | {'Latency':>10} | {'Win':>5} | {'Kills':>5} | {'Reward':>7}")
+    print(f"{'-'*70}")
     for tier in [t for t, *_ in distill_chain if t in results]:
         r = results[tier]
         size_kb = os.path.getsize(r["path"]) / 1024
         ms_str = f"{r['ms']:.3f} ms" if r["ms"] else "N/A"
-        print(f"{tier:>8} | {r['params']:>10,} | {size_kb:>6.1f} KB | {ms_str:>10}")
-    print(f"{'='*60}")
+        print(f"{tier:>8} | {r['params']:>10,} | {size_kb:>6.1f} KB | {ms_str:>10} "
+              f"| {r['win_rate']:>4.0%} | {r['mean_kills']:>5.1f} | {r['mean_reward']:>+7.1f}")
+    print(f"{'='*70}")
+
+
+def _evaluate_tier(model, stage, archetype, frame_stack,
+                   obs_normalizer, device, num_eval_episodes=50):
+    """Run in-sim evaluation for a distilled model tier.
+
+    Uses the same seeded evaluation as training — deterministic
+    scenarios with autoregressive masked action selection.
+    """
+    from training.evaluation import evaluate
+
+    model.eval().to(device)
+    stats = evaluate(
+        model, stage, archetype, num_eval_episodes,
+        device, frame_stack=frame_stack,
+        obs_normalizer=obs_normalizer,
+        base_seed=42,
+        is_actor_critic=False,  # CombatPolicy has no value head.
+    )
+    print(f"  Eval: win={stats['win_rate']:.0%}, "
+          f"kills={stats['mean_kills']:.1f}, "
+          f"reward={stats['mean_reward']:+.1f}")
+    return stats
 
 
 def _regenerate_logits(model, obs_array, device, batch_size=512):
