@@ -197,8 +197,10 @@ class PPOTrainer(BaseTrainer):
                  if warmup_steps > 0 else ""))
 
         # ── Buffer ───────────────────────────────────────────────
+        gru_hidden = getattr(self.model, 'gru_hidden', 0)
         buffer = VecRolloutBuffer(
-            cfg.num_steps, self.num_envs, self.input_size)
+            cfg.num_steps, self.num_envs, self.input_size,
+            gru_hidden=gru_hidden)
 
         # ── Training state ───────────────────────────────────────
         obs, initial_infos = vec_env.reset()
@@ -226,6 +228,12 @@ class PPOTrainer(BaseTrainer):
             self.model.eval()
             rollout_episodes = 0
 
+            # GRU hidden state per env (persists across steps, resets on done).
+            if gru_hidden > 0 and not hasattr(self, '_rollout_hidden'):
+                self._rollout_hidden = self.model.init_hidden(
+                    self.num_envs, self.device)
+            hidden = getattr(self, '_rollout_hidden', None)
+
             for step in range(cfg.num_steps):
                 # Normalise observations.
                 if self.obs_normalizer:
@@ -237,9 +245,17 @@ class PPOTrainer(BaseTrainer):
                 with torch.no_grad():
                     obs_t = torch.from_numpy(obs_normed).float().to(
                         self.device)
-                    actions, log_probs, _, values = \
-                        self.model.get_action_and_value(
-                            obs_t, masks=current_masks)
+
+                    result = self.model.get_action_and_value(
+                        obs_t, masks=current_masks, hidden=hidden)
+
+                    # GRU models return 5 values, non-GRU return 4.
+                    if len(result) == 5:
+                        actions, log_probs, _, values, new_hidden = result
+                    else:
+                        actions, log_probs, _, values = result
+                        new_hidden = None
+
                     m_acts = actions[0].cpu().numpy()
                     c_acts = actions[1].cpu().numpy()
                     t_acts = actions[2].cpu().numpy()
@@ -286,6 +302,17 @@ class PPOTrainer(BaseTrainer):
                 buffer.m_masks[step] = current_masks[0].cpu().numpy()
                 buffer.c_masks[step] = current_masks[1].cpu().numpy()
                 buffer.t_masks[step] = current_masks[2].cpu().numpy()
+
+                # Store GRU hidden state (BEFORE this step's GRU update).
+                if gru_hidden > 0 and hidden is not None:
+                    buffer.hiddens[step] = hidden.squeeze(0).cpu().numpy()
+
+                # Advance hidden state and reset for done envs.
+                if new_hidden is not None:
+                    hidden = new_hidden
+                    for i in range(self.num_envs):
+                        if dones[i] or truncateds[i]:
+                            hidden[0, i] = 0.0
 
                 # Update masks for NEXT step from env infos.
                 current_masks = self.extract_masks(infos)
@@ -345,6 +372,10 @@ class PPOTrainer(BaseTrainer):
 
             buffer.compute_gae(last_values, cfg.gamma, cfg.gae_lambda)
 
+            # Persist hidden state for next rollout.
+            if hidden is not None:
+                self._rollout_hidden = hidden.detach()
+
             # ── PPO Update ───────────────────────────────────────
             self.model.train()
 
@@ -391,9 +422,17 @@ class PPOTrainer(BaseTrainer):
                         batch["t_masks"].to(self.device),
                     )
 
+                    # Feed stored hidden states for GRU conditioning.
+                    b_hidden = None
+                    if "hiddens" in batch:
+                        # [batch, gru_hidden] → [1, batch, gru_hidden]
+                        b_hidden = batch["hiddens"].to(
+                            self.device).unsqueeze(0)
+
                     new_lp, entropy, new_val = \
                         self.model.evaluate_actions(
-                            b_obs, b_m, b_c, b_t, masks=b_masks)
+                            b_obs, b_m, b_c, b_t,
+                            masks=b_masks, hidden=b_hidden)
 
                     # Policy loss (clipped).
                     ratio = (new_lp - b_old_lp).exp()
