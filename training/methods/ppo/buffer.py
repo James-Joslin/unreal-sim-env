@@ -22,10 +22,12 @@ class VecRolloutBuffer:
     For minibatch sampling, they're flattened to [num_steps * num_envs, ...].
     """
 
-    def __init__(self, num_steps: int, num_envs: int, obs_size: int):
+    def __init__(self, num_steps: int, num_envs: int, obs_size: int,
+                 gru_hidden: int = 0):
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.obs_size = obs_size
+        self.gru_hidden = gru_hidden
         self.total = num_steps * num_envs
 
         self.obs = np.zeros(
@@ -55,6 +57,10 @@ class VecRolloutBuffer:
             (num_steps, num_envs, COMBAT_ACTIONS), dtype=bool)
         self.t_masks = np.ones(
             (num_steps, num_envs, TARGET_ACTIONS), dtype=bool)
+        # GRU hidden states (stored for PPO update).
+        if gru_hidden > 0:
+            self.hiddens = np.zeros(
+                (num_steps, num_envs, gru_hidden), dtype=np.float32)
 
     def compute_gae(self, last_values: np.ndarray, gamma: float,
                     lam: float):
@@ -79,7 +85,7 @@ class VecRolloutBuffer:
 
     def flatten(self):
         """Flatten [num_steps, num_envs] → [total] for minibatch sampling."""
-        return {
+        flat = {
             "obs": self.obs.reshape(self.total, self.obs_size),
             "m_acts": self.m_acts.reshape(self.total),
             "c_acts": self.c_acts.reshape(self.total),
@@ -92,6 +98,9 @@ class VecRolloutBuffer:
             "c_masks": self.c_masks.reshape(self.total, COMBAT_ACTIONS),
             "t_masks": self.t_masks.reshape(self.total, TARGET_ACTIONS),
         }
+        if self.gru_hidden > 0:
+            flat["hiddens"] = self.hiddens.reshape(self.total, self.gru_hidden)
+        return flat
 
     def sample_minibatches(self, batch_size: int):
         flat = self.flatten()

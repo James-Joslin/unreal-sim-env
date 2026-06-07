@@ -1,31 +1,13 @@
 """
-actor_critic.py — PPO ActorCritic with autoregressive action heads.
+actor_critic.py — PPO ActorCritic with GRU memory + autoregressive heads.
 
-The actor samples actions SEQUENTIALLY:
-    1. movement  = P(m | obs)
-    2. combat    = P(c | obs, m)       ← conditioned on chosen movement
-    3. target    = P(t | obs, m, c)    ← conditioned on movement + combat
-
-This lets the policy learn action correlations: "if I chose FIRE, I
-should select the target I'm facing" becomes a learnable conditional
-rather than a coincidence of independent distributions.
-
-Projection layers before combat/target heads keep the head OUTPUT shapes
-identical to the non-autoregressive model, so old checkpoints partially
-load (heads transfer, new embedding/projection layers init fresh).
-
-KEY NAMING CONVENTION
-    ActorCritic keys          CombatPolicy keys
-    ──────────────────        ──────────────────
-    actor_encoder.*       →   encoder.*
-    actor_backbone.*      →   backbone.*
-    move_head.*           →   move_head.*
-    move_embed.*          →   move_embed.*          (NEW)
-    combat_proj.*         →   combat_proj.*         (NEW)
-    combat_head.*         →   combat_head.*
-    combat_embed.*        →   combat_embed.*        (NEW)
-    target_proj.*         →   target_proj.*         (NEW)
-    target_head.*         →   target_head.*
+Architecture:
+    obs → DeltaEncoder → StructuredEncoder → backbone → GRU → heads
+    
+The GRU gives episodic memory — the agent remembers the entire encounter.
+The critic does NOT use the GRU (it estimates V(s) from the current 
+observation only). This simplifies hidden state management: only the 
+actor's hidden state needs to be tracked per agent.
 """
 
 import torch
@@ -55,7 +37,11 @@ def _build_backbone(input_size: int, hidden: int, num_layers: int) -> nn.Sequent
 
 
 class ActorCritic(nn.Module):
-    """PPO actor-critic with autoregressive action heads."""
+    """PPO actor-critic with GRU memory and autoregressive action heads.
+    
+    The actor path: encoder → backbone → GRU → heads.
+    The critic path: encoder → backbone → value_head (no GRU).
+    """
 
     def __init__(self, obs_size=OBS_SIZE, hidden=128, tier="large"):
         super().__init__()
@@ -64,11 +50,13 @@ class ActorCritic(nn.Module):
         unique_dim = cfg["unique_dim"]
         backbone_hidden = cfg["backbone_hidden"]
         backbone_layers = cfg["backbone_layers"]
+        gru_hidden = cfg["gru_hidden"]
 
         self.obs_size = obs_size
         self.frame_stack = max(1, obs_size // OBS_SIZE) if obs_size > OBS_SIZE else 1
         self.tier = tier
         self.backbone_hidden = backbone_hidden
+        self.gru_hidden = gru_hidden
 
         # Delta encoding (no learnable params, shared).
         self.delta = DeltaEncoder(self.frame_stack)
@@ -76,7 +64,6 @@ class ActorCritic(nn.Module):
         # Group encoders (separate for actor/critic).
         self.actor_encoder = StructuredEncoder(entity_dim, unique_dim)
         self.critic_encoder = StructuredEncoder(entity_dim, unique_dim)
-
         channel_dim = self.actor_encoder.channel_dim
         concat_dim = 3 * channel_dim
 
@@ -86,32 +73,34 @@ class ActorCritic(nn.Module):
         self.critic_backbone = _build_backbone(
             concat_dim, backbone_hidden, backbone_layers)
 
-        # ── Autoregressive policy heads ──────────────────────────
-        # Head 1: movement (unconditioned — same as before).
-        self.move_head = layer_init(
-            nn.Linear(backbone_hidden, MOVEMENT_ACTIONS), std=0.01)
+        # GRU on actor only.
+        self.gru = nn.GRU(backbone_hidden, gru_hidden, num_layers=1,
+                          batch_first=True)
 
-        # Embedding for conditioning subsequent heads.
+        # ── Autoregressive policy heads (on GRU output) ─────────
+        self.move_head = layer_init(
+            nn.Linear(gru_hidden, MOVEMENT_ACTIONS), std=0.01)
         self.move_embed = nn.Embedding(MOVEMENT_ACTIONS, ACTION_EMBED_DIM)
 
-        # Head 2: combat (conditioned on movement).
-        # Projection fuses action embedding with backbone features.
         self.combat_proj = layer_init(
-            nn.Linear(backbone_hidden + ACTION_EMBED_DIM, backbone_hidden))
+            nn.Linear(gru_hidden + ACTION_EMBED_DIM, gru_hidden))
         self.combat_head = layer_init(
-            nn.Linear(backbone_hidden, COMBAT_ACTIONS), std=0.01)
-
+            nn.Linear(gru_hidden, COMBAT_ACTIONS), std=0.01)
         self.combat_embed = nn.Embedding(COMBAT_ACTIONS, ACTION_EMBED_DIM)
 
-        # Head 3: target (conditioned on movement + combat).
         self.target_proj = layer_init(
-            nn.Linear(backbone_hidden + 2 * ACTION_EMBED_DIM, backbone_hidden))
+            nn.Linear(gru_hidden + 2 * ACTION_EMBED_DIM, gru_hidden))
         self.target_head = layer_init(
-            nn.Linear(backbone_hidden, TARGET_ACTIONS), std=0.01)
+            nn.Linear(gru_hidden, TARGET_ACTIONS), std=0.01)
 
-        # Value head (critic).
+        # Value head (critic — no GRU, uses backbone directly).
         self.value_head = layer_init(
             nn.Linear(backbone_hidden, 1), std=1.0)
+
+    def init_hidden(self, batch_size=1, device=None):
+        if device is None:
+            device = next(self.parameters()).device
+        return torch.zeros(1, batch_size, self.gru_hidden, device=device)
 
     def _encode(self, obs, encoder):
         deltas = self.delta(obs)
@@ -123,66 +112,36 @@ class ActorCritic(nn.Module):
     def _scaled(self, raw):
         return torch.tanh(raw) * LOGIT_SCALE
 
-    def _get_actor_features(self, obs):
-        return self.actor_backbone(self._encode(obs, self.actor_encoder))
-
-    def _get_critic_features(self, obs):
-        return self.critic_backbone(self._encode(obs, self.critic_encoder))
+    def _actor_features(self, obs, hidden):
+        """Encode through actor path + GRU. Returns (gru_output, new_hidden)."""
+        backbone_out = self.actor_backbone(
+            self._encode(obs, self.actor_encoder))
+        gru_in = backbone_out.unsqueeze(1)
+        gru_out, hidden_out = self.gru(gru_in, hidden)
+        return gru_out.squeeze(1), hidden_out
 
     def _autoregressive_logits(self, features, m_action, c_action):
-        """Compute all three logit tensors with autoregressive conditioning.
-
-        Args:
-            features: backbone output [batch, backbone_hidden]
-            m_action: movement actions for conditioning [batch] (ints)
-            c_action: combat actions for conditioning [batch] (ints)
-
-        Returns:
-            m_logits, c_logits, t_logits
-        """
         m_logits = self._scaled(self.move_head(features))
-
         m_emb = self.move_embed(m_action)
         c_features = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
         c_logits = self._scaled(self.combat_head(c_features))
-
         c_emb = self.combat_embed(c_action)
         t_features = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
         t_logits = self._scaled(self.target_head(t_features))
-
         return m_logits, c_logits, t_logits
 
-    # ─── forward (for basic eval — uses unmasked argmax for conditioning) ───
+    # ─── get_action_and_value (training rollout) ─────────────────
 
-    def forward(self, obs):
-        actor_feat = self._get_actor_features(obs)
-        critic_feat = self._get_critic_features(obs)
+    def get_action_and_value(self, obs, masks=None, hidden=None):
+        batch = obs.shape[0]
+        if hidden is None:
+            hidden = self.init_hidden(batch, obs.device)
 
-        # Autoregressive: sample m, condition c, condition t.
-        m_logits = self._scaled(self.move_head(actor_feat))
-        m_action = m_logits.argmax(dim=-1)
-
-        m_emb = self.move_embed(m_action)
-        c_features = F.gelu(self.combat_proj(
-            torch.cat([actor_feat, m_emb], dim=-1)))
-        c_logits = self._scaled(self.combat_head(c_features))
-        c_action = c_logits.argmax(dim=-1)
-
-        c_emb = self.combat_embed(c_action)
-        t_features = F.gelu(self.target_proj(
-            torch.cat([actor_feat, m_emb, c_emb], dim=-1)))
-        t_logits = self._scaled(self.target_head(t_features))
-
-        value = self.value_head(critic_feat)
-        return m_logits, c_logits, t_logits, value
-
-    # ─── get_action_and_value (training rollout — masked sequential sampling) ───
-
-    def get_action_and_value(self, obs, masks=None):
-        actor_feat = self._get_actor_features(obs)
-        critic_feat = self._get_critic_features(obs)
+        actor_feat, hidden_out = self._actor_features(obs, hidden)
+        critic_feat = self.critic_backbone(
+            self._encode(obs, self.critic_encoder))
 
         # Head 1: movement.
         m_logits = self._scaled(self.move_head(actor_feat))
@@ -216,15 +175,20 @@ class ActorCritic(nn.Module):
         entropy = m_dist.entropy() + c_dist.entropy() + t_dist.entropy()
         value = self.value_head(critic_feat).squeeze(-1)
 
-        return (m_act, c_act, t_act), log_prob, entropy, value
+        return (m_act, c_act, t_act), log_prob, entropy, value, hidden_out
 
-    # ─── evaluate_actions (PPO update — uses given actions for conditioning) ───
+    # ─── evaluate_actions (PPO update) ───────────────────────────
 
-    def evaluate_actions(self, obs, m_act, c_act, t_act, masks=None):
-        actor_feat = self._get_actor_features(obs)
-        critic_feat = self._get_critic_features(obs)
+    def evaluate_actions(self, obs, m_act, c_act, t_act,
+                         masks=None, hidden=None):
+        batch = obs.shape[0]
+        if hidden is None:
+            hidden = self.init_hidden(batch, obs.device)
 
-        # Use the PROVIDED actions for conditioning (teacher forcing).
+        actor_feat, _ = self._actor_features(obs, hidden)
+        critic_feat = self.critic_backbone(
+            self._encode(obs, self.critic_encoder))
+
         m_logits, c_logits, t_logits = self._autoregressive_logits(
             actor_feat, m_act, c_act)
 
@@ -244,11 +208,14 @@ class ActorCritic(nn.Module):
 
         return log_prob, entropy, value
 
-    # ─── select_actions (eval — masked autoregressive argmax) ───
+    # ─── select_actions (eval — masked autoregressive argmax) ────
 
-    def select_actions(self, obs, masks):
-        """Deterministic action selection with proper autoregressive masking."""
-        actor_feat = self._get_actor_features(obs)
+    def select_actions(self, obs, masks, hidden=None):
+        batch = obs.shape[0]
+        if hidden is None:
+            hidden = self.init_hidden(batch, obs.device)
+
+        actor_feat, hidden_out = self._actor_features(obs, hidden)
         m_mask, c_mask, t_mask = masks
 
         m_logits = self._scaled(self.move_head(actor_feat))
@@ -269,13 +236,14 @@ class ActorCritic(nn.Module):
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
         t = t_logits.argmax(dim=-1)
 
-        return m, c, t
+        return m, c, t, hidden_out
 
     def get_value(self, obs):
-        critic_feat = self._get_critic_features(obs)
+        critic_feat = self.critic_backbone(
+            self._encode(obs, self.critic_encoder))
         return self.value_head(critic_feat).squeeze(-1)
 
-    # ─── Checkpoint loading ───
+    # ─── Checkpoint loading ──────────────────────────────────────
 
     def load_from_ppo_checkpoint(self, ckpt_path, reinit_critic=False):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)

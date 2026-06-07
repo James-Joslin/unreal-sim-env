@@ -61,6 +61,11 @@ def evaluate(
         done = False
         num_targets = len(raw_env.targets)
 
+        # GRU hidden state (reset per episode).
+        hidden = None
+        if hasattr(model, 'init_hidden'):
+            hidden = model.init_hidden(1, device)
+
         while not done:
             if obs_normalizer:
                 obs_normed = obs_normalizer.normalize(obs)
@@ -73,15 +78,18 @@ def evaluate(
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs_normed).float().unsqueeze(0).to(device)
 
-                # Use autoregressive selection if the model supports it
-                # (applies masks inside the sequential head computation).
-                # Falls back to independent argmax for legacy models.
                 if hasattr(model, 'select_actions'):
                     m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
                     c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
                     t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
-                    m_a, c_a, t_a = model.select_actions(
-                        obs_t, (m_mask_t, c_mask_t, t_mask_t))
+                    result = model.select_actions(
+                        obs_t, (m_mask_t, c_mask_t, t_mask_t), hidden)
+                    # GRU models return (m, c, t, hidden_out).
+                    # Non-GRU models return (m, c, t).
+                    if len(result) == 4:
+                        m_a, c_a, t_a, hidden = result
+                    else:
+                        m_a, c_a, t_a = result
                     m = m_a.item()
                     c = c_a.item()
                     t = t_a.item()
