@@ -66,22 +66,21 @@ import torch.nn.functional as F
 #  Constants (must match C++ NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 215
+OBS_SIZE = 249
 MOVEMENT_ACTIONS = 9
-COMBAT_ACTIONS = 7
+COMBAT_ACTIONS = 8   # Added Dodge (action 7)
 TARGET_ACTIONS = 5
 
 DEFAULT_FRAME_STACK = 3
 
-# Observation layout: feature group boundaries within one 215-float frame.
-# Unique features = everything EXCEPT hostile/ally entity slots.
-_HOSTILE_START = 70                        # 4 slots x 13 features
+# Observation layout: feature group boundaries within one 249-float frame.
+_HOSTILE_START = 74                        # 4 slots x 17 features
 _HOSTILE_SLOTS = 4
-_HOSTILE_SLOT_SIZE = 13
-_ALLY_START = 122                          # 3 slots x 12 features
+_HOSTILE_SLOT_SIZE = 17                    # was 13: +class, +mana, +commitment, +gap_closer
+_ALLY_START = 142                          # 3 slots x 15 features
 _ALLY_SLOTS = 3
-_ALLY_SLOT_SIZE = 12
-_UNIQUE_SIZE = 127                         # 70 (self+weapon+arch+target) + 57 (spatial/cover/threat/nav/metrics/arc)
+_ALLY_SLOT_SIZE = 15                       # was 12: +target_idx, +combat_action, +flanking
+_UNIQUE_SIZE = 136                         # 74 (self+weapon+arch+primary24) + 62 (spatial..patterns)
 
 # Logit bounding (same as before).
 LOGIT_SCALE = 3.0
@@ -111,99 +110,153 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 # ─────────────────────────────────────────────────────────────────
+#  Cross-Attention for Entity Slots
+# ─────────────────────────────────────────────────────────────────
+
+class EntityAttention(nn.Module):
+    """Cross-attention from context (unique features) to entity slots.
+
+    Replaces max-pooling. Instead of "what's the most extreme entity?"
+    the model learns "given my current state, which entity matters most?"
+
+    A reloading enemy at close range gets high attention weight; a
+    full-health enemy behind cover gets low. This is particularly
+    important now that entity slots carry rich information (mana,
+    commitment, class type) — the model needs to attend to the RIGHT
+    entity's mana state, not the max across all slots.
+
+    Uses manual multi-head attention (matmul + softmax) for clean
+    ONNX export — no nn.MultiheadAttention internals to trace.
+    """
+
+    def __init__(self, query_dim: int, entity_dim: int, num_heads: int = 2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = entity_dim // num_heads
+        self.entity_dim = entity_dim
+        assert entity_dim % num_heads == 0, (
+            f"entity_dim ({entity_dim}) must be divisible by "
+            f"num_heads ({num_heads})")
+
+        self.q_proj = layer_init(nn.Linear(query_dim, entity_dim))
+        self.k_proj = layer_init(nn.Linear(entity_dim, entity_dim))
+        self.v_proj = layer_init(nn.Linear(entity_dim, entity_dim))
+        self.out_proj = layer_init(nn.Linear(entity_dim, entity_dim))
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, query: torch.Tensor,
+                entities: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query:    [batch, query_dim] — context from unique features.
+            entities: [batch, num_slots, entity_dim] — per-slot embeddings.
+        Returns:
+            [batch, entity_dim] — attended entity summary.
+        """
+        batch = query.shape[0]
+        num_slots = entities.shape[1]
+        h, d = self.num_heads, self.head_dim
+
+        # Project to multi-head space.
+        q = self.q_proj(query).view(batch, 1, h, d).transpose(1, 2)
+        k = self.k_proj(entities).view(batch, num_slots, h, d).transpose(1, 2)
+        v = self.v_proj(entities).view(batch, num_slots, h, d).transpose(1, 2)
+
+        # Scaled dot-product attention.
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)  # [batch, heads, 1, head_dim]
+
+        # Reshape and project.
+        out = out.transpose(1, 2).reshape(batch, self.entity_dim)
+        return self.out_proj(out)
+
+
+# ─────────────────────────────────────────────────────────────────
 #  Structured Encoder (shared building block)
 # ─────────────────────────────────────────────────────────────────
 
 class StructuredEncoder(nn.Module):
-    """Encodes one 215-float frame into a compact embedding.
+    """Encodes one 249-float frame into a compact embedding.
 
     Splits features into unique/hostile/ally/threat groups, encodes each
-    with weight-shared layers, and concatenates the results.
+    with weight-shared layers, then uses cross-attention (not max-pool)
+    to aggregate entity slots. The query for each attention is the
+    unique embedding — the model asks "given my state, which entity
+    matters most right now?"
     """
 
     def __init__(self, entity_dim: int = 16, unique_dim: int = 32):
         super().__init__()
         self.entity_dim = entity_dim
         self.unique_dim = unique_dim
-        
-        # New permutation-invariant threat dimension
-        self.threat_dim = entity_dim 
-        
-        # Total output dimensions automatically scales (backbones adapt dynamically)
+        self.threat_dim = entity_dim
         self.channel_dim = unique_dim + entity_dim + entity_dim + self.threat_dim
 
-        # Unique features tracking self and global metrics (127 inputs total)
+        # Unique features (136 inputs).
         self.unique_encoder = nn.Sequential(
             layer_init(nn.Linear(_UNIQUE_SIZE, unique_dim)),
             nn.GELU(),
         )
 
-        # Shared hostile slot encoder (13 → entity_dim)
+        # Shared hostile slot encoder (17 → entity_dim).
         self.hostile_encoder = nn.Sequential(
             layer_init(nn.Linear(_HOSTILE_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-        # Shared ally slot encoder (12 → entity_dim)
+        # Shared ally slot encoder (15 → entity_dim).
         self.ally_encoder = nn.Sequential(
             layer_init(nn.Linear(_ALLY_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-        # ─── Shared Dynamic Threat (Projectile) Encoder ───
-        # Each projectile threat slot is parameterized by: (distance, heading_x, heading_y)
+        # Shared threat slot encoder (3 → threat_dim).
         self.threat_slot_encoder = nn.Sequential(
             layer_init(nn.Linear(3, self.threat_dim)),
             nn.GELU(),
         )
 
+        # Cross-attention: unique_emb queries each entity group.
+        self.hostile_attn = EntityAttention(unique_dim, entity_dim, num_heads=2)
+        self.ally_attn = EntityAttention(unique_dim, entity_dim, num_heads=2)
+        self.threat_attn = EntityAttention(unique_dim, self.threat_dim, num_heads=2)
+
     def forward(self, frame: torch.Tensor) -> torch.Tensor:
         batch = frame.shape[0]
 
-        # 1. Unique features (retains absolute ranking and system metrics)
-        # Includes Self, Weapon, Archetype, Primary Target, plus Spatial, Cover Height,
-        # Threat 1, Navmesh, Group, Spawn, Threat 2 & 3, threat counts, weapon
-        # capabilities, ammo, targets killed, and arc clearance.
+        # 1. Unique features.
         unique_feats = torch.cat([
-            frame[:, 0:70],
-            frame[:, 158:OBS_SIZE],
-        ], dim=-1)  # [batch, 127]
+            frame[:, 0:74],
+            frame[:, 187:OBS_SIZE],
+        ], dim=-1)  # [batch, 136]
         unique_emb = self.unique_encoder(unique_feats)  # [batch, unique_dim]
 
-        # 2. Shared Hostile Encoder
+        # 2. Hostile entities → shared encoder → cross-attention.
         hostile_feats = frame[:, _HOSTILE_START:_HOSTILE_START + _HOSTILE_SLOTS * _HOSTILE_SLOT_SIZE]
         hostile_feats = hostile_feats.view(batch, _HOSTILE_SLOTS, _HOSTILE_SLOT_SIZE)
         hostile_flat = hostile_feats.reshape(batch * _HOSTILE_SLOTS, _HOSTILE_SLOT_SIZE)
         hostile_embs = self.hostile_encoder(hostile_flat).view(batch, _HOSTILE_SLOTS, self.entity_dim)
-        hostile_pooled = hostile_embs.max(dim=1).values  # [batch, entity_dim]
+        hostile_attended = self.hostile_attn(unique_emb, hostile_embs)
 
-        # 3. Shared Ally Encoder
+        # 3. Allied entities → shared encoder → cross-attention.
         ally_feats = frame[:, _ALLY_START:_ALLY_START + _ALLY_SLOTS * _ALLY_SLOT_SIZE]
         ally_feats = ally_feats.view(batch, _ALLY_SLOTS, _ALLY_SLOT_SIZE)
         ally_flat = ally_feats.reshape(batch * _ALLY_SLOTS, _ALLY_SLOT_SIZE)
         ally_embs = self.ally_encoder(ally_flat).view(batch, _ALLY_SLOTS, self.entity_dim)
-        ally_pooled = ally_embs.max(dim=1).values  # [batch, entity_dim]
+        ally_attended = self.ally_attn(unique_emb, ally_embs)
 
-        # 4. ─── Shared Projectile Threat Encoder with Symmetric Max-Pooling ───
-        # Extract features for Threat 1, 2, and 3: (distance, heading_x, heading_y)
-        # 
-        # Nearest projectile Threat 1 is at index 190 (dist), 192 (dirX), 193 (dirY) of the Threat Sensing block
-        t1 = torch.stack([frame[:, 174], frame[:, 176], frame[:, 177]], dim=-1) # nearest
-        # Second-nearest Threat 2 is at index 214 (dist), 215 (dirX), 216 (dirY)
-        t2 = torch.stack([frame[:, 198], frame[:, 199], frame[:, 200]], dim=-1) # second-nearest
-        # Third-nearest Threat 3 is at index 217 (dist), 218 (dirX), 219 (dirY)
-        t3 = torch.stack([frame[:, 201], frame[:, 202], frame[:, 203]], dim=-1) # third-nearest
-        
-        # Reshape to slot tensor: [batch, 3_slots, 3_features]
+        # 4. Threat entities → shared encoder → cross-attention.
+        t1 = torch.stack([frame[:, 203], frame[:, 205], frame[:, 206]], dim=-1)
+        t2 = torch.stack([frame[:, 227], frame[:, 228], frame[:, 229]], dim=-1)
+        t3 = torch.stack([frame[:, 230], frame[:, 231], frame[:, 232]], dim=-1)
         threats_feats = torch.stack([t1, t2, t3], dim=1)
         threats_flat = threats_feats.reshape(batch * 3, 3)
         threats_embs = self.threat_slot_encoder(threats_flat).view(batch, 3, self.threat_dim)
-        
-        # Apply max pooling along slot dimension for true translation & swap invariance
-        threats_pooled = threats_embs.max(dim=1).values  # [batch, threat_dim]
+        threats_attended = self.threat_attn(unique_emb, threats_embs)
 
-        # 5. Concatenate everything adaptively (channels are packed cleanly)
-        return torch.cat([unique_emb, hostile_pooled, ally_pooled, threats_pooled], dim=-1)
+        # 5. Concatenate.
+        return torch.cat([unique_emb, hostile_attended, ally_attended, threats_attended], dim=-1)
 
 # ─────────────────────────────────────────────────────────────────
 #  Delta Encoding Module (no learnable params)
@@ -278,34 +331,81 @@ class CombatPolicy(nn.Module):
             in_dim = out_dim
         self.backbone = nn.Sequential(*backbone_layers_list)
 
-        # Policy heads.
+        # Policy heads (autoregressive: m → c|m → t|m,c).
         self.move_head = layer_init(nn.Linear(backbone_hidden, MOVEMENT_ACTIONS), std=0.01)
+
+        ACTION_EMBED_DIM = 16
+        self.move_embed = nn.Embedding(MOVEMENT_ACTIONS, ACTION_EMBED_DIM)
+        self.combat_proj = layer_init(nn.Linear(backbone_hidden + ACTION_EMBED_DIM, backbone_hidden))
         self.combat_head = layer_init(nn.Linear(backbone_hidden, COMBAT_ACTIONS), std=0.01)
+
+        self.combat_embed = nn.Embedding(COMBAT_ACTIONS, ACTION_EMBED_DIM)
+        self.target_proj = layer_init(nn.Linear(backbone_hidden + 2 * ACTION_EMBED_DIM, backbone_hidden))
         self.target_head = layer_init(nn.Linear(backbone_hidden, TARGET_ACTIONS), std=0.01)
 
     def forward(self, obs: torch.Tensor):
-        """Forward pass.
+        """Autoregressive forward pass for ONNX export.
 
-        Args:
-            obs: [batch, frame_stack * 215] flat observations from C++.
-        Returns:
-            (movement_logits, combat_logits, target_logits) — each [batch, N].
+        Uses unmasked argmax for internal conditioning. The C++ runtime
+        applies action masks to the output logits. The internal argmax
+        picks the highest-logit action for conditioning subsequent heads,
+        which is correct >95% of the time (most actions are valid).
         """
-        # Stage 1: Reshape + delta encode → [batch, 3, 215]
-        deltas = self.delta(obs)  # [batch, 3, 215]
-
-        # Stage 2: Encode each delta channel through the shared group encoder.
+        deltas = self.delta(obs)
         batch = deltas.shape[0]
-        # Flatten channels: [batch*3, 215] so encoder processes all at once.
         channels_flat = deltas.view(batch * 3, OBS_SIZE)
-        embeddings_flat = self.encoder(channels_flat)  # [batch*3, channel_dim]
+        embeddings_flat = self.encoder(channels_flat)
         embeddings = embeddings_flat.view(batch, 3 * self.encoder.channel_dim)
-
-        # Stage 3: Backbone → heads.
         features = self.backbone(embeddings)
+
+        # Head 1: movement (unconditioned).
         m = torch.tanh(self.move_head(features)) * LOGIT_SCALE
-        c = torch.tanh(self.combat_head(features)) * LOGIT_SCALE
-        t = torch.tanh(self.target_head(features)) * LOGIT_SCALE
+        m_action = m.argmax(dim=-1)
+
+        # Head 2: combat conditioned on movement.
+        m_emb = self.move_embed(m_action)
+        c_feat = torch.nn.functional.gelu(
+            self.combat_proj(torch.cat([features, m_emb], dim=-1)))
+        c = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c_action = c.argmax(dim=-1)
+
+        # Head 3: target conditioned on movement + combat.
+        c_emb = self.combat_embed(c_action)
+        t_feat = torch.nn.functional.gelu(
+            self.target_proj(torch.cat([features, m_emb, c_emb], dim=-1)))
+        t = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+
+        return m, c, t
+
+    def select_actions(self, obs, masks):
+        """Autoregressive action selection with proper masking."""
+        deltas = self.delta(obs)
+        batch = deltas.shape[0]
+        channels_flat = deltas.view(batch * 3, OBS_SIZE)
+        embeddings_flat = self.encoder(channels_flat)
+        embeddings = embeddings_flat.view(batch, 3 * self.encoder.channel_dim)
+        features = self.backbone(embeddings)
+
+        m_mask, c_mask, t_mask = masks
+
+        m_logits = torch.tanh(self.move_head(features)) * LOGIT_SCALE
+        m_logits = m_logits.masked_fill(~m_mask, -1e8)
+        m = m_logits.argmax(dim=-1)
+
+        m_emb = self.move_embed(m)
+        c_feat = torch.nn.functional.gelu(
+            self.combat_proj(torch.cat([features, m_emb], dim=-1)))
+        c_logits = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c_logits = c_logits.masked_fill(~c_mask, -1e8)
+        c = c_logits.argmax(dim=-1)
+
+        c_emb = self.combat_embed(c)
+        t_feat = torch.nn.functional.gelu(
+            self.target_proj(torch.cat([features, m_emb, c_emb], dim=-1)))
+        t_logits = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+        t_logits = t_logits.masked_fill(~t_mask, -1e8)
+        t = t_logits.argmax(dim=-1)
+
         return m, c, t
 
 

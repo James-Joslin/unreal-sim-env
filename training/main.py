@@ -190,103 +190,16 @@ Examples:
 
 def _run_distillation(teacher_path, output_dir, frame_stack,
                       archetype, num_episodes, epochs):
-    """Run the distillation pipeline.
-
-    Delegates to 02_distill_and_export.py's infrastructure.
-    This keeps distillation code in one place while making it
-    callable from the unified entry point.
-    """
-    # Import lazily to avoid circular deps and keep startup fast.
-    from combat_policy import load_teacher_from_checkpoint, export_onnx, verify_export, make_policy
-    from frame_stack import stacked_obs_size
-    import torch
-    import numpy as np
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load normalizer if present.
-    obs_normalizer = None
-    ckpt = torch.load(teacher_path, map_location="cpu", weights_only=False)
-    fs = ckpt.get("frame_stack", frame_stack)
-
-    if "obs_normalizer" in ckpt:
-        from training.normalizers import RunningNormalizer
-        input_size = stacked_obs_size(fs)
-        obs_normalizer = RunningNormalizer(input_size)
-        obs_normalizer.load_state_dict(ckpt["obs_normalizer"])
-        print(f"Loaded observation normalizer from checkpoint")
-
-    # Load teacher.
-    teacher = load_teacher_from_checkpoint(teacher_path, device)
-
-    # Delegate to 02_distill_and_export if available, otherwise
-    # do a minimal export of just the teacher tier.
-    try:
-        from importlib import import_module
-        distill_mod = import_module("02_distill_and_export")
-
-        # Generate dataset and run full pipeline.
-        dataset = distill_mod.generate_teacher_dataset(
-            teacher, num_episodes=num_episodes,
-            stages=[3, 4, 5, 6, 7], archetype=archetype,
-            frame_stack=fs, device=device,
-            obs_normalizer=obs_normalizer,
-        )
-
-        val_size = int(len(dataset) * 0.1)
-        train_size = len(dataset) - val_size
-        split_gen = torch.Generator().manual_seed(42)
-        train_set, val_set = torch.utils.data.random_split(
-            dataset, [train_size, val_size], generator=split_gen)
-        train_loader = torch.utils.data.DataLoader(
-            train_set, batch_size=256, shuffle=True)
-        val_loader = torch.utils.data.DataLoader(
-            val_set, batch_size=256, shuffle=False)
-
-        # Distill chain.
-        distill_chain = [
-            ("large",  None,     0.0, 0.0, 0),
-            ("medium", "large",  0.7, 3.0, epochs),
-            ("small",  "medium", 0.7, 3.0, epochs),
-            ("micro",  "small",  0.5, 4.0, epochs),
-            ("xl",     "large",  0.7, 3.0, epochs),
-        ]
-
-        models = {"large": teacher}
-
-        for tier, teacher_tier, alpha, temp, ep in distill_chain:
-            print(f"\n── {tier.upper()} ──")
-            if teacher_tier is None:
-                models[tier] = teacher
-            else:
-                student = make_policy(tier, frame_stack=fs)
-                student = distill_mod.distill_from_teacher_data(
-                    student, train_loader, val_loader,
-                    alpha=alpha, temperature=temp, epochs=ep,
-                    device=device, tier_name=tier)
-                models[tier] = student
-
-            onnx_path = export_onnx(
-                models[tier], tier, output_dir,
-                frame_stack=fs, obs_normalizer=obs_normalizer)
-            verify_export(
-                models[tier], onnx_path,
-                frame_stack=fs, obs_normalizer=obs_normalizer)
-
-        print(f"\nAll ONNX models saved to: {output_dir}/")
-
-    except (ImportError, ModuleNotFoundError):
-        # Fallback: just export the teacher directly.
-        print("02_distill_and_export not found — exporting teacher only")
-        teacher_tier = ckpt.get("tier", "large")
-        onnx_path = export_onnx(
-            teacher, teacher_tier, output_dir,
-            frame_stack=fs, obs_normalizer=obs_normalizer)
-        verify_export(
-            teacher, onnx_path,
-            frame_stack=fs, obs_normalizer=obs_normalizer)
-        print(f"Exported: {onnx_path}")
+    """Delegate to the distillation module."""
+    from training.distillation import run_distillation
+    run_distillation(
+        teacher_path=teacher_path,
+        output_dir=output_dir,
+        frame_stack=frame_stack,
+        archetype=archetype,
+        num_episodes=num_episodes,
+        epochs=epochs,
+    )
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 #  Constants (match NeuralCombatTypes.h)
 # ─────────────────────────────────────────────────────────────────
 
-OBS_SIZE = 215
+OBS_SIZE = 249
                 # [198-200] 2nd projectile (dist,dirX,dirY)
                 # [201-203] 3rd projectile (dist,dirX,dirY)
                 # [204]     incoming threat count
@@ -63,12 +63,93 @@ OBS_SIZE = 215
                 # [210]     targets killed fraction
                 # [211-214] arc clearance per weapon slot (MaxArcableObstacleHeight / 3000)
 MOVEMENT_ACTIONS = 9
-COMBAT_ACTIONS = 7
+COMBAT_ACTIONS = 8  # Added Dodge (action 7)
 TARGET_ACTIONS = 5
 
 DEFENCE_CONSTANT = 100.0
 MIN_DAMAGE = 1.0
 AGENT_BODY_RADIUS = 30.0  # UU — prevents agent from visually clipping into obstacles
+
+# ── Character type normalised encoding (maps to ECharacterType) ──
+CHARACTER_TYPE_MAP = {
+    "knight": 0.0, "rogue": 0.2, "ranger": 0.4,
+    "mage": 0.6, "healer": 0.8, "none": 0.5,
+}
+
+# ── Player pattern tracking ──────────────────────────────────────
+class PlayerPatternTracker:
+    """Tracks EMAs of player behavior for observation encoding."""
+
+    def __init__(self, alpha: float = 0.05):
+        self.alpha = alpha
+        self.aggression = 0.0       # Fire rate EMA
+        self.evasion = 0.0          # Dodge frequency EMA
+        self.predictability = 0.5   # Movement entropy (0=predictable, 1=random)
+        self.preferred_range = 0.5  # Normalised engagement distance
+        self.mana_burn_rate = 0.0   # Mana spend rate EMA
+        # Direction histogram for predictability (8 bins).
+        self._dir_hist = np.zeros(8, dtype=np.float32)
+        self._fire_count = 0
+        self._dodge_count = 0
+        self._tick_count = 0
+
+    def update(self, targets, agent_pos, dt, arena_half):
+        """Called once per sim tick with all target data."""
+        self._tick_count += 1
+        total_aggression = 0.0
+        total_range = 0.0
+        total_mana_rate = 0.0
+        n_alive = 0
+
+        for t in targets:
+            if not t.alive:
+                continue
+            n_alive += 1
+
+            # Aggression: was this target attacking this tick?
+            if t.commitment > 0.01:
+                total_aggression += 1.0
+
+            # Range to agent.
+            dist = np.linalg.norm(t.pos - agent_pos)
+            total_range += dist / (arena_half * 2)
+
+            # Mana burn: how fast are they spending?
+            if t.max_mana > 0:
+                total_mana_rate += (1.0 - t.mana_fraction())
+
+            # Movement direction for predictability.
+            speed = np.linalg.norm(t.velocity)
+            if speed > 10.0:
+                angle = math.atan2(t.velocity[1], t.velocity[0])
+                bin_idx = int((angle + math.pi) / (math.pi / 4)) % 8
+                self._dir_hist[bin_idx] += 1.0
+
+        if n_alive > 0:
+            a = self.alpha
+            self.aggression = self.aggression * (1 - a) + (total_aggression / n_alive) * a
+            self.preferred_range = self.preferred_range * (1 - a) + (total_range / n_alive) * a
+            self.mana_burn_rate = self.mana_burn_rate * (1 - a) + (total_mana_rate / n_alive) * a
+
+        # Decay direction histogram and compute entropy.
+        self._dir_hist *= 0.99
+        total = self._dir_hist.sum()
+        if total > 1e-6:
+            probs = self._dir_hist / total
+            entropy = 0.0
+            for p in probs:
+                if p > 0.001:
+                    entropy -= p * math.log(p)
+            self.predictability = min(1.0, entropy / math.log(8))
+
+    def as_array(self) -> np.ndarray:
+        return np.array([
+            self.aggression,
+            self.evasion,
+            self.predictability,
+            self.preferred_range,
+            self.mana_burn_rate,
+        ], dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -80,7 +161,7 @@ class Archetype(IntEnum):
 
 class CombatAction(IntEnum):
     NONE = 0; FIRE = 1; RELOAD = 2
-    SWITCH_0 = 3; SWITCH_1 = 4; MELEE = 5; BLOCK = 6
+    SWITCH_0 = 3; SWITCH_1 = 4; MELEE = 5; BLOCK = 6; DODGE = 7
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -614,6 +695,30 @@ class Target:
     # Combat role: "ranged", "melee", "mixed" (has both).
     combat_role: str = "ranged"
 
+    # ── Character type (maps to ECharacterType) ──────────────────
+    # "knight"=0.0, "rogue"=0.2, "ranger"=0.4, "mage"=0.6, "healer"=0.8
+    character_type: str = "mage"
+    character_type_float: float = 0.6  # Pre-computed normalised value.
+
+    # ── Mana system ──────────────────────────────────────────────
+    mana: float = 50.0
+    max_mana: float = 50.0
+    mana_regen_per_second: float = 5.0
+    mana_regen_delay: float = 2.0      # Seconds after spending before regen starts.
+    mana_regen_delay_remaining: float = 0.0
+
+    # ── Cast / attack commitment ─────────────────────────────────
+    commitment: float = 0.0            # 0=idle, 0-1=animation progress.
+    commitment_duration: float = 0.0   # Total duration of current action.
+    commitment_timer: float = 0.0      # Time elapsed in current action.
+
+    # ── Gap-closer ability ───────────────────────────────────────
+    gap_closer_range: float = 600.0    # Max dash/charge range.
+    gap_closer_cooldown: float = 8.0   # Cooldown duration.
+    gap_closer_cooldown_remaining: float = 0.0
+    gap_closer_speed: float = 3000.0   # Dash speed during gap-close.
+    has_gap_closer: bool = True        # Whether this character has one.
+
     # Ranged attack stats.
     attack_damage: float = 18.0
     attack_range: float = 1200.0
@@ -621,6 +726,8 @@ class Target:
     attack_cooldown_remaining: float = 0.0
     attack_projectile_speed: float = 1800.0
     attack_stat: float = 8.0
+    attack_mana_cost: float = 8.0      # Mana cost per ranged attack/spell.
+    attack_cast_time: float = 0.4      # Cast time before projectile fires.
 
     # Melee attack stats.
     melee_damage: float = 30.0
@@ -628,6 +735,8 @@ class Target:
     melee_cooldown: float = 0.8
     melee_cooldown_remaining: float = 0.0
     melee_stat: float = 12.0
+    melee_mana_cost: float = 0.0       # Melee usually free.
+    melee_commit_time: float = 0.3     # Swing animation duration.
 
     # [Audit §5.4] Targets should roll crits, matching C++ ProcessAttack.
     crit_chance: float = 0.05
@@ -643,6 +752,54 @@ class Target:
 
     def hp_fraction(self) -> float:
         return max(0, self.hp / self.max_hp)
+
+    def mana_fraction(self) -> float:
+        return max(0, self.mana / self.max_mana) if self.max_mana > 0 else 0.0
+
+    def gap_closer_threat(self, agent_pos) -> float:
+        """Returns 0-1: how threatened the agent is by a gap-closer."""
+        if not self.has_gap_closer or not self.alive:
+            return 0.0
+        if self.gap_closer_cooldown_remaining > 0:
+            return 0.0
+        dist = np.linalg.norm(self.pos - agent_pos)
+        if dist > self.gap_closer_range:
+            return 0.0
+        return 1.0
+
+    def tick_mana(self, dt: float):
+        """Regenerate mana after regen delay."""
+        if self.mana_regen_delay_remaining > 0:
+            self.mana_regen_delay_remaining -= dt
+        elif self.mana < self.max_mana:
+            self.mana = min(self.max_mana,
+                            self.mana + self.mana_regen_per_second * dt)
+        self.gap_closer_cooldown_remaining = max(
+            0, self.gap_closer_cooldown_remaining - dt)
+
+    def tick_commitment(self, dt: float):
+        """Advance cast/attack animation progress."""
+        if self.commitment_duration > 0 and self.commitment_timer < self.commitment_duration:
+            self.commitment_timer += dt
+            self.commitment = min(1.0, self.commitment_timer / self.commitment_duration)
+        else:
+            self.commitment = 0.0
+            self.commitment_duration = 0.0
+            self.commitment_timer = 0.0
+
+    def start_commitment(self, duration: float):
+        """Begin a cast/attack animation."""
+        self.commitment_duration = duration
+        self.commitment_timer = 0.0
+        self.commitment = 0.01
+
+    def spend_mana(self, cost: float) -> bool:
+        """Attempt to spend mana. Returns False if insufficient."""
+        if self.mana < cost:
+            return False
+        self.mana -= cost
+        self.mana_regen_delay_remaining = self.mana_regen_delay
+        return True
 
     def tick_ai(self, dt: float, arena_size: float, agent_pos=None,
                 obstacles=None, rng=None):
@@ -1097,6 +1254,7 @@ class CombatEnv(gym.Env):
         self._prev_alive_allies: int = 0  # Track ally deaths between steps
         self.threat_table = ThreatTable()  # [Audit §1.3] Damage-based target priority
         self.rng = random.Random()  # [Audit §4.1] Per-env RNG isolation
+        self._player_patterns = PlayerPatternTracker()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1107,6 +1265,7 @@ class CombatEnv(gym.Env):
         self.reward_fn.reset()
         self._projectiles = []
         self.threat_table.reset()  # [Audit §1.3]
+        self._player_patterns = PlayerPatternTracker()
 
         # Build arena.
         self._build_arena()
@@ -1175,8 +1334,12 @@ class CombatEnv(gym.Env):
                 c_mask[CombatAction.MELEE] = True
 
             # [6] Block — always valid (matches C++ CombatMask[6] = true).
-            # [Audit §1.2] BLOCK is a no-op in C++; mask must match.
             c_mask[CombatAction.BLOCK] = True
+
+            # [7] Dodge — cooldown ready + not already dodging.
+            if (not a.is_dodging
+                    and a.dodge_cooldown_remaining <= 0):
+                c_mask[CombatAction.DODGE] = True
 
         # Target mask — only valid if that slot has an alive target.
         # [Audit §1.3] Sort by priority score (not distance) to match
@@ -1254,6 +1417,12 @@ class CombatEnv(gym.Env):
                           agent_pos=self.agent.pos,
                           obstacles=self.obstacles,
                           rng=self.rng)
+                t.tick_mana(dt)
+                t.tick_commitment(dt)
+
+        # 3b. Update player pattern tracker.
+        self._player_patterns.update(
+            self.targets, self.agent.pos, dt, self._arena_half)
 
         # 4. Targets fight back (simplified: periodic damage to agent).
         self._target_attacks_agent(dt)
@@ -1568,6 +1737,40 @@ class CombatEnv(gym.Env):
 
             self.targets.append(t)
 
+            # Set character type and mana based on combat role.
+            role_to_type = {
+                "melee": "knight",
+                "mixed": "rogue",
+                "ranged": "mage",
+            }
+            t.character_type = role_to_type.get(role, "mage")
+            t.character_type_float = CHARACTER_TYPE_MAP.get(t.character_type, 0.5)
+
+            # Mana: melee characters have minimal/no mana, casters have full.
+            if role == "melee":
+                t.max_mana = 0.0
+                t.mana = 0.0
+                t.attack_mana_cost = 0.0
+                t.melee_mana_cost = 0.0
+                t.has_gap_closer = True
+                t.gap_closer_range = self.rng.uniform(500, 800)
+                t.gap_closer_cooldown = self.rng.uniform(6, 10)
+            elif role == "mixed":
+                t.max_mana = self.rng.uniform(30, 50)
+                t.mana = t.max_mana
+                t.attack_mana_cost = self.rng.uniform(5, 10)
+                t.melee_mana_cost = 0.0
+                t.has_gap_closer = self.rng.random() > 0.5
+                t.gap_closer_range = self.rng.uniform(400, 600)
+                t.gap_closer_cooldown = self.rng.uniform(8, 12)
+            else:  # ranged / mage
+                t.max_mana = self.rng.uniform(40, 80)
+                t.mana = t.max_mana
+                t.attack_mana_cost = self.rng.uniform(6, 12)
+                t.melee_mana_cost = 0.0
+                t.has_gap_closer = False
+                t.attack_cast_time = self.rng.uniform(0.3, 0.6)
+
         self.current_target_idx = 0
 
     # ═════════════════════════════════════════════════════════════
@@ -1794,11 +1997,33 @@ class CombatEnv(gym.Env):
                 agent.targets_hit.add(target.target_id)
 
         elif action == CombatAction.BLOCK:
-            # [Audit §1.2] No-op — matches C++ ENeuralCombatAction::Block
-            # which is a TODO stub. Dodging is handled by the autonomous
-            # auto-dodge system (_try_auto_dodge) triggered by incoming
-            # projectile threats, matching C++ EnemyDodgeComponent.
+            # [Audit §1.2] No-op — matches C++ ENeuralCombatAction::Block.
             pass
+
+        elif action == CombatAction.DODGE:
+            # Model-controlled dodge. The agent chooses WHEN to dodge
+            # (strategic: conserve cooldown for big threats). Direction
+            # is the current movement direction, or away from target
+            # if stationary. Matches C++ EnemyDodgeComponent.
+            if (not agent.is_dodging
+                    and agent.dodge_cooldown_remaining <= 0):
+                agent.is_dodging = True
+                agent.dodge_remaining = agent.dodge_duration
+
+                # Dodge direction: current movement, or away from target.
+                speed = np.linalg.norm(agent.velocity)
+                if speed > 10:
+                    dodge_dir = agent.velocity / speed
+                else:
+                    away = agent.pos - target.pos
+                    away_d = np.linalg.norm(away)
+                    dodge_dir = away / max(away_d, 1)
+
+                agent.dodge_direction = dodge_dir
+                agent.velocity = np.zeros(2, dtype=np.float32)
+                agent.dodge_cooldown_remaining = agent.dodge_cooldown
+                agent.set_action_lock(
+                    agent.dodge_duration + 0.1, 3)  # reason=3 Dodging
 
     def _spawn_agent_projectile(self, slot: WeaponSlot, target, agent, dist: float):
         """Spawn a projectile from the agent toward the target.
@@ -1927,9 +2152,13 @@ class CombatEnv(gym.Env):
             # ── Melee attack (melee and mixed roles) ─────────────
             can_melee = t.combat_role in ("melee", "mixed")
             if can_melee and dist <= t.melee_range:
-                if t.melee_cooldown_remaining <= 0:
+                if t.melee_cooldown_remaining <= 0 and t.commitment <= 0:
+                    # Check mana (melee usually free, but configurable).
+                    if t.melee_mana_cost > 0 and not t.spend_mana(t.melee_mana_cost):
+                        continue
                     t.melee_cooldown_remaining = t.melee_cooldown
-                    t.focus_target_id = 0  # Targeting the agent
+                    t.start_commitment(t.melee_commit_time)
+                    t.focus_target_id = 0
 
                     # [Audit §5.3] Full invulnerability during dodge,
                     # matching C++ DodgeComponent.InvulnerabilityDuration.
@@ -1977,14 +2206,20 @@ class CombatEnv(gym.Env):
 
             if t.attack_cooldown_remaining > 0:
                 continue
+            if t.commitment > 0:
+                continue  # Already casting/swinging.
             if dist > t.attack_range:
                 continue
             if not check_los(t.pos, a.pos, self.obstacles):
                 continue
+            # Check mana cost.
+            if t.attack_mana_cost > 0 and not t.spend_mana(t.attack_mana_cost):
+                continue
 
             # Fire — spawn projectile aimed at agent's predicted position.
             t.attack_cooldown_remaining = t.attack_cooldown
-            t.focus_target_id = 0  # Targeting the agent (id=0)
+            t.start_commitment(t.attack_cast_time)
+            t.focus_target_id = 0
 
             # Lead the shot: predict where agent will be.
             flight_time = dist / max(t.attack_projectile_speed, 500.0)
@@ -2224,7 +2459,7 @@ class CombatEnv(gym.Env):
         obs[idx] = 1.0 if a.any_ammo() else 0; idx += 1
         obs[idx] = 1.0 if a.melee.cooldown_remaining <= 0 else 0; idx += 1
 
-        # ── Primary Target (20) ──────────────────────────────────
+        # ── Primary Target (24) ──────────────────────────────────
         if target and target.alive:
             rel = target.pos - a.pos
             dist = np.linalg.norm(rel)
@@ -2236,14 +2471,8 @@ class CombatEnv(gym.Env):
             has_los = check_los(a.pos, target.pos, self.obstacles)
             obs[idx] = 1.0 if has_los else 0; idx += 1
             obs[idx] = 1.0; idx += 1  # in sight cone (always true in sim)
-            # Self→target facing: uses BODY facing (matches C++ GetActorForwardVector).
-            # During combat, body is locked toward target via SetFocus.
-            # This is 1.0 when facing target, 0.0 when perpendicular, -1.0 when facing away.
             obs[idx] = float(np.dot(a.facing, rel / max(dist, 1)))
             idx += 1
-            # Target→self facing: raw dot product [-1,1] matching C++
-            # ComputeRelativeFacing(Target, Self).
-            # 1.0 = facing directly at agent, -1.0 = facing away.
             to_agent_dir = -rel / max(dist, 1)  # unit vector from target toward agent
             target_facing_dot = float(np.dot(target.facing, to_agent_dir))
             obs[idx] = target_facing_dot; idx += 1
@@ -2262,10 +2491,15 @@ class CombatEnv(gym.Env):
                 to_target = rel / dist
                 closing = float(np.dot(a.velocity - t_vel, to_target))
             obs[idx] = np.clip(closing / 1000, -1, 1); idx += 1
+            # ── New fields (Phase 1) ─────────────────────────
+            obs[idx] = target.character_type_float; idx += 1
+            obs[idx] = target.mana_fraction(); idx += 1
+            obs[idx] = target.commitment; idx += 1
+            obs[idx] = target.gap_closer_threat(a.pos); idx += 1
         else:
-            idx += 20
+            idx += 24
 
-        # ── Hostile Targets (52 = 4 × 13) ───────────────────────
+        # ── Hostile Targets (68 = 4 × 17) ───────────────────────
         # [Audit §1.3] Sort by priority score, not distance, matching
         # C++ ScoredTargets from EvaluateTargetPriority.
         sorted_targets = self._get_sorted_targets()
@@ -2281,7 +2515,6 @@ class CombatEnv(gym.Env):
                 obs[idx] = 1.0 if check_los(a.pos, t.pos, self.obstacles) else 0; idx += 1
                 obs[idx] = 1.0 if t.is_player_controlled else 0; idx += 1
                 # Facing: C++ ComputeRelativeFacing(Target, Owner), raw dot [-1,1].
-                # 1.0 = facing agent, -1.0 = facing away.
                 to_agent = (a.pos - t.pos)
                 to_agent_d = np.linalg.norm(to_agent)
                 if to_agent_d > 1:
@@ -2298,23 +2531,85 @@ class CombatEnv(gym.Env):
                 # Velocity (2D normalised).
                 obs[idx] = np.clip(t.velocity[0] / 600, -1, 1); idx += 1
                 obs[idx] = np.clip(t.velocity[1] / 600, -1, 1); idx += 1
-                # [Audit §1.5] Is targeting me: C++ uses dot(TheirForward, ToMe)
-                # clamped to [0,1] — a continuous facing signal, not binary.
-                # Reuse the to_agent / to_agent_d already computed above.
+                # [Audit §1.5] Is targeting me: continuous facing signal.
                 if to_agent_d > 1:
                     targeting_dot = float(np.dot(t.facing, to_agent / to_agent_d))
                     obs[idx] = max(0.0, min(1.0, targeting_dot))
                 else:
                     obs[idx] = 1.0
                 idx += 1
+                # ── New fields (Phase 1) ─────────────────────────
+                obs[idx] = t.character_type_float; idx += 1
+                obs[idx] = t.mana_fraction(); idx += 1
+                obs[idx] = t.commitment; idx += 1
+                obs[idx] = t.gap_closer_threat(a.pos); idx += 1
             else:
-                idx += 13
+                idx += 17
 
-        # ── Allied Robots (36 = 3 × 12) ─────────────────────────
+        # ── Allied Robots (45 = 3 × 15) ─────────────────────────
+        allies = getattr(self, 'allies', [])
         for si in range(3):
-            # In single-agent env, no allies. Zero-filled.
-            # Multi-agent training would populate these.
-            idx += 12
+            if si < len(allies) and allies[si].alive:
+                ally = allies[si]
+                rel = ally.pos - a.pos
+                dist = np.linalg.norm(rel)
+                obs[idx] = 1.0; idx += 1  # occupied
+                obs[idx] = np.clip(rel[0] / 5000, -1, 1); idx += 1
+                obs[idx] = np.clip(rel[1] / 5000, -1, 1); idx += 1
+                obs[idx] = min(dist / 5000, 1.0); idx += 1
+                obs[idx] = ally.hp_fraction(); idx += 1
+                obs[idx] = 1.0 if check_los(a.pos, ally.pos, self.obstacles) else 0; idx += 1
+                # Velocity (normalised).
+                obs[idx] = np.clip(ally.velocity[0] / 600, -1, 1); idx += 1
+                obs[idx] = np.clip(ally.velocity[1] / 600, -1, 1); idx += 1
+                # Ally facing dot toward agent (computed from velocity).
+                ally_speed = np.linalg.norm(ally.velocity)
+                if ally_speed > 10:
+                    ally_facing = ally.velocity / ally_speed
+                else:
+                    # Stationary: face toward current target.
+                    if (hasattr(ally, 'target_idx')
+                            and ally.target_idx < len(sorted_targets)
+                            and sorted_targets[ally.target_idx].alive):
+                        to_tgt = sorted_targets[ally.target_idx].pos - ally.pos
+                        to_tgt_d = np.linalg.norm(to_tgt)
+                        ally_facing = to_tgt / max(to_tgt_d, 1.0)
+                    else:
+                        ally_facing = np.array([1.0, 0.0], dtype=np.float32)
+                to_me = a.pos - ally.pos
+                to_me_d = np.linalg.norm(to_me)
+                if to_me_d > 1:
+                    obs[idx] = float(np.dot(ally_facing, to_me / to_me_d))
+                else:
+                    obs[idx] = 1.0
+                idx += 1
+                # Weapon state (normalised).
+                obs[idx] = ally.ammo_fraction if hasattr(ally, 'ammo_fraction') else 1.0; idx += 1
+                obs[idx] = 1.0 if getattr(ally, 'is_reloading', False) else 0.0; idx += 1
+                obs[idx] = min(getattr(ally, 'active_weapon_fire_cooldown', 0) / 2.0, 1.0); idx += 1
+                # ── New coordination fields (Phase 1) ────────────
+                # Target index: which hostile is this ally engaging?
+                ally_tgt = getattr(ally, 'target_idx', -1)
+                obs[idx] = (ally_tgt + 1) / 5.0; idx += 1  # -1→0, 0→0.2, 3→0.8
+                # Combat action: what is this ally doing?
+                ally_action = getattr(ally, 'current_combat_action', 0)
+                obs[idx] = ally_action / 7.0; idx += 1  # normalise to [0,1]
+                # Flanking angle: cos between my→target and ally→target.
+                flanking = 0.0
+                if (ally_tgt >= 0
+                        and ally_tgt < len(sorted_targets)
+                        and sorted_targets[ally_tgt].alive):
+                    shared_tgt = sorted_targets[ally_tgt]
+                    my_to_tgt = shared_tgt.pos - a.pos
+                    ally_to_tgt = shared_tgt.pos - ally.pos
+                    my_d = np.linalg.norm(my_to_tgt)
+                    ally_d = np.linalg.norm(ally_to_tgt)
+                    if my_d > 1 and ally_d > 1:
+                        flanking = float(np.dot(
+                            my_to_tgt / my_d, ally_to_tgt / ally_d))
+                obs[idx] = flanking; idx += 1
+            else:
+                idx += 15
 
         # ── Spatial Ring (8) ─────────────────────────────────────
         # 8 sphere sweeps at 45° spacing. Each sweep uses a sphere
@@ -2544,7 +2839,19 @@ class CombatEnv(gym.Env):
                         obs[idx] = 1.0  # unlimited clearance
                     else:
                         obs[idx] = min(w.max_arc_height / 3000.0, 1.0)
-            idx += 1                                               # 211-214
+            idx += 1                                               # 240-243
+
+        # ── Player Patterns (5) ──────────────────────────────────
+        # EMAs of player behavior: aggression, evasion, predictability,
+        # preferred range, mana burn rate. Updated once per tick in
+        # the environment step. Gives the model awareness of player
+        # tendencies for adaptive strategy.
+        if hasattr(self, '_player_patterns'):
+            patterns = self._player_patterns.as_array()
+            for p in patterns:
+                obs[idx] = p; idx += 1
+        else:
+            idx += 5                                               # 244-248
 
         return obs
 
