@@ -64,6 +64,7 @@ class ActorCritic(nn.Module):
         unique_dim = cfg["unique_dim"]
         backbone_hidden = cfg["backbone_hidden"]
         backbone_layers = cfg["backbone_layers"]
+        attention_heads = cfg["attention_heads"]
 
         self.obs_size = obs_size
         self.frame_stack = max(1, obs_size // OBS_SIZE) if obs_size > OBS_SIZE else 1
@@ -74,8 +75,8 @@ class ActorCritic(nn.Module):
         self.delta = DeltaEncoder(self.frame_stack)
 
         # Group encoders (separate for actor/critic).
-        self.actor_encoder = StructuredEncoder(entity_dim, unique_dim)
-        self.critic_encoder = StructuredEncoder(entity_dim, unique_dim)
+        self.actor_encoder = StructuredEncoder(entity_dim, unique_dim, attention_heads)
+        self.critic_encoder = StructuredEncoder(entity_dim, unique_dim, attention_heads)
 
         channel_dim = self.actor_encoder.channel_dim
         concat_dim = 3 * channel_dim
