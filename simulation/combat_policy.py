@@ -89,13 +89,56 @@ LOGIT_SCALE = 3.0
 # ─────────────────────────────────────────────────────────────────
 #  Tier Configurations
 # ─────────────────────────────────────────────────────────────────
-
 TIER_CONFIGS = {
-    "micro":  dict(entity_dim=8,  unique_dim=16, backbone_hidden=32,  backbone_layers=1),
-    "small":  dict(entity_dim=12, unique_dim=24, backbone_hidden=48,  backbone_layers=1),
-    "medium": dict(entity_dim=16, unique_dim=32, backbone_hidden=64,  backbone_layers=2),
-    "large":  dict(entity_dim=16, unique_dim=32, backbone_hidden=96,  backbone_layers=2),
-    "xl":     dict(entity_dim=24, unique_dim=48, backbone_hidden=128, backbone_layers=3),
+    # d_k = 4. Balanced for ultra-low latency. 
+    # Must use 2 heads here; 4 heads would reduce d_k to an un-trainable 2.
+    "micro": dict(
+        entity_dim=8, 
+        unique_dim=16, 
+        backbone_hidden=32, 
+        backbone_layers=1, 
+        attention_heads=2
+    ),
+    
+    # d_k = 8. Sharp jump in capability.
+    # Scaled entity_dim up to 16 so 2 heads get a rich 8-dimensional workspace.
+    "small": dict(
+        entity_dim=16, 
+        unique_dim=32, 
+        backbone_hidden=64, 
+        backbone_layers=1, 
+        attention_heads=2
+    ),
+    
+    # d_k = 8. The entry-level tier for full 4-head behavioral tracking.
+    # entity_dim scaled to 32 to give your 4 heads proper breathing room.
+    "medium": dict(
+        entity_dim=32, 
+        unique_dim=48, 
+        backbone_hidden=96, 
+        backbone_layers=2, 
+        attention_heads=4
+    ),
+    
+    # d_k = 8. A deeper, wider architecture for tracking complex scenarios.
+    # Uses expanded unique contexts and a wider backbone to parse interactions.
+    "large": dict(
+        entity_dim=32,          
+        unique_dim=64,          
+        backbone_hidden=128,    
+        backbone_layers=2,
+        attention_heads=4       
+    ),
+    
+    # d_k = 16. The high-capacity powerhouse model.
+    # Broadens the attention spaces to 16 dimensions per head and deepens the policy network.
+    "xl": dict(
+        entity_dim=64, 
+        unique_dim=96, 
+        backbone_hidden=256, 
+        backbone_layers=3, 
+        attention_heads=4
+    ),
 }
 
 
@@ -129,7 +172,7 @@ class EntityAttention(nn.Module):
     ONNX export — no nn.MultiheadAttention internals to trace.
     """
 
-    def __init__(self, query_dim: int, entity_dim: int, num_heads: int = 2):
+    def __init__(self, query_dim: int, entity_dim: int, num_heads: int = 4):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = entity_dim // num_heads
@@ -177,51 +220,45 @@ class EntityAttention(nn.Module):
 # ─────────────────────────────────────────────────────────────────
 
 class StructuredEncoder(nn.Module):
-    """Encodes one 249-float frame into a compact embedding.
-
-    Splits features into unique/hostile/ally/threat groups, encodes each
-    with weight-shared layers, then uses cross-attention (not max-pool)
-    to aggregate entity slots. The query for each attention is the
-    unique embedding — the model asks "given my state, which entity
-    matters most right now?"
-    """
-
-    def __init__(self, entity_dim: int = 16, unique_dim: int = 32):
+    def __init__(self, entity_dim: int, unique_dim: int, attention_heads: int):
         super().__init__()
         self.entity_dim = entity_dim
         self.unique_dim = unique_dim
         self.threat_dim = entity_dim
         self.channel_dim = unique_dim + entity_dim + entity_dim + self.threat_dim
 
-        # Unique features (136 inputs).
+        # Unique features (136 inputs -> 64)
         self.unique_encoder = nn.Sequential(
-            layer_init(nn.Linear(_UNIQUE_SIZE, unique_dim)),
+            layer_init(nn.Linear(136, unique_dim)),
             nn.GELU(),
         )
 
-        # Shared hostile slot encoder (17 → entity_dim).
+        # Hostile slot encoder (17 -> 32)
         self.hostile_encoder = nn.Sequential(
             layer_init(nn.Linear(_HOSTILE_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-        # Shared ally slot encoder (15 → entity_dim).
+        # Ally slot encoder (15 -> 32)
         self.ally_encoder = nn.Sequential(
             layer_init(nn.Linear(_ALLY_SLOT_SIZE, entity_dim)),
             nn.GELU(),
         )
 
-        # Shared threat slot encoder (3 → threat_dim).
+        # Threat slot encoder (3 -> 32)
         self.threat_slot_encoder = nn.Sequential(
-            layer_init(nn.Linear(3, self.threat_dim)),
+            layer_init(nn.Linear(3, self.threat_dim)), # CHECK THIS
             nn.GELU(),
         )
 
-        # Cross-attention: unique_emb queries each entity group.
-        self.hostile_attn = EntityAttention(unique_dim, entity_dim, num_heads=2)
-        self.ally_attn = EntityAttention(unique_dim, entity_dim, num_heads=2)
-        self.threat_attn = EntityAttention(unique_dim, self.threat_dim, num_heads=2)
-
+        # --- Cross-Attention Layer Gating ---
+        # Dynamically scale hostile and ally tracking using the tier configuration
+        self.hostile_attn = EntityAttention(unique_dim, entity_dim, num_heads=attention_heads)
+        self.ally_attn = EntityAttention(unique_dim, entity_dim, num_heads=attention_heads)
+        
+        threat_heads = 2 if attention_heads >= 2 else 1
+        self.threat_attn = EntityAttention(unique_dim, self.threat_dim, num_heads=threat_heads)
+        
     def forward(self, frame: torch.Tensor) -> torch.Tensor:
         batch = frame.shape[0]
 
@@ -307,7 +344,8 @@ class CombatPolicy(nn.Module):
 
     def __init__(self, frame_stack: int = DEFAULT_FRAME_STACK,
                  entity_dim: int = 16, unique_dim: int = 32,
-                 backbone_hidden: int = 96, backbone_layers: int = 2):
+                 backbone_hidden: int = 96, backbone_layers: int = 2,
+                 attention_heads = 4):
         super().__init__()
         self.frame_stack = frame_stack
 
@@ -315,7 +353,7 @@ class CombatPolicy(nn.Module):
         self.delta = DeltaEncoder(frame_stack)
 
         # Stage 2: Structured group encoder (shared across 3 delta channels).
-        self.encoder = StructuredEncoder(entity_dim, unique_dim)
+        self.encoder = StructuredEncoder(entity_dim, unique_dim, attention_heads)
         channel_dim = self.encoder.channel_dim
         concat_dim = 3 * channel_dim  # 3 delta channels concatenated
 
@@ -422,6 +460,7 @@ def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPoli
         unique_dim=cfg["unique_dim"],
         backbone_hidden=cfg["backbone_hidden"],
         backbone_layers=cfg["backbone_layers"],
+        attention_heads=cfg["attention_heads"]
     )
 
 

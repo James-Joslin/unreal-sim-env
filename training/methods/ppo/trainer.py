@@ -51,12 +51,25 @@ class PPOTrainer(BaseTrainer):
     # ═════════════════════════════════════════════════════════════
 
     def build_model(self) -> nn.Module:
-        """Create ActorCritic and optimizer."""
+        """Create ActorCritic and optimizer with isolated learning rates."""
         model = ActorCritic(
             obs_size=self.input_size, tier=self.tier
         ).to(self.device)
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=self.cfg.lr, eps=1e-5)
+        
+        # Group parameters to protect structural encoders from value loss spikes
+        encoder_params = []
+        head_params = []
+        
+        for name, param in model.named_parameters():
+            if "encoder" in name or "backbone" in name:
+                encoder_params.append(param)
+            else:
+                head_params.append(param)
+                
+        optimizer = torch.optim.Adam([
+            {"params": encoder_params, "lr": self.cfg.lr * 0.5}, # Protected structural rate
+            {"params": head_params, "lr": self.cfg.lr}
+        ], eps=1e-5)
 
         self.model = model
         self.optimizer = optimizer
@@ -496,6 +509,8 @@ class PPOTrainer(BaseTrainer):
             )
 
             # ── Periodic evaluation ──────────────────────────────
+            
+            # ── Periodic evaluation ──────────────────────────────────────────────
             if global_step % cfg.eval_interval < batch_total:
                 eval_stats = self.run_eval(
                     global_step,
@@ -509,41 +524,79 @@ class PPOTrainer(BaseTrainer):
                 else:
                     consecutive_regressions += 1
 
-                # Revert on catastrophic regression.
+                # NESTED INSIDE THE EVAL VAL GATING: Revert on catastrophic regression.
                 current_wr = eval_stats["win_rate"]
-                has_collapsed = (
-                    (self.best_eval_win_rate - current_wr)
-                    > cfg.revert_min_drop
-                )
+                has_collapsed = (self.best_eval_win_rate - current_wr) > cfg.revert_min_drop
+                
                 if (cfg.revert_on_regression
-                        and consecutive_regressions
-                        >= cfg.revert_patience
+                        and consecutive_regressions >= cfg.revert_patience # Now represents evaluation count steps
                         and has_collapsed
                         and self.best_eval_win_rate > 0.05):
                     best_path = os.path.join(
                         self.output_dir,
-                        f"{self.method_name}_stage"
-                        f"{self.stage}_best.pt")
+                        f"{self.method_name}_stage{self.stage}_best.pt"
+                    )
                     if os.path.exists(best_path):
-                        print(
-                            f"  ⚠ Win rate collapsed: "
-                            f"current={current_wr:.0%} "
-                            f"vs best="
-                            f"{self.best_eval_win_rate:.0%} "
-                            f"(>{cfg.revert_min_drop:.0%} drop, "
-                            f"{consecutive_regressions} evals). "
-                            f"Reverting model weights only.")
-                        self.model.load_from_ppo_checkpoint(
-                            best_path)
+                        print(f"  ⚠ Win rate collapsed. Reverting model weights only.")
+                        self.model.load_from_ppo_checkpoint(best_path)
                         if self.obs_normalizer:
-                            ckpt = torch.load(
-                                best_path,
-                                map_location=self.device,
-                                weights_only=False)
-                            if "obs_normalizer" in ckpt:
-                                self.obs_normalizer.load_state_dict(
-                                    ckpt["obs_normalizer"])
+                                ckpt = torch.load(
+                                    best_path,
+                                    map_location=self.device,
+                                    weights_only=False)
+                                if "obs_normalizer" in ckpt:
+                                    self.obs_normalizer.load_state_dict(
+                                        ckpt["obs_normalizer"])
                         consecutive_regressions = 0
+            
+            # if global_step % cfg.eval_interval < batch_total:
+            #     eval_stats = self.run_eval(
+            #         global_step,
+            #         eval_episodes=cfg.num_eval_episodes,
+            #         eval_base_seed=cfg.eval_base_seed,
+            #         batch_total=batch_total,
+            #     )
+
+            #     if self.check_best_model(eval_stats, global_step):
+            #         consecutive_regressions = 0
+            #     else:
+            #         consecutive_regressions += 1
+
+            #     # Revert on catastrophic regression.
+            #     current_wr = eval_stats["win_rate"]
+            #     has_collapsed = (
+            #         (self.best_eval_win_rate - current_wr)
+            #         > cfg.revert_min_drop
+            #     )
+            #     if (cfg.revert_on_regression
+            #             and consecutive_regressions
+            #             >= cfg.revert_patience
+            #             and has_collapsed
+            #             and self.best_eval_win_rate > 0.05):
+            #         best_path = os.path.join(
+            #             self.output_dir,
+            #             f"{self.method_name}_stage"
+            #             f"{self.stage}_best.pt")
+            #         if os.path.exists(best_path):
+            #             print(
+            #                 f"  ⚠ Win rate collapsed: "
+            #                 f"current={current_wr:.0%} "
+            #                 f"vs best="
+            #                 f"{self.best_eval_win_rate:.0%} "
+            #                 f"(>{cfg.revert_min_drop:.0%} drop, "
+            #                 f"{consecutive_regressions} evals). "
+            #                 f"Reverting model weights only.")
+            #             self.model.load_from_ppo_checkpoint(
+            #                 best_path)
+            #             if self.obs_normalizer:
+            #                 ckpt = torch.load(
+            #                     best_path,
+            #                     map_location=self.device,
+            #                     weights_only=False)
+            #                 if "obs_normalizer" in ckpt:
+            #                     self.obs_normalizer.load_state_dict(
+            #                         ckpt["obs_normalizer"])
+            #             consecutive_regressions = 0
 
             # ── Periodic save ────────────────────────────────────
             if global_step % cfg.save_interval < batch_total:

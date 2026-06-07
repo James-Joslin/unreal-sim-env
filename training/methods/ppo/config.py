@@ -1,43 +1,38 @@
-"""
-config.py — PPO hyperparameters.
-
-All PPO-specific tuning lives here. These values have been calibrated
-through extensive experimentation on the combat sim.
-"""
-
 from dataclasses import dataclass
-
 
 @dataclass
 class PPOConfig:
-    lr: float = 3e-4
+    # --- Learning Rate Tuning ---
+    lr: float = 1.2e-4              # Adjusted for multi-head scale properties
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.08
-    vf_clip_range: float = 10.0     # Value function clipping — prevents
-                                     # huge value updates at stage transitions.
-    entropy_coef: float = 0.01      # Start of entropy anneal range.
-                                     # Higher than before (0.01) to maintain
-                                     # exploration with the larger obs space.
-    entropy_coef_final: float = 0.001 # Entropy decays to this. Slightly higher
-                                      # than before (0.002) — the 231-feature
-                                      # obs has more local optima to escape.
-    value_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    num_steps: int = 196             # Steps per env per rollout.
-                                     # Total transitions = num_steps × num_envs.
-    mini_batch_size: int = 256
-    update_epochs: int = 4           # Reduced — action masking makes each step
-                                     # more informative, fewer passes needed.
-    target_kl: float = 0.015         # KL early stopping. If approx KL exceeds
-                                     # this, stop the epoch loop early.
-    total_timesteps: int = 6_000_000
-    eval_interval: int = 10_000
-    save_interval: int = 50_000
+    clip_range: float = 0.08        
+    vf_clip_range: float = 10.0      
+    
+    # --- Exploration Adjustments ---
+    entropy_coef: float = 0.025      
+    entropy_coef_final: float = 0.002 
+    value_coef: float = 0.35         # Lowered to insulate shared encoder from value updates
+    
+    # --- CRITICAL GRADIENT SAFETY ---
+    max_grad_norm: float = 0.3       # RESTORED: Hard ceiling against attention gradient spikes
+    
+    # --- Batching & Update Loops ---
+    num_steps: int = 196             
+    mini_batch_size: int = 512       
+    update_epochs: int = 3           
+    target_kl: float = 0.012         
+    
+    # --- Horizons & Safety Gates ---
+    total_timesteps: int = 9_000_000 
+    eval_interval: int = 20_000      
+    save_interval: int = 100_000
     num_eval_episodes: int = 50
     eval_base_seed: int = 42
     normalize_obs: bool = True
     normalize_returns: bool = True
-    revert_on_regression: bool = True  # Revert on CATASTROPHIC regression only.
-    revert_patience: int = 80          # ~80 evals without improvement before reverting.
-    revert_min_drop: float = 0.15      # Only revert if win rate dropped >15%.
+    
+    # --- Reversion Engine Settings ---
+    revert_on_regression: bool = True
+    revert_patience: int = 4         # Tracked properly inside eval loop now
+    revert_min_drop: float = 0.15
