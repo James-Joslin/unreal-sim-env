@@ -13,6 +13,8 @@ WHAT THIS ADDS (matching NeuralCombatComponent.cpp)
        Matches EnemyPerceptionComponent::EvaluateTargetPriority().
     4. Priority scoring — composite of distance, HP, threat, LOS.
     5. Allied robots — simple scripted allies that fight alongside the agent.
+       AlliedRobot exposes ammo_fraction, is_reloading, fire_cooldown,
+       and current_combat_action for the base class's 15-field ally slots.
     6. Projectile tracking — incoming projectiles with position, velocity,
        time-to-arrival, and direction (for dodge training).
     7. Sight cone — actual vision cone check instead of always-true.
@@ -176,6 +178,28 @@ class AlliedRobot:
     attack_cooldown: float = 1.0
     attack_cooldown_remaining: float = 0.0
     target_idx: int = 0  # Which hostile this ally is targeting.
+    current_combat_action: int = 0  # What the ally is doing (for obs encoding).
+
+    # ── Properties read by base CombatEnv._build_observation() ──
+    # AlliedRobot uses cooldown-based attacks, not a weapon system,
+    # so these map the cooldown state to weapon-like observations.
+
+    @property
+    def ammo_fraction(self) -> float:
+        """Effective ammo: 1.0 when off cooldown, 0.0 when on cooldown."""
+        if self.attack_cooldown <= 0:
+            return 1.0
+        return max(0.0, 1.0 - self.attack_cooldown_remaining / self.attack_cooldown)
+
+    @property
+    def is_reloading(self) -> bool:
+        """No reload mechanic — always False."""
+        return False
+
+    @property
+    def active_weapon_fire_cooldown(self) -> float:
+        """Maps attack_cooldown_remaining for the obs fire_cd field."""
+        return self.attack_cooldown_remaining
 
     def hp_fraction(self) -> float:
         return max(0, self.hp / self.max_hp)
@@ -238,12 +262,18 @@ class AlliedRobot:
             has_los = check_los(self.pos, target.pos, obstacles)
             if has_los:
                 self.attack_cooldown_remaining = self.attack_cooldown
+                # Track combat action: melee archetype = 5 (Melee), others = 1 (Fire).
+                self.current_combat_action = 5 if self.archetype == 1 else 1
                 dmg, target.barrier, _ = compute_damage(
                     self.attack_damage, 5.0, target.defence, target.barrier)
                 target.hp -= dmg
                 if target.hp <= 0:
                     target.hp = 0
                     target.alive = False
+            else:
+                self.current_combat_action = 0  # No LOS — can't attack.
+        else:
+            self.current_combat_action = 0  # Not attacking this tick.
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -293,14 +323,16 @@ class ThreatTable:
 class CombatEnvExtended(CombatEnv):
     """CombatEnv with all observation features properly implemented.
 
-    Adds:
+    The base CombatEnv produces the full 249-float observation vector.
+    This class adds simulation of systems that exist in UE but are
+    simplified in the base sim:
     - Status effects (stun/slow/debuffs) applied randomly by targets
-    - Target acceleration tracking
-    - Threat/priority scoring per hostile
-    - Allied robots (stages 6+)
+    - Target acceleration tracking (fills base's skipped accel slots)
+    - Threat/priority scoring per hostile (fills base's placeholder scores)
+    - Allied robots (stages 6+) with coordination attributes
     - Projectile tracking with TTA
-    - Sight cone checks
-    - Group summary from ally data
+    - Sight cone checks (replaces base's always-true)
+    - Group summary with real ally count (base hardcodes allies=0)
     """
 
     def __init__(self, config: CombatEnvConfig = None, render_mode: str = None):
@@ -609,11 +641,20 @@ class CombatEnvExtended(CombatEnv):
                                 target_ally.alive = False
 
     # ═════════════════════════════════════════════════════════════
-    #  Observation Builder (fills ALL 215 features)
+    #  Observation Builder (fills ALL 249 features)
     # ═════════════════════════════════════════════════════════════
 
     def _build_observation(self) -> np.ndarray:
-        """Override: builds the full 215-float observation with all features."""
+        """Override: enhances the base 249-float observation with features
+        that only CombatEnvExtended simulates (status effects, sight cone,
+        acceleration, threat/priority scoring, group summary with allies).
+
+        The base class already handles:
+          - Allied robot slots [142..186] via getattr(self, 'allies', [])
+          - Player patterns [244..248] via self._player_patterns
+          - All other sections
+        So we only override the fields we add value to.
+        """
         obs = super()._build_observation()
 
         a = self.agent
@@ -630,126 +671,66 @@ class CombatEnvExtended(CombatEnv):
         obs[14] = 0.176                                      # height above ground
 
         # ── Primary Target: sight cone and acceleration ──────────
+        # Primary target starts at offset 50 (unchanged).
+        # Sight cone = +6 = index 56. Accel = +11,+12 = indices 61,62.
         if target and target.alive:
             # Sight cone: check if target is in our forward arc.
             rel = target.pos - a.pos
             dist = np.linalg.norm(rel)
             if dist > 1:
-                # Use body facing (not velocity) for sight cone check.
-                # Matches C++ where GetActorForwardVector() is target-locked.
                 target_dir = rel / dist
                 facing_dot = float(np.dot(a.facing, target_dir))
                 obs[56] = 1.0 if facing_dot > -0.17 else 0.0  # ~100° half-cone
 
             # Target acceleration (velocity delta / dt).
-            # C++ GatherPrimaryTarget writes accel at indices 61-62 (after vel at 59-60).
             # Base env skips these with `idx += 2`. We fill them here.
             prev_vel = self.prev_target_velocities.get(target.target_id, np.zeros(2, dtype=np.float32))
             accel = (target.velocity - prev_vel) / max(self.cfg.decision_interval, 0.01)
-            obs[61] = np.clip(accel[0] / 2000, -1, 1)  # normalised
+            obs[61] = np.clip(accel[0] / 2000, -1, 1)
             obs[62] = np.clip(accel[1] / 2000, -1, 1)
 
         # ── Hostile Targets: priority and threat scores ──────────
-        # [Audit §1.3] Sort by priority score (not distance), matching
-        # C++ ScoredTargets from EvaluateTargetPriority.
+        # Hostile targets start at offset 74, stride 17 per slot.
+        # Priority = +8, Threat = +9 within each slot.
         sorted_targets = self._get_sorted_targets()
 
         for si in range(4):
-            base = 70 + si * 13
+            base = 74 + si * 17
             if si < len(sorted_targets):
                 t = sorted_targets[si]
                 obs[base + 8] = self._compute_priority_score(t)  # priority
                 obs[base + 9] = self._compute_threat_level(t)    # threat
 
         # ── Allied Robots ────────────────────────────────────────
-        # Matches C++ GatherAlliedRobots per-slot layout (12 floats each):
-        #   +0  occupied
-        #   +1  rel_x / 5000
-        #   +2  rel_y / 5000
-        #   +3  distance / 5000
-        #   +4  HP fraction
-        #   +5  ammo fraction (GetActiveAmmoFraction)
-        #   +6  is in combat (IsInCombat)
-        #   +7  is dodging (IsDodging)
-        #   +8  archetype scalar ((enum+1)/4.0)
-        #   +9  velocity X / ally max_speed
-        #   +10 velocity Y / ally max_speed
-        #   +11 target hostile index (normalised slot, -1 if none)
-        alive_allies_sorted = sorted(
-            [ally for ally in self.allies if ally.alive],
-            key=lambda ally: np.linalg.norm(ally.pos - a.pos))
-
-        for si in range(3):
-            base = 122 + si * 12
-            if si < len(alive_allies_sorted):
-                ally = alive_allies_sorted[si]
-                rel = ally.pos - a.pos
-                dist = np.linalg.norm(rel)
-
-                obs[base + 0] = 1.0                                    # occupied
-                obs[base + 1] = np.clip(rel[0] / 5000, -1, 1)        # rel_x
-                obs[base + 2] = np.clip(rel[1] / 5000, -1, 1)        # rel_y
-                obs[base + 3] = min(dist / 5000, 1.0)                  # distance
-                obs[base + 4] = ally.hp_fraction()                      # HP
-
-                # [+5] Ammo fraction. C++ reads GetActiveAmmoFraction().
-                # Python AlliedRobot has no weapon system — uses cooldown-based
-                # attacks. 1.0 = always ready (infinite "ammo"). If a weapon
-                # system is added to AlliedRobot later, read it here instead.
-                obs[base + 5] = 1.0
-
-                # [+6] Is in combat. C++ reads AllyPerception->IsInCombat().
-                # Python allies only exist during combat encounters, so always 1.0.
-                obs[base + 6] = 1.0
-
-                # [+7] Is dodging. C++ reads DodgeComp->IsDodging().
-                # Python AlliedRobot doesn't implement dodging.
-                obs[base + 7] = 0.0
-
-                # [+8] Archetype as single scalar. C++ encodes as (enum+1)/4:
-                #   Ranged(0)=0.25, Melee(1)=0.5, Healer(2)=0.75, Tank(3)=1.0
-                obs[base + 8] = (ally.archetype + 1) / 4.0
-
-                # [+9,10] Velocity normalised by ally's own max speed.
-                # C++ uses AMC->MaxWalkSpeed per ally.
-                ally_max_spd = ally.max_speed if ally.max_speed > 0 else 450.0
-                obs[base + 9]  = np.clip(ally.velocity[0] / ally_max_spd, -1, 1)
-                obs[base + 10] = np.clip(ally.velocity[1] / ally_max_spd, -1, 1)
-
-                # [+11] Which hostile slot this ally is targeting.
-                # C++ maps the ally's DetectedTarget to our ScoredTargets list,
-                # then normalises: slot_index / (MaxHostileSlots - 1).
-                # -1.0 if no target or target not in our hostile list.
-                target_slot_norm = -1.0
-                if ally.target_idx < len(self.targets):
-                    ally_target = self.targets[ally.target_idx]
-                    for h in range(min(len(sorted_targets), 4)):
-                        if sorted_targets[h] is ally_target:
-                            target_slot_norm = h / 3.0  # MaxHostileSlots - 1 = 3
-                            break
-                obs[base + 11] = target_slot_norm
+        # The base class handles ally observation slots [142..186]
+        # via getattr(self, 'allies', []) and reads attributes that
+        # AlliedRobot now provides (ammo_fraction, is_reloading,
+        # active_weapon_fire_cooldown, current_combat_action).
+        # No override needed here.
 
         # ── Threat Sensing ────────────────────────────────────────
-        # [Audit §1.4] Now handled correctly by base env's _build_observation
-        # which scans self._projectiles (the SimProjectile list that's actually
-        # populated). The old TrackedProjectile-based override here was reading
-        # from self.projectiles which was never populated, and had wrong
-        # direction (toward-agent not velocity) and TTA scale (/3.0 not /2.0).
+        # Handled correctly by base env's _build_observation which
+        # scans self._projectiles (the SimProjectile list).
 
         # ── Group Summary ────────────────────────────────────────
+        # Group summary starts at offset 220.
+        # Base class hardcodes alive_allies = 0, so we override
+        # with the real ally count from CombatEnvExtended.
         alive_ally_count = sum(1 for ally in self.allies if ally.alive)
         alive_hostiles = sum(1 for t in self.targets if t.alive)
 
-        obs[191] = min(alive_ally_count / 10.0, 1.0)            # alive allies (normalised by 10)
+        obs[220] = min(alive_ally_count / 10.0, 1.0)          # [+0] alive allies
+        # obs[221] = alive_hostiles — already set correctly by base.
         if alive_ally_count > 0:
-            obs[193] = sum(ally.hp_fraction() for ally in self.allies if ally.alive) / alive_ally_count
+            obs[222] = sum(ally.hp_fraction() for ally in self.allies if ally.alive) / alive_ally_count
         else:
-            obs[193] = 0.0                                    # avg ally HP
+            obs[222] = 0.0                                     # [+2] avg ally HP
+        # obs[223] = avg hostile HP — already set correctly by base.
 
         # [Audit §1.11] C++ computes AliveAllies / (AliveAllies + AliveHostiles).
         # Does NOT count the agent itself — only other allied robots.
         total = alive_ally_count + alive_hostiles
-        obs[195] = (alive_ally_count / total) if total > 0 else 0.5
+        obs[224] = (alive_ally_count / total) if total > 0 else 0.5  # [+4] numerical advantage
 
         return obs
 

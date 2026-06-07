@@ -442,7 +442,7 @@ def run_distillation(
     archetype: str = "ranged",
     num_episodes: int = 500,
     epochs: int = 50,
-    mode: str = "standard",
+    mode: str = "amplified",
     rollouts_per_scenario: int = 16,
     top_k_fraction: float = 0.25,
     iterations: int = 1,
