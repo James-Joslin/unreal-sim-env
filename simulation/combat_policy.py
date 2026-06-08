@@ -98,51 +98,49 @@ TIER_CONFIGS = {
         backbone_hidden=32, 
         backbone_layers=1, 
         attention_heads=2,
-        gru_hidden=16
+        gru_hidden=32       # == backbone_hidden: no bottleneck
     ),
     
-    # d_k = 8. Sharp jump in capability.
-    # Scaled entity_dim up to 16 so 2 heads get a rich 8-dimensional workspace.
+    # d_k = 6. Sharp jump in capability.
     "small": dict(
+        entity_dim=12, 
+        unique_dim=24, 
+        backbone_hidden=48, 
+        backbone_layers=1, 
+        attention_heads=2,
+        gru_hidden=48       # == backbone_hidden: no bottleneck
+    ),
+    
+    # d_k = 8. Full 4-head behavioral tracking.
+    "medium": dict(
         entity_dim=16, 
         unique_dim=32, 
         backbone_hidden=64, 
-        backbone_layers=1, 
-        attention_heads=2,
-        gru_hidden=24)
-    ),
-    
-    # d_k = 8. The entry-level tier for full 4-head behavioral tracking.
-    # entity_dim scaled to 32 to give your 4 heads proper breathing room.
-    "medium": dict(
-        entity_dim=32, 
-        unique_dim=48, 
-        backbone_hidden=96, 
         backbone_layers=2, 
         attention_heads=4,
-        gru_hidden=32
+        gru_hidden=64       # == backbone_hidden: no bottleneck
     ),
     
-    # d_k = 8. A deeper, wider architecture for tracking complex scenarios.
-    # Uses expanded unique contexts and a wider backbone to parse interactions.
+    # d_k = 8. Proven dims from the 70% win rate S4 run.
+    # gru_hidden matches backbone so the action heads receive the
+    # same representation capacity as the non-GRU architecture.
     "large": dict(
-        entity_dim=32,          
-        unique_dim=64,          
-        backbone_hidden=128,    
+        entity_dim=16,          # restored from 32
+        unique_dim=32,          # restored from 64
+        backbone_hidden=96,     # restored from 128
         backbone_layers=2,
         attention_heads=4,
-        gru_hidden=48
+        gru_hidden=96           # == backbone_hidden: no bottleneck
     ),
     
-    # d_k = 16. The high-capacity powerhouse model.
-    # Broadens the attention spaces to 16 dimensions per head and deepens the policy network.
+    # d_k = 12. High-capacity model.
     "xl": dict(
-        entity_dim=64, 
-        unique_dim=96, 
-        backbone_hidden=256, 
+        entity_dim=24, 
+        unique_dim=48, 
+        backbone_hidden=128, 
         backbone_layers=3, 
         attention_heads=4,
-        gru_hidden=64
+        gru_hidden=128          # == backbone_hidden: no bottleneck
     )
 }
 
@@ -490,7 +488,7 @@ def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPoli
         unique_dim=cfg["unique_dim"],
         backbone_hidden=cfg["backbone_hidden"],
         backbone_layers=cfg["backbone_layers"],
-        attention_heads=cfg["attention_heads"]
+        attention_heads=cfg["attention_heads"],
         gru_hidden=cfg["gru_hidden"],
     )
 

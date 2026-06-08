@@ -59,18 +59,20 @@ class PPOTrainer(BaseTrainer):
             obs_size=self.input_size, tier=self.tier
         ).to(self.device)
         
-        # Group parameters to protect structural encoders from value loss spikes
-        encoder_params = []
+        # Group parameters: encoder, backbone, and GRU are representation
+        # layers that need a lower LR for stability. Heads and embeddings
+        # get the full LR since they sit on top.
+        repr_params = []
         head_params = []
         
         for name, param in model.named_parameters():
-            if "encoder" in name or "backbone" in name:
-                encoder_params.append(param)
+            if "encoder" in name or "backbone" in name or "gru" in name:
+                repr_params.append(param)
             else:
                 head_params.append(param)
                 
         optimizer = torch.optim.Adam([
-            {"params": encoder_params, "lr": self.cfg.lr * 0.5},
+            {"params": repr_params, "lr": self.cfg.lr * 0.5},
             {"params": head_params, "lr": self.cfg.lr}
         ], eps=1e-5)
 
@@ -132,15 +134,15 @@ class PPOTrainer(BaseTrainer):
 
         # Rebuild optimizer with two-group LR split (matches build_model).
         if self.model is not None:
-            encoder_params = []
+            repr_params = []
             head_params = []
             for name, param in self.model.named_parameters():
-                if "encoder" in name or "backbone" in name:
-                    encoder_params.append(param)
+                if "encoder" in name or "backbone" in name or "gru" in name:
+                    repr_params.append(param)
                 else:
                     head_params.append(param)
             self.optimizer = torch.optim.Adam([
-                {"params": encoder_params, "lr": cfg.lr * 0.5},
+                {"params": repr_params, "lr": cfg.lr * 0.5},
                 {"params": head_params, "lr": cfg.lr}
             ], eps=1e-5)
 
