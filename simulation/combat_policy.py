@@ -97,7 +97,8 @@ TIER_CONFIGS = {
         unique_dim=16, 
         backbone_hidden=32, 
         backbone_layers=1, 
-        attention_heads=2
+        attention_heads=2,
+        gru_hidden=16
     ),
     
     # d_k = 8. Sharp jump in capability.
@@ -107,7 +108,8 @@ TIER_CONFIGS = {
         unique_dim=32, 
         backbone_hidden=64, 
         backbone_layers=1, 
-        attention_heads=2
+        attention_heads=2,
+        gru_hidden=24)
     ),
     
     # d_k = 8. The entry-level tier for full 4-head behavioral tracking.
@@ -117,7 +119,8 @@ TIER_CONFIGS = {
         unique_dim=48, 
         backbone_hidden=96, 
         backbone_layers=2, 
-        attention_heads=4
+        attention_heads=4,
+        gru_hidden=32
     ),
     
     # d_k = 8. A deeper, wider architecture for tracking complex scenarios.
@@ -127,7 +130,8 @@ TIER_CONFIGS = {
         unique_dim=64,          
         backbone_hidden=128,    
         backbone_layers=2,
-        attention_heads=4       
+        attention_heads=4,
+        gru_hidden=48
     ),
     
     # d_k = 16. The high-capacity powerhouse model.
@@ -137,8 +141,9 @@ TIER_CONFIGS = {
         unique_dim=96, 
         backbone_hidden=256, 
         backbone_layers=3, 
-        attention_heads=4
-    ),
+        attention_heads=4,
+        gru_hidden=64
+    )
 }
 
 
@@ -335,19 +340,19 @@ class DeltaEncoder(nn.Module):
 class CombatPolicy(nn.Module):
     """Structured policy for distillation and ONNX export.
 
-    Replaces the flat MLP CombatPolicy. Same external interface:
-    forward(obs) → (movement_logits, combat_logits, target_logits).
-
-    Internally: delta encode → group encode → backbone → heads.
-    Everything bakes into the ONNX graph.
+    Architecture: delta encode → group encode → backbone → GRU → heads.
+    The GRU gives episodic memory — the agent remembers the entire
+    encounter, not just the last 3 frames. Everything bakes into the
+    ONNX graph, including hidden state as an additional input/output.
     """
 
     def __init__(self, frame_stack: int = DEFAULT_FRAME_STACK,
                  entity_dim: int = 16, unique_dim: int = 32,
                  backbone_hidden: int = 96, backbone_layers: int = 2,
-                 attention_heads = 4):
+                 attention_heads = 4, gru_hidden = 32):
         super().__init__()
         self.frame_stack = frame_stack
+        self.gru_hidden = gru_hidden
 
         # Stage 1: Delta encoding (no params).
         self.delta = DeltaEncoder(frame_stack)
@@ -355,74 +360,99 @@ class CombatPolicy(nn.Module):
         # Stage 2: Structured group encoder (shared across 3 delta channels).
         self.encoder = StructuredEncoder(entity_dim, unique_dim, attention_heads)
         channel_dim = self.encoder.channel_dim
-        concat_dim = 3 * channel_dim  # 3 delta channels concatenated
+        concat_dim = 3 * channel_dim
 
         # Stage 3: Policy backbone.
         backbone_layers_list = []
         in_dim = concat_dim
         for i in range(backbone_layers):
-            out_dim = backbone_hidden if i < backbone_layers - 1 else backbone_hidden
-            backbone_layers_list.append(layer_init(nn.Linear(in_dim, out_dim)))
+            backbone_layers_list.append(layer_init(nn.Linear(in_dim, backbone_hidden)))
             if i == 0:
-                backbone_layers_list.append(nn.LayerNorm(out_dim))
+                backbone_layers_list.append(nn.LayerNorm(backbone_hidden))
             backbone_layers_list.append(nn.GELU())
-            in_dim = out_dim
+            in_dim = backbone_hidden
         self.backbone = nn.Sequential(*backbone_layers_list)
 
-        # Policy heads (autoregressive: m → c|m → t|m,c).
-        self.move_head = layer_init(nn.Linear(backbone_hidden, MOVEMENT_ACTIONS), std=0.01)
+        # Stage 4: GRU memory (episodic memory across the encounter).
+        self.gru = nn.GRU(backbone_hidden, gru_hidden, num_layers=1,
+                          batch_first=True)
 
+        # Stage 5: Autoregressive policy heads (on GRU output).
         ACTION_EMBED_DIM = 16
+        self.move_head = layer_init(nn.Linear(gru_hidden, MOVEMENT_ACTIONS), std=0.01)
+
         self.move_embed = nn.Embedding(MOVEMENT_ACTIONS, ACTION_EMBED_DIM)
-        self.combat_proj = layer_init(nn.Linear(backbone_hidden + ACTION_EMBED_DIM, backbone_hidden))
-        self.combat_head = layer_init(nn.Linear(backbone_hidden, COMBAT_ACTIONS), std=0.01)
+        self.combat_proj = layer_init(nn.Linear(gru_hidden + ACTION_EMBED_DIM, gru_hidden))
+        self.combat_head = layer_init(nn.Linear(gru_hidden, COMBAT_ACTIONS), std=0.01)
 
         self.combat_embed = nn.Embedding(COMBAT_ACTIONS, ACTION_EMBED_DIM)
-        self.target_proj = layer_init(nn.Linear(backbone_hidden + 2 * ACTION_EMBED_DIM, backbone_hidden))
-        self.target_head = layer_init(nn.Linear(backbone_hidden, TARGET_ACTIONS), std=0.01)
+        self.target_proj = layer_init(nn.Linear(gru_hidden + 2 * ACTION_EMBED_DIM, gru_hidden))
+        self.target_head = layer_init(nn.Linear(gru_hidden, TARGET_ACTIONS), std=0.01)
 
-    def forward(self, obs: torch.Tensor):
-        """Autoregressive forward pass for ONNX export.
+    def init_hidden(self, batch_size: int = 1, device=None):
+        """Create zero-initialised hidden state."""
+        if device is None:
+            device = next(self.parameters()).device
+        return torch.zeros(1, batch_size, self.gru_hidden, device=device)
 
-        Uses unmasked argmax for internal conditioning. The C++ runtime
-        applies action masks to the output logits. The internal argmax
-        picks the highest-logit action for conditioning subsequent heads,
-        which is correct >95% of the time (most actions are valid).
-        """
+    def _encode_features(self, obs):
+        """Encode obs through delta → structured encoder → backbone."""
         deltas = self.delta(obs)
         batch = deltas.shape[0]
         channels_flat = deltas.view(batch * 3, OBS_SIZE)
         embeddings_flat = self.encoder(channels_flat)
         embeddings = embeddings_flat.view(batch, 3 * self.encoder.channel_dim)
-        features = self.backbone(embeddings)
+        return self.backbone(embeddings)  # [batch, backbone_hidden]
 
-        # Head 1: movement (unconditioned).
+    def _heads(self, features):
+        """Autoregressive heads with unmasked argmax conditioning."""
         m = torch.tanh(self.move_head(features)) * LOGIT_SCALE
         m_action = m.argmax(dim=-1)
 
-        # Head 2: combat conditioned on movement.
         m_emb = self.move_embed(m_action)
-        c_feat = torch.nn.functional.gelu(
-            self.combat_proj(torch.cat([features, m_emb], dim=-1)))
+        c_feat = F.gelu(self.combat_proj(
+            torch.cat([features, m_emb], dim=-1)))
         c = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
         c_action = c.argmax(dim=-1)
 
-        # Head 3: target conditioned on movement + combat.
         c_emb = self.combat_embed(c_action)
-        t_feat = torch.nn.functional.gelu(
-            self.target_proj(torch.cat([features, m_emb, c_emb], dim=-1)))
+        t_feat = F.gelu(self.target_proj(
+            torch.cat([features, m_emb, c_emb], dim=-1)))
         t = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
 
         return m, c, t
 
-    def select_actions(self, obs, masks):
-        """Autoregressive action selection with proper masking."""
-        deltas = self.delta(obs)
-        batch = deltas.shape[0]
-        channels_flat = deltas.view(batch * 3, OBS_SIZE)
-        embeddings_flat = self.encoder(channels_flat)
-        embeddings = embeddings_flat.view(batch, 3 * self.encoder.channel_dim)
-        features = self.backbone(embeddings)
+    def forward(self, obs: torch.Tensor, hidden: torch.Tensor = None):
+        """Forward pass for ONNX export.
+
+        Args:
+            obs:    [batch, frame_stack * OBS_SIZE]
+            hidden: [1, batch, gru_hidden] or None (zeros)
+        Returns:
+            m_logits, c_logits, t_logits, hidden_out
+        """
+        batch = obs.shape[0]
+        if hidden is None:
+            hidden = self.init_hidden(batch, obs.device)
+
+        backbone_out = self._encode_features(obs)  # [batch, backbone_hidden]
+        gru_in = backbone_out.unsqueeze(1)          # [batch, 1, backbone_hidden]
+        gru_out, hidden_out = self.gru(gru_in, hidden)
+        features = gru_out.squeeze(1)               # [batch, gru_hidden]
+
+        m, c, t = self._heads(features)
+        return m, c, t, hidden_out
+
+    def select_actions(self, obs, masks, hidden=None):
+        """Autoregressive masked action selection with GRU."""
+        batch = obs.shape[0]
+        if hidden is None:
+            hidden = self.init_hidden(batch, obs.device)
+
+        backbone_out = self._encode_features(obs)
+        gru_in = backbone_out.unsqueeze(1)
+        gru_out, hidden_out = self.gru(gru_in, hidden)
+        features = gru_out.squeeze(1)
 
         m_mask, c_mask, t_mask = masks
 
@@ -431,20 +461,20 @@ class CombatPolicy(nn.Module):
         m = m_logits.argmax(dim=-1)
 
         m_emb = self.move_embed(m)
-        c_feat = torch.nn.functional.gelu(
-            self.combat_proj(torch.cat([features, m_emb], dim=-1)))
+        c_feat = F.gelu(self.combat_proj(
+            torch.cat([features, m_emb], dim=-1)))
         c_logits = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
         c_logits = c_logits.masked_fill(~c_mask, -1e8)
         c = c_logits.argmax(dim=-1)
 
         c_emb = self.combat_embed(c)
-        t_feat = torch.nn.functional.gelu(
-            self.target_proj(torch.cat([features, m_emb, c_emb], dim=-1)))
+        t_feat = F.gelu(self.target_proj(
+            torch.cat([features, m_emb, c_emb], dim=-1)))
         t_logits = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
         t = t_logits.argmax(dim=-1)
 
-        return m, c, t
+        return m, c, t, hidden_out
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -461,6 +491,7 @@ def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPoli
         backbone_hidden=cfg["backbone_hidden"],
         backbone_layers=cfg["backbone_layers"],
         attention_heads=cfg["attention_heads"]
+        gru_hidden=cfg["gru_hidden"],
     )
 
 
@@ -590,10 +621,10 @@ class NormalizedPolicyWrapper(nn.Module):
         self.register_buffer("obs_std",
             torch.from_numpy(np.sqrt(var.astype(np.float32) + epsilon)))
 
-    def forward(self, obs):
+    def forward(self, obs, hidden=None):
         normed = torch.clamp((obs - self.obs_mean) / self.obs_std,
                              -self.clip, self.clip)
-        return self.policy(normed)
+        return self.policy(normed, hidden)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -626,15 +657,21 @@ def export_onnx(model: CombatPolicy, tier: str, output_dir: str,
         export_model = model
 
     dummy = torch.randn(1, input_size)
+    dummy_hidden = torch.zeros(1, 1, model.gru_hidden)
 
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"Combat_{tier.capitalize()}.onnx")
 
     torch.onnx.export(
-        export_model, dummy, path,
-        input_names=["observation"],
-        output_names=["movement_logits", "combat_logits", "target_logits"],
-        dynamic_axes={"observation": {0: "batch_size"}},
+        export_model, (dummy, dummy_hidden), path,
+        input_names=["observation", "hidden_in"],
+        output_names=["movement_logits", "combat_logits",
+                       "target_logits", "hidden_out"],
+        dynamic_axes={
+            "observation": {0: "batch_size"},
+            "hidden_in": {1: "batch_size"},
+            "hidden_out": {1: "batch_size"},
+        },
         opset_version=17,
     )
 
@@ -672,6 +709,7 @@ def verify_export(model: CombatPolicy, onnx_path: str,
     model.eval().cpu()
     input_size = OBS_SIZE * frame_stack
     dummy = torch.randn(1, input_size)
+    dummy_hidden = torch.zeros(1, 1, model.gru_hidden)
 
     if obs_normalizer is not None:
         pt_model = NormalizedPolicyWrapper(
@@ -685,10 +723,13 @@ def verify_export(model: CombatPolicy, onnx_path: str,
         pt_model = model
 
     with torch.no_grad():
-        pt_m, pt_c, pt_t = pt_model(dummy)
+        pt_m, pt_c, pt_t, pt_h = pt_model(dummy, dummy_hidden)
 
     sess = ort.InferenceSession(onnx_path)
-    ort_out = sess.run(None, {"observation": dummy.numpy()})
+    ort_out = sess.run(None, {
+        "observation": dummy.numpy(),
+        "hidden_in": dummy_hidden.numpy(),
+    })
 
     m_diff = abs(pt_m.numpy() - ort_out[0]).max()
     c_diff = abs(pt_c.numpy() - ort_out[1]).max()
