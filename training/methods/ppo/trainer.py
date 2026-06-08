@@ -8,6 +8,7 @@ Implements BaseTrainer for Proximal Policy Optimization with:
     - Entropy annealing
     - Value function clipping
     - Catastrophic regression reversion
+    - Per-stage hyperparameters (curriculum-aware)
 
 This is the ONLY file that needs to change for PPO-specific tuning.
 The base trainer handles env creation, evaluation, curriculum, and checkpointing.
@@ -32,7 +33,7 @@ from frame_stack import stacked_obs_size
 from training.base_trainer import BaseTrainer
 from training.normalizers import RunningNormalizer, ReturnNormalizer
 
-from .config import PPOConfig
+from .config import PPOConfig, get_stage_config, get_stage_summary, PPOStageConfig
 from .actor_critic import ActorCritic
 from .buffer import VecRolloutBuffer
 
@@ -44,7 +45,9 @@ class PPOTrainer(BaseTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.cfg = PPOConfig(total_timesteps=self.total_timesteps)
+        self.cfg = get_stage_config(self.stage)
+        self.cfg.total_timesteps = self.total_timesteps
+        self.stage_steps_done = 0
 
     # ═════════════════════════════════════════════════════════════
     #  BaseTrainer Interface
@@ -67,7 +70,7 @@ class PPOTrainer(BaseTrainer):
                 head_params.append(param)
                 
         optimizer = torch.optim.Adam([
-            {"params": encoder_params, "lr": self.cfg.lr * 0.5}, # Protected structural rate
+            {"params": encoder_params, "lr": self.cfg.lr * 0.5},
             {"params": head_params, "lr": self.cfg.lr}
         ], eps=1e-5)
 
@@ -88,12 +91,10 @@ class PPOTrainer(BaseTrainer):
         loaded = 0
 
         for src_key, src_val in model_state.items():
-            # Skip critic keys.
             if any(skip in src_key for skip in
                    ["critic_encoder", "critic_backbone", "value_head"]):
                 continue
 
-            # Map actor keys to policy keys.
             dst_key = src_key.replace("actor_encoder.", "encoder.")
             dst_key = dst_key.replace("actor_backbone.", "backbone.")
 
@@ -106,6 +107,65 @@ class PPOTrainer(BaseTrainer):
         policy.eval()
         print(f"Extracted CombatPolicy: {loaded} tensors loaded")
         return policy
+
+    # ═════════════════════════════════════════════════════════════
+    #  Stage Config Management
+    # ═════════════════════════════════════════════════════════════
+
+    def apply_stage_config(self, stage: int):
+        """Hot-swap all PPO hyperparameters for a new curriculum stage.
+
+        Call this BEFORE train(). It sets the config, rebuilds the
+        optimizer with the correct LR groups, and resets the entropy
+        schedule. Model weights are NOT touched — they carry over
+        from the previous stage's best checkpoint.
+        """
+        prev_cfg = self.cfg
+        cfg = get_stage_config(stage)
+        cfg.total_timesteps = self.total_timesteps
+        self.cfg = cfg
+
+        print(f"\n{'='*60}")
+        print(f"  STAGE {stage} — Applying stage-specific config")
+        print(f"  {get_stage_summary(stage)}")
+        print(f"{'='*60}")
+
+        # Rebuild optimizer with two-group LR split (matches build_model).
+        if self.model is not None:
+            encoder_params = []
+            head_params = []
+            for name, param in self.model.named_parameters():
+                if "encoder" in name or "backbone" in name:
+                    encoder_params.append(param)
+                else:
+                    head_params.append(param)
+            self.optimizer = torch.optim.Adam([
+                {"params": encoder_params, "lr": cfg.lr * 0.5},
+                {"params": head_params, "lr": cfg.lr}
+            ], eps=1e-5)
+
+        # Reset per-stage entropy schedule.
+        self.stage_steps_done = 0
+
+        # Log changes.
+        changes = []
+        for field_name in ['lr', 'clip_range', 'entropy_coef', 'num_steps',
+                           'update_epochs', 'target_kl', 'num_eval_episodes']:
+            old = getattr(prev_cfg, field_name)
+            new = getattr(cfg, field_name)
+            if old != new:
+                changes.append(f"    {field_name}: {old} → {new}")
+        if changes:
+            print(f"  Changed from previous stage:")
+            for c in changes:
+                print(c)
+        print()
+
+    def get_entropy_coef(self) -> float:
+        """Anneal entropy coefficient linearly within the current stage."""
+        cfg = self.cfg
+        progress = min(1.0, self.stage_steps_done / max(1, cfg.total_timesteps))
+        return cfg.entropy_coef + progress * (cfg.entropy_coef_final - cfg.entropy_coef)
 
     # ═════════════════════════════════════════════════════════════
     #  Training Loop
@@ -160,7 +220,6 @@ class PPOTrainer(BaseTrainer):
                     reinit_critic=is_stage_transition)
                 loaded_from_ppo = True
 
-                # Restore normalizer state if saved.
                 if self.obs_normalizer and "obs_normalizer" in ckpt:
                     self.obs_normalizer.load_state_dict(
                         ckpt["obs_normalizer"])
@@ -170,7 +229,6 @@ class PPOTrainer(BaseTrainer):
                       f"(stage {ckpt_stage}, "
                       f"step {ckpt.get('step', '?')})")
             else:
-                # BC checkpoint — actor weights only, no critic.
                 self.model.load_from_ppo_checkpoint(self.bc_checkpoint)
                 print(f"Warm-started from BC checkpoint: "
                       f"{self.bc_checkpoint}")
@@ -209,13 +267,12 @@ class PPOTrainer(BaseTrainer):
         episode_count = 0
         scheduler_step = 0
         consecutive_regressions = 0
+        self.stage_steps_done = 0
 
-        # Per-env episode tracking.
         ep_rewards = np.zeros(self.num_envs, dtype=np.float32)
         ep_lengths = np.zeros(self.num_envs, dtype=np.int32)
         ep_components = [{} for _ in range(self.num_envs)]
 
-        # Rolling window for reporting.
         recent_rewards = deque(maxlen=50)
         recent_lengths = deque(maxlen=50)
         recent_wins = deque(maxlen=50)
@@ -235,7 +292,6 @@ class PPOTrainer(BaseTrainer):
             hidden = getattr(self, '_rollout_hidden', None)
 
             for step in range(cfg.num_steps):
-                # Normalise observations.
                 if self.obs_normalizer:
                     self.obs_normalizer.update(obs)
                     obs_normed = self.obs_normalizer.normalize(obs)
@@ -265,7 +321,6 @@ class PPOTrainer(BaseTrainer):
                 next_obs, rewards, dones, truncateds, infos = \
                     vec_env.step(actions_np)
 
-                # Update return normalizer and scale rewards.
                 if return_normalizer:
                     terminals = np.logical_or(
                         dones, truncateds).astype(np.float32)
@@ -274,7 +329,6 @@ class PPOTrainer(BaseTrainer):
                 else:
                     rewards_normed = rewards
 
-                # Handle truncations: bootstrap value into reward.
                 for i in range(self.num_envs):
                     if truncateds[i] and not dones[i]:
                         term_obs = infos[i]["terminal_observation"]
@@ -289,7 +343,6 @@ class PPOTrainer(BaseTrainer):
                                 term_t).cpu().item()
                         rewards_normed[i] += cfg.gamma * term_val
 
-                # Store in buffer.
                 buffer.obs[step] = obs_normed
                 buffer.m_acts[step] = m_acts
                 buffer.c_acts[step] = c_acts
@@ -317,8 +370,7 @@ class PPOTrainer(BaseTrainer):
                 # Update masks for NEXT step from env infos.
                 current_masks = self.extract_masks(infos)
 
-                # Per-env episode accounting.
-                ep_rewards += rewards  # Track raw rewards.
+                ep_rewards += rewards
                 ep_lengths += 1
 
                 for i in range(self.num_envs):
@@ -379,21 +431,15 @@ class PPOTrainer(BaseTrainer):
             # ── PPO Update ───────────────────────────────────────
             self.model.train()
 
-            # Normalise advantages.
             flat_adv = buffer.advantages.reshape(-1)
             flat_adv = ((flat_adv - flat_adv.mean())
                         / (flat_adv.std() + 1e-8))
             buffer.advantages = flat_adv.reshape(
                 cfg.num_steps, self.num_envs)
 
-            # Anneal entropy coefficient.
-            ent_progress = min(
-                1.0, global_step / max(cfg.total_timesteps, 1))
-            current_ent_coef = (
-                cfg.entropy_coef
-                + (cfg.entropy_coef_final - cfg.entropy_coef)
-                * ent_progress
-            )
+            # Stage-aware entropy annealing.
+            self.stage_steps_done = global_step
+            current_ent_coef = self.get_entropy_coef()
 
             total_pg_loss = 0
             total_v_loss = 0
@@ -434,14 +480,12 @@ class PPOTrainer(BaseTrainer):
                             b_obs, b_m, b_c, b_t,
                             masks=b_masks, hidden=b_hidden)
 
-                    # Policy loss (clipped).
                     ratio = (new_lp - b_old_lp).exp()
                     pg_loss1 = -b_adv * ratio
                     pg_loss2 = -b_adv * ratio.clamp(
                         1 - cfg.clip_range, 1 + cfg.clip_range)
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                    # Value loss with clipping.
                     v_clipped = b_old_val + (
                         new_val - b_old_val).clamp(
                             -cfg.vf_clip_range, cfg.vf_clip_range)
@@ -449,7 +493,6 @@ class PPOTrainer(BaseTrainer):
                     v_loss2 = (v_clipped - b_ret) ** 2
                     v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
-                    # Entropy bonus (annealed).
                     ent_loss = -entropy.mean()
 
                     loss = (pg_loss
@@ -462,7 +505,6 @@ class PPOTrainer(BaseTrainer):
                         self.model.parameters(), cfg.max_grad_norm)
                     self.optimizer.step()
 
-                    # Track diagnostics.
                     with torch.no_grad():
                         clip_frac = (
                             (ratio - 1.0).abs() > cfg.clip_range
@@ -478,14 +520,12 @@ class PPOTrainer(BaseTrainer):
                     total_approx_kl += approx_kl.item()
                     n_updates += 1
 
-                    # KL early stopping.
                     if (cfg.target_kl > 0
                             and approx_kl.item()
                             > cfg.target_kl * 1.5):
                         kl_early_stopped = True
                         break
 
-            # Step scheduler.
             scheduler_step += 1
             scheduler.step()
 
@@ -548,8 +588,6 @@ class PPOTrainer(BaseTrainer):
             )
 
             # ── Periodic evaluation ──────────────────────────────
-            
-            # ── Periodic evaluation ──────────────────────────────────────────────
             if global_step % cfg.eval_interval < batch_total:
                 eval_stats = self.run_eval(
                     global_step,
@@ -563,12 +601,11 @@ class PPOTrainer(BaseTrainer):
                 else:
                     consecutive_regressions += 1
 
-                # NESTED INSIDE THE EVAL VAL GATING: Revert on catastrophic regression.
                 current_wr = eval_stats["win_rate"]
                 has_collapsed = (self.best_eval_win_rate - current_wr) > cfg.revert_min_drop
                 
                 if (cfg.revert_on_regression
-                        and consecutive_regressions >= cfg.revert_patience # Now represents evaluation count steps
+                        and consecutive_regressions >= cfg.revert_patience
                         and has_collapsed
                         and self.best_eval_win_rate > 0.05):
                     best_path = os.path.join(
@@ -587,55 +624,6 @@ class PPOTrainer(BaseTrainer):
                                     self.obs_normalizer.load_state_dict(
                                         ckpt["obs_normalizer"])
                         consecutive_regressions = 0
-            
-            # if global_step % cfg.eval_interval < batch_total:
-            #     eval_stats = self.run_eval(
-            #         global_step,
-            #         eval_episodes=cfg.num_eval_episodes,
-            #         eval_base_seed=cfg.eval_base_seed,
-            #         batch_total=batch_total,
-            #     )
-
-            #     if self.check_best_model(eval_stats, global_step):
-            #         consecutive_regressions = 0
-            #     else:
-            #         consecutive_regressions += 1
-
-            #     # Revert on catastrophic regression.
-            #     current_wr = eval_stats["win_rate"]
-            #     has_collapsed = (
-            #         (self.best_eval_win_rate - current_wr)
-            #         > cfg.revert_min_drop
-            #     )
-            #     if (cfg.revert_on_regression
-            #             and consecutive_regressions
-            #             >= cfg.revert_patience
-            #             and has_collapsed
-            #             and self.best_eval_win_rate > 0.05):
-            #         best_path = os.path.join(
-            #             self.output_dir,
-            #             f"{self.method_name}_stage"
-            #             f"{self.stage}_best.pt")
-            #         if os.path.exists(best_path):
-            #             print(
-            #                 f"  ⚠ Win rate collapsed: "
-            #                 f"current={current_wr:.0%} "
-            #                 f"vs best="
-            #                 f"{self.best_eval_win_rate:.0%} "
-            #                 f"(>{cfg.revert_min_drop:.0%} drop, "
-            #                 f"{consecutive_regressions} evals). "
-            #                 f"Reverting model weights only.")
-            #             self.model.load_from_ppo_checkpoint(
-            #                 best_path)
-            #             if self.obs_normalizer:
-            #                 ckpt = torch.load(
-            #                     best_path,
-            #                     map_location=self.device,
-            #                     weights_only=False)
-            #                 if "obs_normalizer" in ckpt:
-            #                     self.obs_normalizer.load_state_dict(
-            #                         ckpt["obs_normalizer"])
-            #             consecutive_regressions = 0
 
             # ── Periodic save ────────────────────────────────────
             if global_step % cfg.save_interval < batch_total:
@@ -653,6 +641,4 @@ class PPOTrainer(BaseTrainer):
               f"Best eval win rate: {self.best_eval_win_rate:.0%}")
 
         vec_env.close()
-        # Flush but don't close — run_curriculum manages the writer
-        # lifecycle across stages.
         self.writer.flush()
