@@ -75,7 +75,7 @@ def generate_teacher_dataset(
                 obs_n = obs_normalizer.normalize(obs) if obs_normalizer else obs
                 with torch.no_grad():
                     obs_t = torch.from_numpy(obs_n).float().unsqueeze(0).to(device)
-                    m_l, c_l, t_l = teacher(obs_t)
+                    m_l, c_l, t_l, _ = teacher(obs_t)
 
                 all_obs.append(obs_n.copy())
                 all_m.append(m_l.cpu().squeeze(0).numpy())
@@ -177,7 +177,7 @@ def generate_amplified_dataset(
                             (m_a, c_a, t_a), _, _, _ = policy.get_action_and_value(obs_t)
                             m, c, t = m_a.item(), c_a.item(), t_a.item()
                         else:
-                            m_l, c_l, t_l = policy(obs_t)
+                            m_l, c_l, t_l, _ = policy(obs_t)
                             m_dist = torch.distributions.Categorical(logits=m_l)
                             c_dist = torch.distributions.Categorical(logits=c_l)
                             t_dist = torch.distributions.Categorical(logits=t_l)
@@ -265,7 +265,7 @@ def distill_student(student, dataset, alpha=0.7, temperature=3.0,
             t_c = torch.from_numpy(c_arr[idx]).to(device)
             t_t = torch.from_numpy(t_arr[idx]).to(device)
 
-            s_m, s_c, s_t = student(b_obs)
+            s_m, s_c, s_t, _ = student(b_obs)
             loss = torch.tensor(0.0, device=device)
             for s_l, t_l in [(s_m, t_m), (s_c, t_c), (s_t, t_t)]:
                 t_soft = F.softmax(t_l / temperature, dim=-1)
@@ -287,7 +287,7 @@ def distill_student(student, dataset, alpha=0.7, temperature=3.0,
                 for i in range(0, len(val_idx), batch_size):
                     idx = val_idx[i:i + batch_size]
                     b = torch.from_numpy(obs_arr[idx]).to(device)
-                    s_m, s_c, s_t = student(b)
+                    s_m, s_c, s_t, _ = student(b)
                     for s_l, t_l_np in [(s_m, m_arr[idx]), (s_c, c_arr[idx]), (s_t, t_arr[idx])]:
                         t_l = torch.from_numpy(t_l_np).to(device)
                         v_loss += F.cross_entropy(s_l, t_l.argmax(dim=-1)).item()
@@ -342,7 +342,7 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
             b_t = torch.from_numpy(t_arr[idx]).long().to(device)
             b_w = torch.from_numpy(w_arr[idx]).to(device)
 
-            s_m, s_c, s_t = student(b_obs)
+            s_m, s_c, s_t, _ = student(b_obs)
 
             # Weighted cross-entropy: high-reward episodes count more.
             ce_m = F.cross_entropy(s_m, b_m, reduction="none")
@@ -363,7 +363,7 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
                 for i in range(0, len(val_idx), batch_size):
                     idx = val_idx[i:i + batch_size]
                     b = torch.from_numpy(obs_arr[idx]).to(device)
-                    s_m, s_c, s_t = student(b)
+                    s_m, s_c, s_t, _ = student(b)
                     v_loss += F.cross_entropy(s_m, torch.from_numpy(m_arr[idx]).long().to(device)).item()
                     v_loss += F.cross_entropy(s_c, torch.from_numpy(c_arr[idx]).long().to(device)).item()
                     v_loss += F.cross_entropy(s_t, torch.from_numpy(t_arr[idx]).long().to(device)).item()
@@ -381,7 +381,8 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
 #  ONNX Benchmark
 # ─────────────────────────────────────────────────────────────────
 
-def benchmark_onnx(onnx_path, input_size, n_iters=500):
+def benchmark_onnx(onnx_path, input_size, gru_hidden=0,
+                   n_iters=500):
     """Returns mean ms per forward pass, or None."""
     try:
         import onnxruntime as ort
@@ -392,12 +393,27 @@ def benchmark_onnx(onnx_path, input_size, n_iters=500):
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     dummy = np.random.randn(1, input_size).astype(np.float32)
 
+    # Build feed dict — include hidden_in if model has GRU.
+    feed = {"observation": dummy}
+    input_names = [inp.name for inp in sess.get_inputs()]
+    if "hidden_in" in input_names:
+        h_size = gru_hidden if gru_hidden > 0 else 48  # fallback
+        # Try to get exact shape from the model's input spec.
+        for inp in sess.get_inputs():
+            if inp.name == "hidden_in":
+                shape = inp.shape
+                # shape is [1, 'batch_size', gru_hidden] or [1, 1, N]
+                if len(shape) == 3 and isinstance(shape[2], int):
+                    h_size = shape[2]
+                break
+        feed["hidden_in"] = np.zeros((1, 1, h_size), dtype=np.float32)
+
     for _ in range(50):
-        sess.run(None, {"observation": dummy})
+        sess.run(None, feed)
 
     start = _time.perf_counter()
     for _ in range(n_iters):
-        sess.run(None, {"observation": dummy})
+        sess.run(None, feed)
     elapsed = _time.perf_counter() - start
 
     ms = (elapsed / n_iters) * 1000
@@ -617,7 +633,7 @@ def _regenerate_logits(model, obs_array, device, batch_size=512):
     for i in range(0, len(obs_array), batch_size):
         batch = torch.from_numpy(obs_array[i:i+batch_size]).to(device)
         with torch.no_grad():
-            m, c, t = model(batch)
+            m, c, t, _ = model(batch)
         all_m.append(m.cpu().numpy())
         all_c.append(c.cpu().numpy())
         all_t.append(t.cpu().numpy())
