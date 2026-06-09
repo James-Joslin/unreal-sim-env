@@ -164,10 +164,21 @@ class PPOTrainer(BaseTrainer):
         print()
 
     def get_entropy_coef(self) -> float:
-        """Anneal entropy coefficient linearly within the current stage."""
+        """Anneal entropy coefficient with cosine schedule.
+
+        Cosine decays slowly in the first half (preserve exploration)
+        and fast in the second half (let the policy commit). This
+        prevents the late-training entropy drift seen in S5/S6 where
+        linear annealing left the entropy term dominant as the policy
+        gradient weakened under LR decay.
+        """
+        import math
         cfg = self.cfg
         progress = min(1.0, self.stage_steps_done / max(1, cfg.total_timesteps))
-        return cfg.entropy_coef + progress * (cfg.entropy_coef_final - cfg.entropy_coef)
+        # Cosine: 1.0 at progress=0, 0.0 at progress=1
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (cfg.entropy_coef_final
+                + cosine_factor * (cfg.entropy_coef - cfg.entropy_coef_final))
 
     # ═════════════════════════════════════════════════════════════
     #  Training Loop
@@ -236,8 +247,18 @@ class PPOTrainer(BaseTrainer):
                       f"{self.bc_checkpoint}")
 
         # ── LR annealing ─────────────────────────────────────────
+        #
+        # Cosine schedule: slower decay in the middle (where peak
+        # performance is typically reached), faster convergence at
+        # the end. Minimum 5% (not 1%) — the linear schedule's 1%
+        # floor left too little learning capacity to hold onto peak
+        # performance in S5/S6, causing entropy drift and win rate
+        # regression in the final 15% of training.
+        import math
+
         warmup_steps = 50_000 if loaded_from_ppo else 0
         total_rollouts = cfg.total_timesteps // batch_total
+        lr_min_fraction = 0.05  # 5% floor instead of 1%
 
         def lr_lambda(rollout_step):
             if warmup_steps > 0:
@@ -245,14 +266,15 @@ class PPOTrainer(BaseTrainer):
                 if rollout_step < warmup_rollouts:
                     return 0.2 + 0.8 * rollout_step / warmup_rollouts
             progress = min(1.0, rollout_step / max(total_rollouts, 1))
-            return max(0.01, 1.0 - progress)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min_fraction + cosine * (1.0 - lr_min_fraction)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda)
 
-        print(f"LR schedule: {cfg.lr:.1e} → {cfg.lr * 0.01:.1e} "
-              f"over {total_rollouts} rollouts "
-              f"({cfg.total_timesteps:,} steps)"
+        print(f"LR schedule: {cfg.lr:.1e} → {cfg.lr * lr_min_fraction:.1e} "
+              f"(cosine, {total_rollouts} rollouts, "
+              f"{cfg.total_timesteps:,} steps)"
               + (f" with warmup over {warmup_steps:,} steps"
                  if warmup_steps > 0 else ""))
 
