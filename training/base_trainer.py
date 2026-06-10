@@ -149,7 +149,7 @@ class BaseTrainer(ABC):
             1: 50_000,        # 1v1 no obstacles — learn to approach and shoot
             2: 100_000,       # 1v1 with obstacles — learn navigation
             3: 1_500_000,       # 1v2 — learn target switching
-            4: 6_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon mgmt
+            4: 2_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon mgmt
             5: 10_000_000,    # 2v3 — multi-target, ally coordination
             6: 20_000_000,    # 2v3 full arena — complex navigation
             7: 30_000_000,    # 2v4 full arena — everything together

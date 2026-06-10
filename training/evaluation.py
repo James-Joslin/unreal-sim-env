@@ -94,11 +94,17 @@ def evaluate(
                     c = c_a.item()
                     t = t_a.item()
                 else:
-                    outputs = model(obs_t)
+                    outputs = model(obs_t, hidden)
                     if is_actor_critic:
-                        m_l, c_l, t_l, _ = outputs
+                        # ActorCritic: (m, c, t, value, hidden_out)
+                        m_l, c_l, t_l = outputs[0], outputs[1], outputs[2]
+                        if len(outputs) > 4:
+                            hidden = outputs[4]
                     else:
-                        m_l, c_l, t_l = outputs
+                        # CombatPolicy: (m, c, t, hidden_out)
+                        m_l, c_l, t_l = outputs[0], outputs[1], outputs[2]
+                        if len(outputs) > 3:
+                            hidden = outputs[3]
                     m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
                     c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
                     t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)

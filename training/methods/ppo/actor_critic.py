@@ -17,7 +17,7 @@ import numpy as np
 
 from combat_sim import OBS_SIZE, MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 from combat_policy import (
-    TIER_CONFIGS, LOGIT_SCALE, layer_init,
+    TIER_CONFIGS, layer_init,
     StructuredEncoder, DeltaEncoder,
 )
 
@@ -111,9 +111,6 @@ class ActorCritic(nn.Module):
         emb_flat = encoder(channels_flat)
         return emb_flat.view(batch, 3 * encoder.channel_dim)
 
-    def _scaled(self, raw):
-        return torch.tanh(raw) * LOGIT_SCALE
-
     def _actor_features(self, obs, hidden):
         """Encode through actor path + GRU. Returns (gru_output, new_hidden)."""
         backbone_out = self.actor_backbone(
@@ -123,15 +120,15 @@ class ActorCritic(nn.Module):
         return gru_out.squeeze(1), hidden_out
 
     def _autoregressive_logits(self, features, m_action, c_action):
-        m_logits = self._scaled(self.move_head(features))
+        m_logits = self.move_head(features)
         m_emb = self.move_embed(m_action)
         c_features = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
-        c_logits = self._scaled(self.combat_head(c_features))
+        c_logits = self.combat_head(c_features)
         c_emb = self.combat_embed(c_action)
         t_features = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
-        t_logits = self._scaled(self.target_head(t_features))
+        t_logits = self.target_head(t_features)
         return m_logits, c_logits, t_logits
 
     # ─── get_action_and_value (training rollout) ─────────────────
@@ -146,7 +143,7 @@ class ActorCritic(nn.Module):
             self._encode(obs, self.critic_encoder))
 
         # Head 1: movement.
-        m_logits = self._scaled(self.move_head(actor_feat))
+        m_logits = self.move_head(actor_feat)
         if masks is not None:
             m_logits = m_logits.masked_fill(~masks[0], -1e8)
         m_dist = torch.distributions.Categorical(logits=m_logits)
@@ -156,7 +153,7 @@ class ActorCritic(nn.Module):
         m_emb = self.move_embed(m_act)
         c_features = F.gelu(self.combat_proj(
             torch.cat([actor_feat, m_emb], dim=-1)))
-        c_logits = self._scaled(self.combat_head(c_features))
+        c_logits = self.combat_head(c_features)
         if masks is not None:
             c_logits = c_logits.masked_fill(~masks[1], -1e8)
         c_dist = torch.distributions.Categorical(logits=c_logits)
@@ -166,7 +163,7 @@ class ActorCritic(nn.Module):
         c_emb = self.combat_embed(c_act)
         t_features = F.gelu(self.target_proj(
             torch.cat([actor_feat, m_emb, c_emb], dim=-1)))
-        t_logits = self._scaled(self.target_head(t_features))
+        t_logits = self.target_head(t_features)
         if masks is not None:
             t_logits = t_logits.masked_fill(~masks[2], -1e8)
         t_dist = torch.distributions.Categorical(logits=t_logits)
@@ -220,21 +217,21 @@ class ActorCritic(nn.Module):
         actor_feat, hidden_out = self._actor_features(obs, hidden)
         m_mask, c_mask, t_mask = masks
 
-        m_logits = self._scaled(self.move_head(actor_feat))
+        m_logits = self.move_head(actor_feat)
         m_logits = m_logits.masked_fill(~m_mask, -1e8)
         m = m_logits.argmax(dim=-1)
 
         m_emb = self.move_embed(m)
         c_features = F.gelu(self.combat_proj(
             torch.cat([actor_feat, m_emb], dim=-1)))
-        c_logits = self._scaled(self.combat_head(c_features))
+        c_logits = self.combat_head(c_features)
         c_logits = c_logits.masked_fill(~c_mask, -1e8)
         c = c_logits.argmax(dim=-1)
 
         c_emb = self.combat_embed(c)
         t_features = F.gelu(self.target_proj(
             torch.cat([actor_feat, m_emb, c_emb], dim=-1)))
-        t_logits = self._scaled(self.target_head(t_features))
+        t_logits = self.target_head(t_features)
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
         t = t_logits.argmax(dim=-1)
 

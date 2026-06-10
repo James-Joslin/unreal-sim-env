@@ -82,8 +82,11 @@ _ALLY_SLOTS = 3
 _ALLY_SLOT_SIZE = 15                       # was 12: +target_idx, +combat_action, +flanking
 _UNIQUE_SIZE = 136                         # 74 (self+weapon+arch+primary24) + 62 (spatial..patterns)
 
-# Logit bounding (same as before).
-LOGIT_SCALE = 3.0
+# Logits are unbounded — standard for PPO. Clip range, grad norm
+# clipping, and KL early stopping provide sufficient stability.
+# The tanh × 3.0 bounding was removed because it saturated gradients
+# once raw logits exceeded ±2, creating a ceiling on policy confidence
+# and contributing to entropy stagnation in later curriculum stages.
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -404,19 +407,19 @@ class CombatPolicy(nn.Module):
 
     def _heads(self, features):
         """Autoregressive heads with unmasked argmax conditioning."""
-        m = torch.tanh(self.move_head(features)) * LOGIT_SCALE
+        m = self.move_head(features)
         m_action = m.argmax(dim=-1)
 
         m_emb = self.move_embed(m_action)
         c_feat = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
-        c = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c = self.combat_head(c_feat)
         c_action = c.argmax(dim=-1)
 
         c_emb = self.combat_embed(c_action)
         t_feat = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
-        t = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+        t = self.target_head(t_feat)
 
         return m, c, t
 
@@ -454,21 +457,21 @@ class CombatPolicy(nn.Module):
 
         m_mask, c_mask, t_mask = masks
 
-        m_logits = torch.tanh(self.move_head(features)) * LOGIT_SCALE
+        m_logits = self.move_head(features)
         m_logits = m_logits.masked_fill(~m_mask, -1e8)
         m = m_logits.argmax(dim=-1)
 
         m_emb = self.move_embed(m)
         c_feat = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
-        c_logits = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c_logits = self.combat_head(c_feat)
         c_logits = c_logits.masked_fill(~c_mask, -1e8)
         c = c_logits.argmax(dim=-1)
 
         c_emb = self.combat_embed(c)
         t_feat = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
-        t_logits = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+        t_logits = self.target_head(t_feat)
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
         t = t_logits.argmax(dim=-1)
 
