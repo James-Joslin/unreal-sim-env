@@ -17,7 +17,7 @@ The base trainer handles env creation, evaluation, curriculum, and checkpointing
 import os
 import time
 from collections import deque
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -162,6 +162,18 @@ class PPOTrainer(BaseTrainer):
             for c in changes:
                 print(c)
         print()
+        
+    def default_curriculum_timesteps(self) -> Dict[int, int]:
+        """Per-stage training budgets, read from PPOStageConfig.total_timesteps.
+ 
+        Centralised in config.py so the cosine LR/entropy schedules and
+        the actual training budget are always in sync. Override in
+        subclasses only if a method needs a different budget than PPO.
+        """
+        return {
+            stage: get_stage_config(stage).total_timesteps
+            for stage in range(1, 8)
+        }
 
     def get_entropy_coef(self) -> float:
         """Anneal entropy coefficient with cosine schedule.

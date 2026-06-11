@@ -3001,6 +3001,10 @@ class CombatEnv(gym.Env):
                 sum(1 for ally in getattr(self, 'allies', []) if ally.alive)
                 < self._prev_alive_allies),
             self_between_threat_and_ally=self._check_between_threat_and_ally(),
+            ally_target_index=next(
+                (getattr(ally, 'target_idx', -1)
+                 for ally in getattr(self, 'allies', []) if ally.alive),
+                -1),
             lowest_ally_hp=min(
                 (ally.hp_fraction()
                  for ally in getattr(self, 'allies', []) if ally.alive),

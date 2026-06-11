@@ -93,57 +93,59 @@ _UNIQUE_SIZE = 136                         # 74 (self+weapon+arch+primary24) + 6
 #  Tier Configurations
 # ─────────────────────────────────────────────────────────────────
 TIER_CONFIGS = {
-    # d_k = 4. Balanced for ultra-low latency. 
-    # Must use 2 heads here; 4 heads would reduce d_k to an un-trainable 2.
+    # d_k = 4. Ultra-low latency deployment tier.
     "micro": dict(
         entity_dim=8, 
         unique_dim=16, 
         backbone_hidden=32, 
         backbone_layers=1, 
         attention_heads=2,
-        gru_hidden=32       # == backbone_hidden: no bottleneck
+        gru_hidden=32
     ),
     
-    # d_k = 6. Sharp jump in capability.
+    # d_k = 6. Light deployment tier.
     "small": dict(
         entity_dim=12, 
         unique_dim=24, 
         backbone_hidden=48, 
         backbone_layers=1, 
         attention_heads=2,
-        gru_hidden=48       # == backbone_hidden: no bottleneck
+        gru_hidden=48
     ),
     
-    # d_k = 8. Full 4-head behavioral tracking.
+    # d_k = 4. Mid-capacity tier — matches old large dims.
+    # Suitable for S1-S4 training or mid-tier deployment.
     "medium": dict(
         entity_dim=16, 
         unique_dim=32, 
-        backbone_hidden=64, 
+        backbone_hidden=96, 
         backbone_layers=2, 
         attention_heads=4,
-        gru_hidden=64       # == backbone_hidden: no bottleneck
+        gru_hidden=96
     ),
     
-    # d_k = 8. Proven dims from the 70% win rate S4 run.
-    # gru_hidden matches backbone so the action heads receive the
-    # same representation capacity as the non-GRU architecture.
+    # d_k = 6. Primary training tier for S5-S6.
+    # Expanded from 16/32/96 to give the encoder richer entity
+    # representations for multi-target coordination and the
+    # backbone more capacity for ally-aware decision making.
     "large": dict(
-        entity_dim=16,          # restored from 32
-        unique_dim=32,          # restored from 64
-        backbone_hidden=96,     # restored from 128
+        entity_dim=24,
+        unique_dim=48,
+        backbone_hidden=128,
         backbone_layers=2,
         attention_heads=4,
-        gru_hidden=96           # == backbone_hidden: no bottleneck
+        gru_hidden=128
     ),
     
-    # d_k = 12. High-capacity model.
+    # d_k = 8. High-capacity tier for S7 training.
+    # Widest representations for full 4-target squad combat.
     "xl": dict(
-        entity_dim=24, 
-        unique_dim=48, 
-        backbone_hidden=128, 
+        entity_dim=32, 
+        unique_dim=64, 
+        backbone_hidden=192, 
         backbone_layers=3, 
         attention_heads=4,
-        gru_hidden=128          # == backbone_hidden: no bottleneck
+        gru_hidden=192
     )
 }
 
