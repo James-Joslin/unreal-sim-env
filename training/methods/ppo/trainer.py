@@ -46,7 +46,7 @@ class PPOTrainer(BaseTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cfg = get_stage_config(self.stage)
-        self.cfg.total_timesteps = self.total_timesteps
+        self.total_timesteps = self.cfg.total_timesteps
         self.stage_steps_done = 0
 
     # ═════════════════════════════════════════════════════════════
@@ -124,8 +124,8 @@ class PPOTrainer(BaseTrainer):
         """
         prev_cfg = self.cfg
         cfg = get_stage_config(stage)
-        cfg.total_timesteps = self.total_timesteps
         self.cfg = cfg
+        self.total_timesteps = cfg.total_timesteps
 
         print(f"\n{'='*60}")
         print(f"  STAGE {stage} — Applying stage-specific config")
@@ -198,11 +198,13 @@ class PPOTrainer(BaseTrainer):
 
     def train(self):
         """Full PPO training loop."""
+        self.cfg = get_stage_config(self.stage)
+        self.total_timesteps = self.cfg.total_timesteps
         cfg = self.cfg
-        cfg.total_timesteps = self.total_timesteps
 
         self.build_model()
         self.print_setup()
+        self._ensure_writer()
 
         batch_total = cfg.num_steps * self.num_envs
         print(f"Steps/env: {cfg.num_steps}, "
