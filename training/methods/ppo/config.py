@@ -209,9 +209,9 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
     ),
 
     7: PPOStageConfig(
-        lr=1.5e-4,
-        clip_range=0.14,
-        entropy_coef=0.0006,         # 2x S6 final (0.0003)
+        lr=2e-4,
+        clip_range=0.16,
+        entropy_coef=0.001,         # 2x S5 final (0.0003)
         entropy_coef_final=0.0001,
         num_steps=2048,
         mini_batch_size=1024,
@@ -220,7 +220,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         total_timesteps=30_000_000,
         eval_interval=15_000,
         num_eval_episodes=150,
-        revert_patience=6,
+        revert_patience=10,
         revert_min_drop=0.10,
     ),
 
