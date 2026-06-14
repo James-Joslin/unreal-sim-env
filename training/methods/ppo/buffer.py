@@ -111,7 +111,7 @@ class VecRolloutBuffer:
             if end > self.total:
                 break
             idx = indices[start:end]
-            yield {
+            batch = {
                 "obs": torch.from_numpy(flat["obs"][idx]),
                 "m_acts": torch.from_numpy(flat["m_acts"][idx]),
                 "c_acts": torch.from_numpy(flat["c_acts"][idx]),
@@ -124,3 +124,8 @@ class VecRolloutBuffer:
                 "c_masks": torch.from_numpy(flat["c_masks"][idx]),
                 "t_masks": torch.from_numpy(flat["t_masks"][idx]),
             }
+            # Pass stored GRU hidden states so evaluate_actions uses
+            # the same hidden context as the rollout collection phase.
+            if "hiddens" in flat:
+                batch["hiddens"] = torch.from_numpy(flat["hiddens"][idx])
+            yield batch

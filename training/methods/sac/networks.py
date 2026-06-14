@@ -15,7 +15,7 @@ import numpy as np
 
 from combat_sim import OBS_SIZE, MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 from combat_policy import (
-    TIER_CONFIGS, LOGIT_SCALE, layer_init,
+    TIER_CONFIGS, layer_init,
     StructuredEncoder, DeltaEncoder,
 )
 
@@ -72,9 +72,9 @@ class SACPolicyNetwork(nn.Module):
         embeddings = emb_flat.view(batch, 3 * self.encoder.channel_dim)
         features = self.backbone(embeddings)
 
-        m = torch.tanh(self.move_head(features)) * LOGIT_SCALE
-        c = torch.tanh(self.combat_head(features)) * LOGIT_SCALE
-        t = torch.tanh(self.target_head(features)) * LOGIT_SCALE
+        m = torch.tanh(self.move_head(features))
+        c = torch.tanh(self.combat_head(features))
+        t = torch.tanh(self.target_head(features))
         return m, c, t
 
     def get_action_probs(self, obs, masks=None, epsilon=1e-8):

@@ -71,11 +71,17 @@ def generate_teacher_dataset(
         for ep in range(eps_per_stage):
             obs, _ = env.reset()
             done = False
+
+            # GRU hidden state — reset per episode.
+            hidden = None
+            if hasattr(teacher, 'init_hidden'):
+                hidden = teacher.init_hidden(1, device)
+
             while not done:
                 obs_n = obs_normalizer.normalize(obs) if obs_normalizer else obs
                 with torch.no_grad():
                     obs_t = torch.from_numpy(obs_n).float().unsqueeze(0).to(device)
-                    m_l, c_l, t_l, _ = teacher(obs_t)
+                    m_l, c_l, t_l, hidden = teacher(obs_t, hidden)
 
                 all_obs.append(obs_n.copy())
                 all_m.append(m_l.cpu().squeeze(0).numpy())
@@ -164,6 +170,11 @@ def generate_amplified_dataset(
                 ep_reward = 0.0
                 done = False
 
+                # GRU hidden state — reset per rollout.
+                hidden = None
+                if hasattr(policy, 'init_hidden'):
+                    hidden = policy.init_hidden(1, device)
+
                 while not done:
                     obs_n = (obs_normalizer.normalize(obs)
                              if obs_normalizer else obs)
@@ -171,13 +182,20 @@ def generate_amplified_dataset(
                         obs_t = torch.from_numpy(obs_n).float().unsqueeze(0).to(device)
 
                         if hasattr(policy, 'sample_actions'):
-                            (m_a, c_a, t_a), _ = policy.sample_actions(obs_t)
+                            result = policy.sample_actions(obs_t, hidden=hidden)
+                            (m_a, c_a, t_a), _ = result[0], result[1]
+                            if len(result) > 2:
+                                hidden = result[2]
                             m, c, t = m_a.item(), c_a.item(), t_a.item()
                         elif hasattr(policy, 'get_action_and_value'):
-                            (m_a, c_a, t_a), _, _, _ = policy.get_action_and_value(obs_t)
+                            result = policy.get_action_and_value(
+                                obs_t, hidden=hidden)
+                            (m_a, c_a, t_a) = result[0]
+                            if len(result) > 4:
+                                hidden = result[4]
                             m, c, t = m_a.item(), c_a.item(), t_a.item()
                         else:
-                            m_l, c_l, t_l, _ = policy(obs_t)
+                            m_l, c_l, t_l, hidden = policy(obs_t, hidden)
                             m_dist = torch.distributions.Categorical(logits=m_l)
                             c_dist = torch.distributions.Categorical(logits=c_l)
                             t_dist = torch.distributions.Categorical(logits=t_l)
@@ -397,7 +415,7 @@ def benchmark_onnx(onnx_path, input_size, gru_hidden=0,
     feed = {"observation": dummy}
     input_names = [inp.name for inp in sess.get_inputs()]
     if "hidden_in" in input_names:
-        h_size = gru_hidden if gru_hidden > 0 else 48  # fallback
+        h_size = gru_hidden if gru_hidden > 0 else 96  # fallback (Large tier default)
         # Try to get exact shape from the model's input spec.
         for inp in sess.get_inputs():
             if inp.name == "hidden_in":
@@ -628,6 +646,15 @@ def _evaluate_tier(model, stage, archetype, frame_stack,
 
 
 def _regenerate_logits(model, obs_array, device, batch_size=512):
+    """Regenerate logits from a source-tier model for cascaded KD.
+
+    NOTE: GRU hidden state is zero-initialised for every batch because
+    the dataset has no episode structure (observations are shuffled).
+    The regenerated logits therefore don't reflect temporal context.
+    This is acceptable for cascaded distillation — the student learns
+    a per-observation logit mapping, and the GRU builds context at
+    sequential inference time.
+    """
     model.eval()
     all_m, all_c, all_t = [], [], []
     for i in range(0, len(obs_array), batch_size):

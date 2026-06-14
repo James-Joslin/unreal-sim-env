@@ -141,6 +141,7 @@ class CombatState:
     ally_in_danger: bool = False     # ally < 30% HP
     ally_just_died: bool = False     # an ally died this step
     self_between_threat_and_ally: bool = False  # tank body-blocking
+    ally_target_index: int = -1      # which target slot the ally is attacking (-1 = none)
 
     # Step metadata
     step_count: int = 0
@@ -476,15 +477,22 @@ class RewardWeights:
     tank_suppression: float = 0.01
     tank_block_while_focused: float = 0.02
 
-    # ── Ally protection (all archetypes, stage 6+) ────────────────
-    # These teach every archetype to be aware of allies, not just tanks.
-    # A ranged DPS that ignores a dying ally is bad teamplay.
+    # ── Ally coordination (all archetypes, stage 6+) ──────────────
+    # These teach every archetype to be team-aware, not just tanks.
     protect_low_hp_ally: float = 0.015     # Per-step: between a threat and a low-HP ally
-    fire_at_ally_threat: float = 0.04      # Per-shot: attacking the target that's
-                                           # targeting a low-HP ally (draw aggro)
-    ally_died_nearby: float = -1.5         # One-time: an ally died while agent was
-                                           # in range to help. Teaches "don't ignore
-                                           # allies being killed next to you."
+    fire_at_ally_threat: float = 0.08      # Per-shot: firing while an ally needs help.
+                                           # Doubled from 0.04 — signal was too weak
+                                           # relative to base combat rewards.
+    ally_died_nearby: float = -5.0         # One-time: an ally died while agent was in
+                                           # range to help. Raised from -1.5 — old value
+                                           # was less than 20 steps of passive-in-range
+                                           # penalty, so the model didn't care.
+    focus_fire_bonus: float = 0.06         # Per-shot: agent fires at the same target as
+                                           # ally. ~30 shots to kill a 150 HP target =
+                                           # ~1.8 reward per coordinated kill. Small
+                                           # enough to not dominate objectives, large
+                                           # enough to create a gradient toward
+                                           # coordination vs independent fighting.
 
 # ─────────────────────────────────────────────────────────────────
 #  Reward Function
@@ -1399,31 +1407,35 @@ class CombatRewardFunction:
         info: Dict[str, float]
     ) -> float:
         r = 0.0
-        _, combat_action, _ = action
+        _, combat_action, target_action = action
 
-        # Target diversity: track unique targets hit this episode.
-        # The actual bonus is applied at episode end via compute_episode_end_bonus().
+        # ── Focus Fire (all archetypes) ────────────────────────────
+        # Both enemies attacking the same target. The strongest
+        # coordination signal — eliminating targets one at a time
+        # is far more effective than spreading damage across three.
+        # No HP gate: focus fire is ALWAYS good, not just in emergencies.
+        if (combat_action == CombatAction.FIRE and prev.can_fire
+                and curr.total_damage_all_targets > 0
+                and curr.ally_target_index >= 0
+                and target_action == curr.ally_target_index):
+            r += self.w.focus_fire_bonus
+            info["focus_fire"] = self.w.focus_fire_bonus
 
-        # ── Ally Protection (all archetypes) ─────────────────────
-        # These rewards teach every archetype to be team-aware, not
-        # just tanks. A ranged DPS that ignores a dying ally is bad.
+        # ── Ally Protection (all archetypes) ───────────────────────
 
         # Protecting a low-HP ally: positioned between threat and ally.
-        # Applies to all archetypes, not just tank. Any ally stepping
-        # between a threat and a wounded teammate is good teamplay.
+        # Kept gated on ally_in_danger — body-blocking only makes sense
+        # when the ally is actually at risk.
         if curr.ally_in_danger and curr.self_between_threat_and_ally:
             r += self.w.protect_low_hp_ally
             info["protect_ally"] = self.w.protect_low_hp_ally
 
-        # Firing at a target that's threatening an ally.
-        # "Threatening" = target is focusing on an ally (not us).
-        # Drawing aggro by shooting them is good for ally survival.
+        # Firing while an ally needs help — draw aggro, apply pressure.
+        # REMOVED ally_in_danger gate: helping your ally is good
+        # regardless of their HP. The old gate meant the model got
+        # zero coordination signal during 70%+ of the fight.
         if (combat_action == CombatAction.FIRE and prev.can_fire
-                and curr.ally_in_danger):
-            # The agent is shooting while an ally is in danger.
-            # Even if they're not shooting the exact threat, applying
-            # pressure helps. But check: if we're hitting a target
-            # and ally is in danger, that's helpful regardless.
+                and curr.alive_allies > 0):
             damage_dealt = curr.total_damage_all_targets
             if damage_dealt > 0:
                 r += self.w.fire_at_ally_threat
@@ -1433,8 +1445,6 @@ class CombatRewardFunction:
         if curr.ally_just_died and curr.nearest_ally_distance < 1500:
             r += self.w.ally_died_nearby
             info["ally_died_nearby"] = self.w.ally_died_nearby
-
-        # Ally collision is already handled in anti-degenerate.
 
         return r
 

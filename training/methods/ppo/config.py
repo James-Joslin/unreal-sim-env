@@ -132,11 +132,6 @@ class PPOStageConfig:
 
 STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 1 — Melee Basics
-    #  1 passive target, no obstacles. Learn: approach → attack.
-    #  Broad exploration, fast updates, short episodes.
-    # ─────────────────────────────────────────────────────────────
     1: PPOStageConfig(
         lr=3.0e-4,
         clip_range=0.20,
@@ -145,15 +140,10 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         num_steps=256,
         update_epochs=4,
         target_kl=0.025,
-        total_timesteps=200_000,
+        total_timesteps=50_000,
         num_eval_episodes=30,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 2 — Ranged Fire & Reload
-    #  1 stationary target. Learn: fire/reload cycle, range.
-    #  Still exploratory, slightly longer rollouts for reload timing.
-    # ─────────────────────────────────────────────────────────────
     2: PPOStageConfig(
         lr=3.0e-4,
         clip_range=0.20,
@@ -162,15 +152,10 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         num_steps=256,
         update_epochs=4,
         target_kl=0.025,
-        total_timesteps=300_000,
+        total_timesteps=100_000,
         num_eval_episodes=30,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 3 — Moving Targets, Cover, Flanking
-    #  1-2 targets, 3 obstacles, 1000 max steps (200s).
-    #  First real combat stage. Longer episodes need bigger rollouts.
-    # ─────────────────────────────────────────────────────────────
     3: PPOStageConfig(
         lr=2.5e-4,
         clip_range=0.18,
@@ -179,105 +164,66 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         num_steps=512,
         update_epochs=5,
         target_kl=0.020,
-        total_timesteps=500_000,
+        total_timesteps=1_500_000,
         num_eval_episodes=50,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 4 — Multi-Weapon Management
-    #  1-2 targets, 8 obstacles, heavy weapon kit.
-    #  Weapon switching adds discrete decision complexity.
-    #  S4 data showed: healthy KL=0.010, clip=15%, climbed to 84%.
-    #  These params are validated by that run.
-    # ─────────────────────────────────────────────────────────────
     4: PPOStageConfig(
         lr=2.5e-4,
         clip_range=0.18,
-        entropy_coef=0.018,
-        entropy_coef_final=0.003,
+        entropy_coef=0.005,          # ~1.7x S3 final (0.003)
+        entropy_coef_final=0.001,
         num_steps=512,
         update_epochs=5,
         target_kl=0.018,
-        total_timesteps=500_000,
+        total_timesteps=6_000_000,
         num_eval_episodes=80,
         revert_patience=5,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 5 — Archetype Behaviours & Allies
-    #  1-3 targets, 1 ally, weapon pool randomisation.
-    #  CRITICAL: entropy_coef halved from S4.
-    #
-    #  S5 data showed entropy/policy ratio of 1.37 (entropy wins),
-    #  causing the policy to drift toward randomness instead of
-    #  committing to multi-target strategies. Cutting entropy_coef
-    #  to 0.010 brings the ratio to ~0.8.
-    #
-    #  num_steps doubled (512→1024): multi-target episodes have
-    #  higher outcome variance; more episodes per rollout clean up
-    #  the advantage estimates.
-    # ─────────────────────────────────────────────────────────────
     5: PPOStageConfig(
         lr=2.0e-4,
         clip_range=0.16,
-        entropy_coef=0.010,
-        entropy_coef_final=0.002,
+        entropy_coef=0.002,          # 2x S4 final (0.001)
+        entropy_coef_final=0.0005,
         num_steps=1024,
         update_epochs=5,
         target_kl=0.015,
-        total_timesteps=500_000,
+        total_timesteps=10_000_000,
         num_eval_episodes=100,
         revert_patience=5,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 6 — Multi-Target Coordination
-    #  1-3 targets, 1 ally, 12 obstacles. Coordination rewards.
-    #  Policy must commit to focus-fire and target-switching rules.
-    #  Entropy further reduced; rollout stays large.
-    # ─────────────────────────────────────────────────────────────
     6: PPOStageConfig(
         lr=2.0e-4,
         clip_range=0.15,
-        entropy_coef=0.008,
-        entropy_coef_final=0.002,
-        num_steps=1024,
+        entropy_coef=0.001,          # 2x S5 final (0.0005)
+        entropy_coef_final=0.0003,
+        num_steps=2048,
         update_epochs=6,
         target_kl=0.012,
-        total_timesteps=1_000_000,
+        total_timesteps=20_000_000,
         num_eval_episodes=120,
         revert_patience=6,
         revert_min_drop=0.12,
     ),
 
-    # ─────────────────────────────────────────────────────────────
-    #  Stage 7 — Full Squad Combat
-    #  1-4 targets (full player party), 1 ally, 16 obstacles.
-    #  Boss-tier HP (500). Maximum complexity.
-    #
-    #  Largest rollouts (2048) for cleanest advantage signal.
-    #  Tightest clip/KL to protect the complex strategy the model
-    #  has built across 6 prior stages. Lowest entropy to force
-    #  full exploitation of learned tactics.
-    #
-    #  Longer training budget (2M) with more frequent eval and
-    #  tighter reversion to catch regressions early.
-    # ─────────────────────────────────────────────────────────────
     7: PPOStageConfig(
-        lr=1.5e-4,
-        clip_range=0.14,
-        entropy_coef=0.006,
-        entropy_coef_final=0.001,
+        lr=2e-4,
+        clip_range=0.16,
+        entropy_coef=0.001,         # 2x S5 final (0.0003)
+        entropy_coef_final=0.0001,
         num_steps=2048,
         mini_batch_size=1024,
         update_epochs=6,
         target_kl=0.010,
-        total_timesteps=2_000_000,
+        total_timesteps=30_000_000,
         eval_interval=15_000,
         num_eval_episodes=150,
-        revert_patience=6,
+        revert_patience=10,
         revert_min_drop=0.10,
     ),
+
 }
 
 

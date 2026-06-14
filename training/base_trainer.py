@@ -93,8 +93,8 @@ class BaseTrainer(ABC):
 
         # TensorBoard.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = (f"runs/{self.method_name}_s{stage}_{archetype}_{timestamp}")
-        self.writer = SummaryWriter(self.log_dir)
+        self.log_dir = None
+        self.writer = None
 
         # Model and optimizer (populated by subclass in build_model).
         self.model: Optional[nn.Module] = None
@@ -149,7 +149,7 @@ class BaseTrainer(ABC):
             1: 50_000,        # 1v1 no obstacles — learn to approach and shoot
             2: 100_000,       # 1v1 with obstacles — learn navigation
             3: 1_500_000,       # 1v2 — learn target switching
-            4: 6_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon mgmt
+            4: 2_000_000,     # 1v2 with obstacles, 2x HP — cover + weapon mgmt
             5: 10_000_000,    # 2v3 — multi-target, ally coordination
             6: 20_000_000,    # 2v3 full arena — complex navigation
             7: 30_000_000,    # 2v4 full arena — everything together
@@ -316,8 +316,16 @@ class BaseTrainer(ABC):
         print(f"Envs: {self.num_envs}")
         print(f"Logs: {self.log_dir}")
 
-    # ─── Curriculum Runner ───────────────────────────────────────
+    # ─── Helper function to be called per training event to log metrics
+    def _ensure_writer(self):
+        """Create the TensorBoard writer if it doesn't exist yet."""
+        if self.writer is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.log_dir = (f"runs/{self.method_name}_s{self.stage}"
+                            f"_{self.archetype}_{timestamp}")
+            self.writer = SummaryWriter(self.log_dir)
 
+    # ─── Curriculum Runner ───────────────────────────────────────
     def run_curriculum(self):
         """Run all 7 curriculum stages sequentially.
 
@@ -344,7 +352,8 @@ class BaseTrainer(ABC):
             self.best_eval_reward = float("-inf")
 
             # Reset TensorBoard writer for new stage.
-            self.writer.close()
+            if self.writer is not None:
+                self.writer.close()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_dir = (f"runs/{self.method_name}_s{stage}_"
                             f"{self.archetype}_{timestamp}")

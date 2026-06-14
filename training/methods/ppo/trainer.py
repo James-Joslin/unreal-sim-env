@@ -17,7 +17,7 @@ The base trainer handles env creation, evaluation, curriculum, and checkpointing
 import os
 import time
 from collections import deque
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -46,7 +46,7 @@ class PPOTrainer(BaseTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.cfg = get_stage_config(self.stage)
-        self.cfg.total_timesteps = self.total_timesteps
+        self.total_timesteps = self.cfg.total_timesteps
         self.stage_steps_done = 0
 
     # ═════════════════════════════════════════════════════════════
@@ -59,18 +59,20 @@ class PPOTrainer(BaseTrainer):
             obs_size=self.input_size, tier=self.tier
         ).to(self.device)
         
-        # Group parameters to protect structural encoders from value loss spikes
-        encoder_params = []
+        # Group parameters: encoder, backbone, and GRU are representation
+        # layers that need a lower LR for stability. Heads and embeddings
+        # get the full LR since they sit on top.
+        repr_params = []
         head_params = []
         
         for name, param in model.named_parameters():
-            if "encoder" in name or "backbone" in name:
-                encoder_params.append(param)
+            if "encoder" in name or "backbone" in name or "gru" in name:
+                repr_params.append(param)
             else:
                 head_params.append(param)
                 
         optimizer = torch.optim.Adam([
-            {"params": encoder_params, "lr": self.cfg.lr * 0.5},
+            {"params": repr_params, "lr": self.cfg.lr * 0.5},
             {"params": head_params, "lr": self.cfg.lr}
         ], eps=1e-5)
 
@@ -122,8 +124,8 @@ class PPOTrainer(BaseTrainer):
         """
         prev_cfg = self.cfg
         cfg = get_stage_config(stage)
-        cfg.total_timesteps = self.total_timesteps
         self.cfg = cfg
+        self.total_timesteps = cfg.total_timesteps
 
         print(f"\n{'='*60}")
         print(f"  STAGE {stage} — Applying stage-specific config")
@@ -132,15 +134,15 @@ class PPOTrainer(BaseTrainer):
 
         # Rebuild optimizer with two-group LR split (matches build_model).
         if self.model is not None:
-            encoder_params = []
+            repr_params = []
             head_params = []
             for name, param in self.model.named_parameters():
-                if "encoder" in name or "backbone" in name:
-                    encoder_params.append(param)
+                if "encoder" in name or "backbone" in name or "gru" in name:
+                    repr_params.append(param)
                 else:
                     head_params.append(param)
             self.optimizer = torch.optim.Adam([
-                {"params": encoder_params, "lr": cfg.lr * 0.5},
+                {"params": repr_params, "lr": cfg.lr * 0.5},
                 {"params": head_params, "lr": cfg.lr}
             ], eps=1e-5)
 
@@ -160,12 +162,35 @@ class PPOTrainer(BaseTrainer):
             for c in changes:
                 print(c)
         print()
+        
+    def default_curriculum_timesteps(self) -> Dict[int, int]:
+        """Per-stage training budgets, read from PPOStageConfig.total_timesteps.
+ 
+        Centralised in config.py so the cosine LR/entropy schedules and
+        the actual training budget are always in sync. Override in
+        subclasses only if a method needs a different budget than PPO.
+        """
+        return {
+            stage: get_stage_config(stage).total_timesteps
+            for stage in range(1, 8)
+        }
 
     def get_entropy_coef(self) -> float:
-        """Anneal entropy coefficient linearly within the current stage."""
+        """Anneal entropy coefficient with cosine schedule.
+
+        Cosine decays slowly in the first half (preserve exploration)
+        and fast in the second half (let the policy commit). This
+        prevents the late-training entropy drift seen in S5/S6 where
+        linear annealing left the entropy term dominant as the policy
+        gradient weakened under LR decay.
+        """
+        import math
         cfg = self.cfg
         progress = min(1.0, self.stage_steps_done / max(1, cfg.total_timesteps))
-        return cfg.entropy_coef + progress * (cfg.entropy_coef_final - cfg.entropy_coef)
+        # Cosine: 1.0 at progress=0, 0.0 at progress=1
+        cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (cfg.entropy_coef_final
+                + cosine_factor * (cfg.entropy_coef - cfg.entropy_coef_final))
 
     # ═════════════════════════════════════════════════════════════
     #  Training Loop
@@ -173,11 +198,13 @@ class PPOTrainer(BaseTrainer):
 
     def train(self):
         """Full PPO training loop."""
+        self.cfg = get_stage_config(self.stage)
+        self.total_timesteps = self.cfg.total_timesteps
         cfg = self.cfg
-        cfg.total_timesteps = self.total_timesteps
 
         self.build_model()
         self.print_setup()
+        self._ensure_writer()
 
         batch_total = cfg.num_steps * self.num_envs
         print(f"Steps/env: {cfg.num_steps}, "
@@ -234,8 +261,18 @@ class PPOTrainer(BaseTrainer):
                       f"{self.bc_checkpoint}")
 
         # ── LR annealing ─────────────────────────────────────────
+        #
+        # Cosine schedule: slower decay in the middle (where peak
+        # performance is typically reached), faster convergence at
+        # the end. Minimum 5% (not 1%) — the linear schedule's 1%
+        # floor left too little learning capacity to hold onto peak
+        # performance in S5/S6, causing entropy drift and win rate
+        # regression in the final 15% of training.
+        import math
+
         warmup_steps = 50_000 if loaded_from_ppo else 0
         total_rollouts = cfg.total_timesteps // batch_total
+        lr_min_fraction = 0.05  # 5% floor instead of 1%
 
         def lr_lambda(rollout_step):
             if warmup_steps > 0:
@@ -243,14 +280,15 @@ class PPOTrainer(BaseTrainer):
                 if rollout_step < warmup_rollouts:
                     return 0.2 + 0.8 * rollout_step / warmup_rollouts
             progress = min(1.0, rollout_step / max(total_rollouts, 1))
-            return max(0.01, 1.0 - progress)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min_fraction + cosine * (1.0 - lr_min_fraction)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_lambda)
 
-        print(f"LR schedule: {cfg.lr:.1e} → {cfg.lr * 0.01:.1e} "
-              f"over {total_rollouts} rollouts "
-              f"({cfg.total_timesteps:,} steps)"
+        print(f"LR schedule: {cfg.lr:.1e} → {cfg.lr * lr_min_fraction:.1e} "
+              f"(cosine, {total_rollouts} rollouts, "
+              f"{cfg.total_timesteps:,} steps)"
               + (f" with warmup over {warmup_steps:,} steps"
                  if warmup_steps > 0 else ""))
 

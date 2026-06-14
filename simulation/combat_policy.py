@@ -82,67 +82,70 @@ _ALLY_SLOTS = 3
 _ALLY_SLOT_SIZE = 15                       # was 12: +target_idx, +combat_action, +flanking
 _UNIQUE_SIZE = 136                         # 74 (self+weapon+arch+primary24) + 62 (spatial..patterns)
 
-# Logit bounding (same as before).
-LOGIT_SCALE = 3.0
+# Logits are unbounded — standard for PPO. Clip range, grad norm
+# clipping, and KL early stopping provide sufficient stability.
+# The tanh × 3.0 bounding was removed because it saturated gradients
+# once raw logits exceeded ±2, creating a ceiling on policy confidence
+# and contributing to entropy stagnation in later curriculum stages.
 
 
 # ─────────────────────────────────────────────────────────────────
 #  Tier Configurations
 # ─────────────────────────────────────────────────────────────────
 TIER_CONFIGS = {
-    # d_k = 4. Balanced for ultra-low latency. 
-    # Must use 2 heads here; 4 heads would reduce d_k to an un-trainable 2.
+    # d_k = 4. Ultra-low latency deployment tier.
     "micro": dict(
         entity_dim=8, 
         unique_dim=16, 
         backbone_hidden=32, 
         backbone_layers=1, 
         attention_heads=2,
-        gru_hidden=16
-    ),
-    
-    # d_k = 8. Sharp jump in capability.
-    # Scaled entity_dim up to 16 so 2 heads get a rich 8-dimensional workspace.
-    "small": dict(
-        entity_dim=16, 
-        unique_dim=32, 
-        backbone_hidden=64, 
-        backbone_layers=1, 
-        attention_heads=2,
-        gru_hidden=24)
-    ),
-    
-    # d_k = 8. The entry-level tier for full 4-head behavioral tracking.
-    # entity_dim scaled to 32 to give your 4 heads proper breathing room.
-    "medium": dict(
-        entity_dim=32, 
-        unique_dim=48, 
-        backbone_hidden=96, 
-        backbone_layers=2, 
-        attention_heads=4,
         gru_hidden=32
     ),
     
-    # d_k = 8. A deeper, wider architecture for tracking complex scenarios.
-    # Uses expanded unique contexts and a wider backbone to parse interactions.
-    "large": dict(
-        entity_dim=32,          
-        unique_dim=64,          
-        backbone_hidden=128,    
-        backbone_layers=2,
-        attention_heads=4,
+    # d_k = 6. Light deployment tier.
+    "small": dict(
+        entity_dim=12, 
+        unique_dim=24, 
+        backbone_hidden=48, 
+        backbone_layers=1, 
+        attention_heads=2,
         gru_hidden=48
     ),
     
-    # d_k = 16. The high-capacity powerhouse model.
-    # Broadens the attention spaces to 16 dimensions per head and deepens the policy network.
+    # d_k = 4. Mid-capacity tier — matches old large dims.
+    # Suitable for S1-S4 training or mid-tier deployment.
+    "medium": dict(
+        entity_dim=16, 
+        unique_dim=32, 
+        backbone_hidden=96, 
+        backbone_layers=2, 
+        attention_heads=4,
+        gru_hidden=96
+    ),
+    
+    # d_k = 6. Primary training tier for S5-S6.
+    # Expanded from 16/32/96 to give the encoder richer entity
+    # representations for multi-target coordination and the
+    # backbone more capacity for ally-aware decision making.
+    "large": dict(
+        entity_dim=24,
+        unique_dim=48,
+        backbone_hidden=128,
+        backbone_layers=2,
+        attention_heads=4,
+        gru_hidden=128
+    ),
+    
+    # d_k = 8. High-capacity tier for S7 training.
+    # Widest representations for full 4-target squad combat.
     "xl": dict(
-        entity_dim=64, 
-        unique_dim=96, 
-        backbone_hidden=256, 
+        entity_dim=32, 
+        unique_dim=64, 
+        backbone_hidden=192, 
         backbone_layers=3, 
         attention_heads=4,
-        gru_hidden=64
+        gru_hidden=192
     )
 }
 
@@ -406,19 +409,19 @@ class CombatPolicy(nn.Module):
 
     def _heads(self, features):
         """Autoregressive heads with unmasked argmax conditioning."""
-        m = torch.tanh(self.move_head(features)) * LOGIT_SCALE
+        m = self.move_head(features)
         m_action = m.argmax(dim=-1)
 
         m_emb = self.move_embed(m_action)
         c_feat = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
-        c = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c = self.combat_head(c_feat)
         c_action = c.argmax(dim=-1)
 
         c_emb = self.combat_embed(c_action)
         t_feat = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
-        t = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+        t = self.target_head(t_feat)
 
         return m, c, t
 
@@ -456,21 +459,21 @@ class CombatPolicy(nn.Module):
 
         m_mask, c_mask, t_mask = masks
 
-        m_logits = torch.tanh(self.move_head(features)) * LOGIT_SCALE
+        m_logits = self.move_head(features)
         m_logits = m_logits.masked_fill(~m_mask, -1e8)
         m = m_logits.argmax(dim=-1)
 
         m_emb = self.move_embed(m)
         c_feat = F.gelu(self.combat_proj(
             torch.cat([features, m_emb], dim=-1)))
-        c_logits = torch.tanh(self.combat_head(c_feat)) * LOGIT_SCALE
+        c_logits = self.combat_head(c_feat)
         c_logits = c_logits.masked_fill(~c_mask, -1e8)
         c = c_logits.argmax(dim=-1)
 
         c_emb = self.combat_embed(c)
         t_feat = F.gelu(self.target_proj(
             torch.cat([features, m_emb, c_emb], dim=-1)))
-        t_logits = torch.tanh(self.target_head(t_feat)) * LOGIT_SCALE
+        t_logits = self.target_head(t_feat)
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
         t = t_logits.argmax(dim=-1)
 
@@ -490,7 +493,7 @@ def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPoli
         unique_dim=cfg["unique_dim"],
         backbone_hidden=cfg["backbone_hidden"],
         backbone_layers=cfg["backbone_layers"],
-        attention_heads=cfg["attention_heads"]
+        attention_heads=cfg["attention_heads"],
         gru_hidden=cfg["gru_hidden"],
     )
 
