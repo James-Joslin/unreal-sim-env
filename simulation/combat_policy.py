@@ -118,10 +118,10 @@ TIER_CONFIGS = {
     "medium": dict(
         entity_dim=16, 
         unique_dim=32, 
-        backbone_hidden=96, 
+        backbone_hidden=48, 
         backbone_layers=2, 
         attention_heads=4,
-        gru_hidden=96
+        gru_hidden=48
     ),
     
     # d_k = 6. Primary training tier for S5-S6.
@@ -129,23 +129,23 @@ TIER_CONFIGS = {
     # representations for multi-target coordination and the
     # backbone more capacity for ally-aware decision making.
     "large": dict(
-        entity_dim=24,
-        unique_dim=48,
-        backbone_hidden=128,
+        entity_dim=16,
+        unique_dim=32,
+        backbone_hidden=64,
         backbone_layers=2,
         attention_heads=4,
-        gru_hidden=128
+        gru_hidden=64
     ),
     
     # d_k = 8. High-capacity tier for S7 training.
     # Widest representations for full 4-target squad combat.
     "xl": dict(
-        entity_dim=32, 
-        unique_dim=64, 
-        backbone_hidden=192, 
-        backbone_layers=3, 
+        entity_dim=16,
+        unique_dim=32,
+        backbone_hidden=64,
+        backbone_layers=3,
         attention_heads=4,
-        gru_hidden=192
+        gru_hidden=64
     )
 }
 
