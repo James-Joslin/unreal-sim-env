@@ -2496,6 +2496,7 @@ class CombatEnv(gym.Env):
             obs[idx] = target.mana_fraction(); idx += 1
             obs[idx] = target.commitment; idx += 1
             obs[idx] = target.gap_closer_threat(a.pos); idx += 1
+            idx += 1  # [73] padding — C++ allocates 24 but writes 23
         else:
             idx += 24
 
