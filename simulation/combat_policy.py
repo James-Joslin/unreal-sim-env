@@ -2,58 +2,196 @@
 combat_policy.py — Structured policy network with delta encoding and entity-aware processing.
 
 ARCHITECTURE
-    Input: flat [batch, 645] (3 frames x 215 features, from C++ frame stacking)
+    Input: flat [batch, 747] (3 frames x 249 features, from C++ frame stacking)
 
     Stage 1 — Reshape + Delta Encode (baked into ONNX, zero params):
-        Reshape [batch, 645] → [batch, 3, 215]
+        Reshape [batch, 747] → [batch, 3, 249]
         current      = frames[:, 2]                                    (latest)
         velocity     = frames[:, 2] - frames[:, 1]                    (1st derivative)
         acceleration = frames[:, 2] - 2·frames[:, 1] + frames[:, 0]   (2nd derivative)
 
     Stage 2 — Per-Channel Group Encoding (shared weights across 3 channels):
         For each delta channel:
-            Split 215 features → unique (127) + hostile slots (4x13) + ally slots (3x12) + dynamic threat slots (3x3)
-            unique_emb  = Linear(127, unique_dim) → GELU
-            hostile_emb = shared Linear(13, entity_dim) → GELU, x4 slots, max-pool
-            ally_emb    = shared Linear(12, entity_dim) → GELU, x3 slots, max-pool
-            threat_emb  = shared Linear(3, entity_dim) → GELU, x3 slots, max-pool
-            channel_emb = [unique_emb ‖ hostile_pool ‖ ally_pool ‖ threat_pool]
+            Split 249 → unique (136) + hostile (4x17) + ally (3x15) + threat (3x3)
+            unique_emb  = Linear(136, unique_dim) → GELU
+            hostile_emb = shared Linear(17, entity_dim) → GELU, x4 → cross-attention
+            ally_emb    = shared Linear(15, entity_dim) → GELU, x3 → cross-attention
+            threat_emb  = shared Linear(3, entity_dim)  → GELU, x3 → cross-attention
+            channel_emb = [unique_emb ‖ hostile_attn ‖ ally_attn ‖ threat_attn]
 
     Stage 3 — Policy Backbone:
-        Concat 3 channels → MLP backbone → 3 policy heads
+        Concat 3 channels → MLP backbone → GRU → 3 autoregressive heads
 
-OBSERVATION LAYOUT (215 per frame)
-    [  0.. 20]  Self State                        (21)     ─┐
-    [ 21.. 42]  Weapon State                      (22)      │
-    [ 43.. 49]  Archetype                         ( 7)      ├─ Unique features (127 total)
-    [ 50.. 69]  Primary Target                    (20)     ─┘ (+ spatial/threat/nav/metrics below)
-    [ 70..121]  Hostile Targets                   (52)  ←── 4 slots x 13 (shared hostile encoder)
-    [122..157]  Allied Robots                     (36)  ←── 3 slots x 12 (shared ally encoder)
-    [158..165]  Spatial Ring                      ( 8)     ─┐
-    [166..173]  Cover Height                      ( 8)      │
-    [174..181]  Threat Sensing (Projectile 1)     ( 8)      ├─ Unique features (continued)
-                (174: dist, 175: speed, 176: dirX, 177: dirY, etc.) // nearest threat
-    [182..190]  Navmesh Viability                 ( 9)      │
-    [191..196]  Group Summary                     ( 6)      │
-    [197..197]  Spawn/Leash                       ( 1)     ─┘
-    [198..200]  Threat Sensing (Projectile 2)     ( 3)      (dist, dirX, dirY) [shared threat encoder]
-    [201..203]  Threat Sensing (Projectile 3)     ( 3)      (dist, dirX, dirY) [shared threat encoder]
-    [204..204]  Incoming Threat Count             ( 1)      Knowing when to dodge vs fight
-    [205..208]  Can Hit Target Per Weapon         ( 4)      (weapon 1, 2, 3, 4) target availability
-    [209..209]  Total Ammo Fraction               ( 1)      Ammo conservation state
-    [210..210]  Targets Killed Fraction           ( 1)      Kill urgency tracker
-    [211..214]  Arc Clearance Per Weapon          ( 4)      MaxArcableObstacleHeight / 3000
+OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
 
-C++ SIDE: Only change FrameStackCount from 8 to 3. Input stays flat TArray<float>.
+    Unique features: frame[:, 0:74] + frame[:, 187:249] = 136 total
+
+    Self State (21)
+    [  0]       hp_fraction
+    [  1]       defence / 200
+    [  2]       speed / max_speed
+    [  3]       stunned                           (CombatEnvExtended fills)
+    [  4]       slowed                            (CombatEnvExtended fills)
+    [  5.. 10]  debuff slots x6                   (CombatEnvExtended fills)
+    [ 11]       velocity_dir X
+    [ 12]       velocity_dir Y
+    [ 13]       combat_time / 120
+    [ 14]       height_above_ground (≈0.176)
+    [ 15]       is_action_locked
+    [ 16]       action_lock_progress
+    [ 17]       action_lock_reason / 6
+    [ 18]       is_dodging
+    [ 19]       dodge_ready
+    [ 20]       invulnerable (= is_dodging)
+
+    Weapon State (22)
+    [ 21]       active_weapon / (n_slots - 1)
+    [ 22]       active ammo_fraction
+    [ 23]       active is_ready && has_ammo
+    [ 24]       active is_reloading
+    [ 25]       active reload_progress
+    [ 26]       active range / 5000
+    [ 27]       active cooldown_frac
+    [ 28]       active wind_up_time / 3
+    [ 29]       active can_arc
+    [ 30]       active is_ranged
+    [ 31.. 42]  other weapon slots x3 (ammo, range/5000, reloading, can_arc)
+
+    Archetype (7)
+    [ 43.. 46]  one-hot (ranged/melee/healer/tank)
+    [ 47]       min_engagement_range / 5000
+    [ 48]       has_any_ammo
+    [ 49]       melee_ready
+
+    Primary Target (24)  ← BUG: live path writes 23, see note below
+    [ 50]       rel X / 5000
+    [ 51]       rel Y / 5000
+    [ 52]       dist / 5000
+    [ 53]       hp_fraction
+    [ 54]       in_weapon_range
+    [ 55]       has_LOS
+    [ 56]       in_sight_cone                     (CombatEnvExtended overrides)
+    [ 57]       agent_facing_dot
+    [ 58]       target_facing_toward_agent
+    [ 59]       velocity X / 600
+    [ 60]       velocity Y / 600
+    [ 61]       acceleration X / 2000             (CombatEnvExtended fills)
+    [ 62]       acceleration Y / 2000             (CombatEnvExtended fills)
+    [ 63]       angular_size (70 / dist)
+    [ 64]       is_player_controlled
+    [ 65]       behind_low_cover
+    [ 66]       cover_height / 500
+    [ 67]       in_melee_range
+    [ 68]       closing_speed / 1000
+    [ 69]       character_type  (Phase 1)
+    [ 70]       mana_fraction   (Phase 1)
+    [ 71]       commitment      (Phase 1)
+    [ 72]       gap_closer_threat (Phase 1)
+    [ 73]       *** MISSING — live path only advances 23 ***
+
+    Hostile Targets (68 = 4 x 17)    _HOSTILE_START = 74
+    [ 74.. 90]  slot 0   [ 91..107]  slot 1
+    [108..124]  slot 2   [125..141]  slot 3
+    Per slot:
+        [+0]  occupied (1=present, 0=empty)   ← mask key
+        [+1]  rel X / 5000
+        [+2]  rel Y / 5000
+        [+3]  dist / 5000
+        [+4]  hp_fraction
+        [+5]  has_LOS
+        [+6]  is_player_controlled
+        [+7]  facing_dot (target facing → agent)
+        [+8]  priority_score / 120            (CombatEnvExtended overrides)
+        [+9]  threat_level / 200              (CombatEnvExtended overrides)
+        [+10] velocity X / 600
+        [+11] velocity Y / 600
+        [+12] is_targeting_me (facing dot, 0–1)
+        [+13] character_type  (Phase 1)
+        [+14] mana_fraction   (Phase 1)
+        [+15] commitment      (Phase 1)
+        [+16] gap_closer_threat (Phase 1)
+    Sorted by priority score, not distance.
+
+    Allied Robots (45 = 3 x 15)      _ALLY_START = 142
+    [142..156]  slot 0   [157..171]  slot 1   [172..186]  slot 2
+    Per slot:
+        [+0]  occupied (1=present, 0=empty)   ← mask key
+        [+1]  rel X / 5000
+        [+2]  rel Y / 5000
+        [+3]  dist / 5000
+        [+4]  hp_fraction
+        [+5]  has_LOS
+        [+6]  velocity X / 600
+        [+7]  velocity Y / 600
+        [+8]  facing_dot (ally facing → agent)
+        [+9]  ammo_fraction
+        [+10] is_reloading
+        [+11] fire_cooldown / 2
+        [+12] target_idx (Phase 1): (idx+1)/5
+        [+13] combat_action (Phase 1): action/7
+        [+14] flanking_angle (Phase 1): cos(my→tgt, ally→tgt)
+
+    ─── Unique features continued (frame[:, 187:249]) ───
+
+    Spatial Ring (8)                  [187..194]
+    Cover Height (8)                 [195..202]
+
+    Threat Sensing — Proj 1 (8)      [203..210]
+        [203] proj1 dist             ← threat slot t1[0]
+        [204] proj1 TTA
+        [205] proj1 dir X            ← threat slot t1[1]
+        [206] proj1 dir Y            ← threat slot t1[2]
+        [207] nearest melee dist
+        [208] nearest melee dir X
+        [209] nearest melee dir Y
+        [210] dodge_available
+
+    Navmesh Viability (9)            [211..219]
+    Group Summary (6)                [220..225]
+        [220] alive_allies / 10      (CombatEnvExtended overrides)
+        [221] alive_hostiles / 4
+        [222] avg_ally_hp            (CombatEnvExtended overrides)
+        [223] avg_hostile_hp
+        [224] numerical_advantage    (CombatEnvExtended overrides)
+        [225] outnumbered
+    Spawn / Leash (1)                [226]
+
+    Extended Threat (7)              [227..233]
+        [227] proj2 dist             ← threat slot t2[0]
+        [228] proj2 dir X            ← threat slot t2[1]
+        [229] proj2 dir Y            ← threat slot t2[2]
+        [230] proj3 dist             ← threat slot t3[0]
+        [231] proj3 dir X            ← threat slot t3[1]
+        [232] proj3 dir Y            ← threat slot t3[2]
+        [233] threat_count / 5
+
+    Weapon Can-Hit (4)               [234..237]
+    Total Ammo Fraction (1)          [238]
+    Targets Killed Fraction (1)      [239]
+    Arc Clearance / Weapon (4)       [240..243]
+    Player Patterns (5)              [244..248]
+        aggression, evasion, predictability, preferred_range, mana_burn_rate
+
+    BUG — PRIMARY TARGET OFF-BY-ONE (combat_sim.py _build_observation)
+        Live path advances idx by 23. Else branch does idx += 24.
+        When the primary target is alive, every section from Hostile Targets
+        onward is written 1 index earlier than this layout describes. The
+        observation flips alignment when targets die (else path restores the
+        intended layout for that step). This also makes the hardcoded indices
+        in combat_extensions.py (obs[220], [222], [224]) and the encoder
+        constants (_HOSTILE_START=74, _ALLY_START=142, threat slot indices)
+        point to the wrong fields during normal (target-alive) operation.
+        Verify against NeuralCombatComponent.cpp and fix whichever side is
+        wrong before implementing attention masking.
 
 TIER ARCHITECTURE (structured)
-    | Tier   | entity | unique | backbone | layers | Approx Params |
-    |--------|--------|--------|----------|--------|---------------|
-    | Micro  | 8      | 16     | 32       | 1      | ~9K           |
-    | Small  | 12     | 24     | 48       | 1      | ~18K          |
-    | Medium | 16     | 32     | 64       | 2      | ~38K          |
-    | Large  | 16     | 32     | 96       | 2      | ~48K          |
-    | XL     | 24     | 48     | 128      | 3      | ~85K          |
+    | Tier   | entity | unique | backbone | layers | attn_heads | gru  |
+    |--------|--------|--------|----------|--------|------------|------|
+    | Micro  | 8      | 16     | 32       | 1      | 2          | 32   |
+    | Small  | 12     | 24     | 48       | 1      | 2          | 48   |
+    | Medium | 16     | 32     | 48       | 2      | 4          | 48   |
+    | Large  | 16     | 32     | 64       | 2      | 4          | 64   |
+    | XL     | 16     | 32     | 64       | 3      | 4          | 64   |
 """
 
 import os
@@ -84,7 +222,7 @@ _UNIQUE_SIZE = 136                         # 74 (self+weapon+arch+primary24) + 6
 
 # Logits are unbounded — standard for PPO. Clip range, grad norm
 # clipping, and KL early stopping provide sufficient stability.
-# The tanh × 3.0 bounding was removed because it saturated gradients
+# The tanh x 3.0 bounding was removed because it saturated gradients
 # once raw logits exceeded ±2, creating a ceiling on policy confidence
 # and contributing to entropy stagnation in later curriculum stages.
 
