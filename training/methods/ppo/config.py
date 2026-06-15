@@ -205,7 +205,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         target_kl=0.015,
         total_timesteps=10_000_000,
         num_eval_episodes=100,
-        revert_patience=5,
+        revert_patience=30,
     ),
 
     6: PPOStageConfig(
