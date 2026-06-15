@@ -22,6 +22,7 @@ from combat_policy import (
 )
 
 ACTION_EMBED_DIM = 16
+TARGET_MOVE_CLASSES = 9  # stationary + 8 compass directions
 
 
 def _build_backbone(input_size: int, hidden: int, num_layers: int) -> nn.Sequential:
@@ -99,6 +100,12 @@ class ActorCritic(nn.Module):
         self.value_head = layer_init(
             nn.Linear(backbone_hidden, 1), std=1.0)
 
+        # Auxiliary prediction head: opponent movement direction (9 classes).
+        # Uses critic features — predicts target's current movement from the
+        # observation to regularise the encoder.  Disabled when aux_pred_coef=0.
+        self.predict_head = layer_init(
+            nn.Linear(backbone_hidden, TARGET_MOVE_CLASSES), std=0.01)
+
     def init_hidden(self, batch_size=1, device=None):
         if device is None:
             device = next(self.parameters()).device
@@ -171,7 +178,7 @@ class ActorCritic(nn.Module):
 
         log_prob = (m_dist.log_prob(m_act) + c_dist.log_prob(c_act)
                     + t_dist.log_prob(t_act))
-        entropy = m_dist.entropy() + c_dist.entropy() + t_dist.entropy()
+        entropy = (m_dist.entropy(), c_dist.entropy(), t_dist.entropy())
         value = self.value_head(critic_feat).squeeze(-1)
 
         return (m_act, c_act, t_act), log_prob, entropy, value, hidden_out
@@ -202,10 +209,11 @@ class ActorCritic(nn.Module):
 
         log_prob = (m_dist.log_prob(m_act) + c_dist.log_prob(c_act)
                     + t_dist.log_prob(t_act))
-        entropy = m_dist.entropy() + c_dist.entropy() + t_dist.entropy()
+        entropy = (m_dist.entropy(), c_dist.entropy(), t_dist.entropy())
         value = self.value_head(critic_feat).squeeze(-1)
+        pred_logits = self.predict_head(critic_feat)
 
-        return log_prob, entropy, value
+        return log_prob, entropy, value, pred_logits
 
     # ─── select_actions (eval — masked autoregressive argmax) ────
 

@@ -98,7 +98,21 @@ class PPOStageConfig:
     # ── Exploration / Exploitation Balance ────────────────────────
     entropy_coef: float = 0.020
     entropy_coef_final: float = 0.002
+    # Per-head entropy ratios.  The cosine-scheduled entropy_coef sets
+    # the overall scale; these ratios control relative weighting across
+    # the three autoregressive heads.  Movement needs the most
+    # exploration (9 actions, spatial); target needs the least
+    # (4 actions, focus fire demands commitment).
+    entropy_move_ratio: float = 1.5
+    entropy_combat_ratio: float = 1.0
+    entropy_target_ratio: float = 0.5
     value_coef: float = 0.35
+
+    # ── Auxiliary Prediction ──────────────────────────────────────
+    # Coefficient for the opponent-movement prediction auxiliary loss.
+    # Small enough to regularise the encoder without dominating the
+    # policy gradient.  Set to 0 to disable.
+    aux_pred_coef: float = 0.1
 
     # ── Gradient Safety ──────────────────────────────────────────
     max_grad_norm: float = 0.5
@@ -254,6 +268,9 @@ def get_stage_summary(stage: int) -> str:
     return (
         f"S{stage}: lr={cfg.lr:.1e} clip={cfg.clip_range:.2f} "
         f"ent={cfg.entropy_coef:.3f}→{cfg.entropy_coef_final:.3f} "
+        f"(m/c/t={cfg.entropy_move_ratio:.1f}/{cfg.entropy_combat_ratio:.1f}"
+        f"/{cfg.entropy_target_ratio:.1f}) "
+        f"aux={cfg.aux_pred_coef:.2f} "
         f"steps={cfg.num_steps} epochs={cfg.update_epochs} "
         f"kl={cfg.target_kl:.3f} eval_eps={cfg.num_eval_episodes}"
     )

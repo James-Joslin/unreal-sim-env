@@ -22,6 +22,7 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from combat_sim import OBS_SIZE, MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 from combat_policy import (
@@ -394,6 +395,11 @@ class PPOTrainer(BaseTrainer):
                 buffer.c_masks[step] = current_masks[1].cpu().numpy()
                 buffer.t_masks[step] = current_masks[2].cpu().numpy()
 
+                # Store auxiliary prediction labels from env infos.
+                for i in range(self.num_envs):
+                    buffer.target_move_labels[step, i] = \
+                        infos[i].get("target_move_label", 0)
+
                 # Store GRU hidden state (BEFORE this step's GRU update).
                 if gru_hidden > 0 and hidden is not None:
                     buffer.hiddens[step] = hidden.squeeze(0).cpu().numpy()
@@ -482,6 +488,10 @@ class PPOTrainer(BaseTrainer):
             total_pg_loss = 0
             total_v_loss = 0
             total_ent = 0
+            total_m_ent = 0
+            total_c_ent = 0
+            total_t_ent = 0
+            total_aux_loss = 0
             total_clip_frac = 0
             total_approx_kl = 0
             n_updates = 0
@@ -505,6 +515,8 @@ class PPOTrainer(BaseTrainer):
                         batch["c_masks"].to(self.device),
                         batch["t_masks"].to(self.device),
                     )
+                    b_target_labels = batch[
+                        "target_move_labels"].to(self.device)
 
                     # Feed stored hidden states for GRU conditioning.
                     b_hidden = None
@@ -513,7 +525,7 @@ class PPOTrainer(BaseTrainer):
                         b_hidden = batch["hiddens"].to(
                             self.device).unsqueeze(0)
 
-                    new_lp, entropy, new_val = \
+                    new_lp, (m_ent, c_ent, t_ent), new_val, pred_logits = \
                         self.model.evaluate_actions(
                             b_obs, b_m, b_c, b_t,
                             masks=b_masks, hidden=b_hidden)
@@ -531,11 +543,21 @@ class PPOTrainer(BaseTrainer):
                     v_loss2 = (v_clipped - b_ret) ** 2
                     v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
 
-                    ent_loss = -entropy.mean()
+                    # Per-head weighted entropy.
+                    ent_loss = -(
+                        cfg.entropy_move_ratio * m_ent
+                        + cfg.entropy_combat_ratio * c_ent
+                        + cfg.entropy_target_ratio * t_ent
+                    ).mean()
+
+                    # Auxiliary prediction loss (opponent movement).
+                    aux_loss = F.cross_entropy(
+                        pred_logits, b_target_labels)
 
                     loss = (pg_loss
                             + cfg.value_coef * v_loss
-                            + current_ent_coef * ent_loss)
+                            + current_ent_coef * ent_loss
+                            + cfg.aux_pred_coef * aux_loss)
 
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -553,7 +575,11 @@ class PPOTrainer(BaseTrainer):
 
                     total_pg_loss += pg_loss.item()
                     total_v_loss += v_loss.item()
-                    total_ent += entropy.mean().item()
+                    total_ent += (m_ent + c_ent + t_ent).mean().item()
+                    total_m_ent += m_ent.mean().item()
+                    total_c_ent += c_ent.mean().item()
+                    total_t_ent += t_ent.mean().item()
+                    total_aux_loss += aux_loss.item()
                     total_clip_frac += clip_frac.item()
                     total_approx_kl += approx_kl.item()
                     n_updates += 1
@@ -575,6 +601,14 @@ class PPOTrainer(BaseTrainer):
                 "train/value_loss", total_v_loss / nu, global_step)
             self.writer.add_scalar(
                 "train/entropy", total_ent / nu, global_step)
+            self.writer.add_scalar(
+                "train/entropy_move", total_m_ent / nu, global_step)
+            self.writer.add_scalar(
+                "train/entropy_combat", total_c_ent / nu, global_step)
+            self.writer.add_scalar(
+                "train/entropy_target", total_t_ent / nu, global_step)
+            self.writer.add_scalar(
+                "train/aux_pred_loss", total_aux_loss / nu, global_step)
             self.writer.add_scalar(
                 "train/clip_fraction",
                 total_clip_frac / nu, global_step)
