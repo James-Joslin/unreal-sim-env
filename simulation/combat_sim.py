@@ -1502,6 +1502,22 @@ class CombatEnv(gym.Env):
         # Include action mask for next step in info (used by PPO).
         info["action_mask"] = self.build_action_mask()
 
+        # Auxiliary prediction label: primary target's movement direction
+        # discretised into 9 classes (0=stationary, 1-8=compass).
+        target = self._current_target()
+        if target and target.alive:
+            vel = target.velocity
+            speed = np.linalg.norm(vel)
+            if speed < 10.0:
+                info["target_move_label"] = 0
+            else:
+                angle = np.arctan2(vel[1], vel[0])
+                # Map [-π, π] → [0, 8), offset by half-bin so 0=East-ish
+                info["target_move_label"] = 1 + int(
+                    (angle + np.pi + np.pi / 8) / (np.pi / 4)) % 8
+        else:
+            info["target_move_label"] = 0
+
         return obs, reward, done, truncated, info
 
     # ═════════════════════════════════════════════════════════════

@@ -62,6 +62,10 @@ class VecRolloutBuffer:
             self.hiddens = np.zeros(
                 (num_steps, num_envs, gru_hidden), dtype=np.float32)
 
+        # Auxiliary prediction labels (target movement direction, 9 classes).
+        self.target_move_labels = np.zeros(
+            (num_steps, num_envs), dtype=np.int64)
+
     def compute_gae(self, last_values: np.ndarray, gamma: float,
                     lam: float):
         """Compute GAE for all envs. last_values: (num_envs,)."""
@@ -97,6 +101,7 @@ class VecRolloutBuffer:
             "m_masks": self.m_masks.reshape(self.total, MOVEMENT_ACTIONS),
             "c_masks": self.c_masks.reshape(self.total, COMBAT_ACTIONS),
             "t_masks": self.t_masks.reshape(self.total, TARGET_ACTIONS),
+            "target_move_labels": self.target_move_labels.reshape(self.total),
         }
         if self.gru_hidden > 0:
             flat["hiddens"] = self.hiddens.reshape(self.total, self.gru_hidden)
@@ -123,6 +128,8 @@ class VecRolloutBuffer:
                 "m_masks": torch.from_numpy(flat["m_masks"][idx]),
                 "c_masks": torch.from_numpy(flat["c_masks"][idx]),
                 "t_masks": torch.from_numpy(flat["t_masks"][idx]),
+                "target_move_labels": torch.from_numpy(
+                    flat["target_move_labels"][idx]),
             }
             # Pass stored GRU hidden states so evaluate_actions uses
             # the same hidden context as the rollout collection phase.
