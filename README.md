@@ -37,7 +37,7 @@ python view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
 python view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
 ```
 
-See [`UPDATED_quickstart.md`](UPDATED_quickstart.md) for dependencies, CLI notes and common commands.
+See [`UPDATED_quickstart.md`](docs/quickstart.md) for dependencies, CLI notes and common commands.
 
 ## Observation and Action Model
 
@@ -111,7 +111,7 @@ Training progresses through seven stages:
 6. **Multi-target coordination** — focus fire, target priority and ally protection
 7. **Full squad combat** — full 4-player party combat using all learned behaviours
 
-See [`UPDATED_curriculum.md`](UPDATED_curriculum.md) for per-stage details.
+See [`UPDATED_curriculum.md`](docs/curriculum.md) for per-stage details.
 
 ## ONNX Deployment Tiers
 
@@ -125,13 +125,13 @@ See [`UPDATED_curriculum.md`](UPDATED_curriculum.md) for per-stage details.
 
 ## Documentation
 
-- [`UPDATED_quickstart.md`](quickstart.md) — setup, commands and scripts
-- [`UPDATED_architecture.md`](architecture.md) — policy network, PPO model and ONNX export
-- [`UPDATED_observations.md`](observations.md) — 249-float observation layout
-- [`UPDATED_curriculum.md`](curriculum.md) — stage design and progression
-- [`UPDATED_rewards.md`](rewards.md) — reward philosophy and component activation
-- [`UPDATED_weapons.md`](weapons.md) — weapon presets and arc-fire mechanics
-- [`UPDATED_web-tool.md`](web-tool.md) — browser debugging/testing tool
+- [`UPDATED_quickstart.md`](docs/quickstart.md) — setup, commands and scripts
+- [`UPDATED_architecture.md`](docs/architecture.md) — policy network, PPO model and ONNX export
+- [`UPDATED_observations.md`](docs/observations.md) — 249-float observation layout
+- [`UPDATED_curriculum.md`](docs/curriculum.md) — stage design and progression
+- [`UPDATED_rewards.md`](docs/rewards.md) — reward philosophy and component activation
+- [`UPDATED_weapons.md`](docs/weapons.md) — weapon presets and arc-fire mechanics
+- [`UPDATED_web-tool.md`](docs/web-tool.md) — browser debugging/testing tool
 
 ## Generated Outputs
 
