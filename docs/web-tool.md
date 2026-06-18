@@ -1,6 +1,6 @@
-# Web Testing Tool
+# Web Testing Tool - OUTDATED NEEDS UPDATING
 
-Browser-based testing and debugging environment for the neural combat AI. Runs a full combat simulation with ONNX model inference, letting you play against the AI agent in real time while monitoring every aspect of its decision-making.
+The web testing tool is a browser-based debugging environment for ONNX combat policies. It can run a combat simulation, load a policy model, inspect observations, visualise rewards and monitor action probabilities.
 
 ## Setup
 
@@ -10,59 +10,68 @@ npm install -D @types/d3 typescript
 npm run dev:local
 ```
 
-Copy `App.tsx`, `main.tsx`, and `components/` into `src/`. The simulation starts immediately with a scripted fallback AI (no model needed for basic testing).
+The tool can run with a scripted fallback AI, so a model is not required for basic UI testing.
 
 ## Controls
 
-| Key | Effect |
+| Key/Input | Effect |
 |---|---|
 | WASD | Move player |
-| Click (canvas) | Shoot toward cursor |
+| Click canvas | Shoot toward cursor |
 | Space | Shoot at AI agent |
 | R | Reload |
-| Enter | Restart (when game over) |
+| Enter | Restart after game over |
 
-## Loading an ONNX Model
+## ONNX Model Loading
 
-Upload via the header bar. The tool auto-detects the tier from input dimension and configures frame stacking accordingly.
+Upload an ONNX model through the header bar. Current policy exports use:
 
-| Tier | Decision Rate | Frame Stack | Input Dim |
-|---|---|---|---|
-| Micro | 2.5 Hz | 3 | 645 |
-| Small | 3.3 Hz | 3 | 645 |
-| Medium | 5 Hz | 3 | 645 |
-| Large | 6.6 Hz | 3 | 645 |
-| XL | 10 Hz | 3 | 645 |
+```text
+observation input: [batch, 747]
+hidden_in input:   [1, batch, gru_hidden]
+outputs: movement_logits, combat_logits, target_logits, hidden_out
+```
+
+The web tool should stay aligned with the Python/C++ model constants:
+
+```text
+OBS_SIZE = 249
+FRAME_STACK = 3
+INPUT_DIM = 747
+MOVEMENT_ACTIONS = 9
+COMBAT_ACTIONS = 8
+TARGET_ACTIONS = 5
+```
 
 ## Components
 
-### Reward D3 Chart
+### Reward Chart
 
-Real-time line chart showing cumulative (blue) or instant (green) reward. Hover for per-step breakdown. Look for: cumulative climbing without kills (farming), instant spikes without HP changes (phantom rewards).
+Shows instant or cumulative reward. Useful for spotting reward farming or reward spikes that do not correspond to meaningful combat progress.
 
 ### Action Probability Heatmap
 
-Softmax probabilities for all three action heads. Shows chosen action, masked actions, and total entropy. Look for: target head cycling without firing (exploit), movement stuck on hold (not engaging), high entropy (hasn't learned).
+Displays movement, combat and target-head probabilities. Useful for checking entropy, invalid-action masking and head collapse.
 
 ### Reward Budget Bar
 
-Live gauge comparing actual cumulative reward against win/death/timeout budgets. Shows trajectory prediction and farming warnings (reward exceeds win budget without kills).
+Compares actual cumulative reward against expected win/loss/timeout budgets. Useful for detecting episodes where shaping rewards outscore objectives.
 
-### Batch Episode Runner (Tools tab)
+### Batch Episode Runner
 
-Runs 10-100 episodes headlessly, shows win rate, avg reward, avg kills, reward distribution histogram, and misalignment warnings (losses more rewarding than wins).
+Runs multiple headless episodes and reports aggregate win rate, reward, kills and warning flags.
 
-### Observation Inspector (Tools tab)
+### Observation Inspector
 
-Expandable accordion showing all 215 observation features grouped by category. Change highlighting (green = increased, red = decreased) with per-group change count badges. Look for: all-zero groups (missing features), jumping values without agent action (observation bugs).
+Displays the 249 observation features grouped by category, with change highlighting. Useful for finding all-zero groups, wrong offsets or unexpected jumps.
 
 ## Keeping In Sync
 
-| What | Web Tool | Python | C++ |
-|---|---|---|---|
-| Reward weights | `RW` in App.tsx | `RewardWeights` in reward.py | N/A |
-| Observation layout | `buildObservation()` | `_build_observation()` | `GatherObservation()` |
-| Action space | label constants | action enums | NeuralCombatTypes.h |
-| OBS_SIZE | `OBS_SIZE` constant | `OBS_SIZE` in combat_sim.py | `ObservationSize` in NeuralCombatTypes.h |
+When these change in Python or C++, update the web tool as well:
 
-When any value changes in Python or C++, update the web tool to match.
+- observation layout and `OBS_SIZE`
+- frame stack/input dimension
+- action labels and action counts
+- reward weights used for visualisation
+- weapon presets and projectile/arc rules
+- ONNX input/output names, especially `hidden_in` and `hidden_out`

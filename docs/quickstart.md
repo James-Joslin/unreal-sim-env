@@ -2,82 +2,126 @@
 
 ## Dependencies
 
-```
-numpy
-gymnasium
-torch
-tensorboard
-```
-
-Optional (for visualisation):
-```
-pygame          # --render human
-imageio[ffmpeg] # --render video
-Pillow          # fallback frame export
-onnx            # ONNX model consolidation
-onnxruntime     # ONNX verification
-```
-
-## Scripts
-
-### Visual Debugger
-
-Run the sim with random actions to verify the environment:
+Core:
 
 ```bash
+pip install numpy gymnasium torch tensorboard pandas matplotlib
+```
+
+Optional visualisation/export:
+
+```bash
+pip install pygame imageio[ffmpeg] Pillow onnx onnxruntime
+```
+
+Optional browser test tool:
+
+```bash
+npm install react react-dom d3 onnxruntime-web
+npm install -D @types/d3 typescript
+```
+
+## Primary Training CLI
+
+The current entry point is `training.main`.
+
+```bash
+# List registered training methods
+python -m training.main --list_methods
+
+# Train one PPO stage
+python -m training.main --method ppo --stage 3 --archetype ranged --tier large
+
+# Full curriculum
+python -m training.main --method ppo --curriculum
+
+# Curriculum followed by distillation/export
+python -m training.main --method ppo --curriculum --distill
+
+# Continue/warm-start from a checkpoint
+python -m training.main --method ppo --stage 5 \
+    --bc_checkpoint checkpoints/ppo_stage4_best.pt
+
+# Distill only from an existing teacher checkpoint
+python -m training.main --distill_only --teacher checkpoints/ppo_stage7_best.pt
+```
+
+## Distillation CLI
+
+```bash
+# Standard distillation
+python -m training.distillation \
+    --teacher checkpoints/ppo_stage7_best.pt \
+    --output_dir models/v1 \
+    --mode standard
+
+# Amplified best-of-N distillation
+python -m training.distillation \
+    --teacher checkpoints/ppo_stage7_best.pt \
+    --output_dir models/v1 \
+    --mode amplified \
+    --rollouts 16 \
+    --top_k 0.25 \
+    --iterations 1
+```
+
+Expected outputs:
+
+```text
+models/v1/Combat_Micro.onnx
+models/v1/Combat_Small.onnx
+models/v1/Combat_Medium.onnx
+models/v1/Combat_Large.onnx
+models/v1/Combat_Xl.onnx
+```
+
+## Visual Debugging
+
+```bash
+# Random/actions-only sim check
 python combat_sim.py --stage 3 --render human
 python combat_sim.py --stage 7 --weapon sniper --render human
 python combat_sim.py --stage 5 --render video --steps 800
+
+# View a checkpoint or ONNX model
+python view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
+python view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
+python view_sim.py --stage 3 --arena_size 4000 --render video
 ```
 
-| Flag | Options | Default |
-|---|---|---|
-| `--stage` | 1–7 | 3 |
-| `--archetype` | ranged, melee, tank, healer | ranged |
-| `--weapon` | scout, heavy, sniper, melee_bot, tank | per stage |
-| `--arena_size` | any float (UU) | per stage |
-| `--steps` | max steps | 500 |
-| `--render` | human, video | none |
+Useful `view_sim.py` flags:
 
-### PPO Training
+```text
+--stage            Curriculum stage, 1-7
+--archetype        ranged, melee, healer, tank
+--model            .pt checkpoint or .onnx model path
+--render           human, video, none
+--arena_size       Override arena size
+--weapon           scout, heavy, sniper, melee_bot, tank
+--fps              Video FPS
+--episodes         Number of episodes
+--deterministic    Use deterministic action choice where supported
+--output           Output video filename
+```
+
+## Policy/ONNX Checks
 
 ```bash
-python 03_ppo_train.py --bc_checkpoint checkpoints/bc_model.pt --stage 3
-python 03_ppo_train.py --stage 1
-python 03_ppo_train.py --curriculum
-python 03_ppo_train.py --stage 3 --num_envs 4
+# Export/test a blank tier model
+python combat_policy.py --tier large --frame_stack 3 --output_dir models/test
+
+# Extract/export from checkpoint
+python combat_policy.py \
+    --checkpoint checkpoints/ppo_stage7_best.pt \
+    --output_dir models/test
 ```
 
-Outputs: `checkpoints/ppo_stage{N}.pt`, `checkpoints/ppo_final.pt`, `runs/ppo_{timestamp}/` (TensorBoard).
-
-### Distillation & ONNX Export
+## TensorBoard
 
 ```bash
-python 02_distill_and_export.py \
-    --teacher checkpoints/ppo_stage7_best.pt \
-    --output_dir models/v1
-
-python 02_distill_and_export.py \
-    --teacher checkpoints/ppo_stage7_best.pt \
-    --eval_only
+tensorboard --logdir runs
 ```
 
-Outputs: `Combat_{Micro,Small,Medium,Large,Xl}.onnx`, `distillation_report.csv`.
+## Notes
 
-### Observation Validator
-
-```bash
-python obs_vector_validator.py --check-structure
-python obs_vector_validator.py --check-live --episodes 50
-python obs_vector_validator.py --dump-py --episodes 20 --output validation/py_obs.csv
-python obs_vector_validator.py --diff-csv \
-    --cpp_csv Saved/NeuralData/Default/Enemy_001.csv \
-    --py_csv validation/py_obs.csv
-```
-
-### Policy Network Test
-
-```bash
-python combat_policy.py --tier large --frame_stack 3
-python combat_policy.py --checkpoint checkpoints/ppo_stage7_best.pt --output_dir models/test
-```
+Older commands such as `03_ppo_train.py` and `02_distill_and_export.py` have been superseded by the modular `training.main` and `training.distillation` entry points.

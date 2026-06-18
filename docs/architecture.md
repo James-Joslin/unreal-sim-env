@@ -2,87 +2,116 @@
 
 ## Pipeline
 
-```
-C++ flat observation [747] → ONNX graph → 3 autoregressive action head logits
-```
-
-Everything from normalisation to action output is baked into the ONNX graph. C++ feeds raw flat observations; no preprocessing needed at runtime.
-
-## Stages
-
-**1. Delta Encoding** (no learnable params): Reshapes `[batch, 747]` → `[batch, 3, 249]`, then computes three channels: current frame, velocity (1st derivative), acceleration (2nd derivative). This gives temporal awareness without recurrence.
-
-**2. Structured Group Encoding** (shared across 3 channels): Splits each 249-float frame into four groups, encodes each with specialised sub-networks, then aggregates entity slots via cross-attention:
-
-| Group | Indices | Size | Encoder | Aggregation |
-|---|---|---|---|---|
-| Unique | [0:74] + [187:249] | 136 | Linear → GELU | — (single vector) |
-| Hostile slots | [74:142] | 4 × 17 | Shared Linear → GELU | 4-head cross-attention |
-| Ally slots | [142:187] | 3 × 15 | Shared Linear → GELU | 4-head cross-attention |
-| Threat slots | extracted from 203,227,230 | 3 × 3 | Shared Linear → GELU | 4-head cross-attention |
-
-Entity encoders use weight-sharing across slots. Cross-attention replaces max-pooling: the unique embedding queries each entity group, so the model learns "given my current state, which entity matters most?" A reloading enemy at close range gets high attention; a full-health enemy behind cover gets low. This is particularly important with the enriched entity slots (mana, commitment, class type) — the model needs to attend to the right entity's state, not the extremum across all slots.
-
-**3. Policy Backbone**: Concatenates 3 channel embeddings → MLP with LayerNorm → GELU → features.
-
-**4. Autoregressive Action Heads**: Actions are sampled sequentially — each head conditions on the previous:
-
-```
-features → move_head → m_logits → sample m
-features + embed(m) → combat_proj → GELU → combat_head → c_logits → sample c
-features + embed(m) + embed(c) → target_proj → GELU → target_head → t_logits
+```text
+Raw observation [747]
+  -> reshape [3, 249]
+  -> delta encoder: current / velocity / acceleration
+  -> structured encoder per channel
+  -> cross-attention over hostiles, allies and threats
+  -> MLP backbone
+  -> GRU memory
+  -> autoregressive action heads
+  -> ONNX logits for movement, combat and target selection
 ```
 
-This lets the policy learn action correlations: "I chose to strafe left → I should fire at the target I'm facing" becomes a learnable conditional. Projection layers before combat/target heads keep head output shapes identical to the non-autoregressive model, so old checkpoints partially load.
+The C++ runtime feeds raw frame-stacked observations. Observation normalisation can be embedded directly inside the ONNX graph during export.
 
-Logits bounded by `tanh × 3.0`.
+## Observation Input
 
-Training uses Large tier. Distillation cascades Large → Medium → Small → Micro, and Large → XL.
+- Single frame: **249 floats**
+- Frame stack: **3 frames**
+- Policy input: **747 floats**
 
-## Tier Architecture
+The frame stack is oldest-first: `[t-2, t-1, t]`.
 
-| Tier | entity_dim | unique_dim | backbone | layers | Approx Params |
-|---|---|---|---|---|---|
-| Micro | 8 | 16 | 32 | 1 | ~12K |
-| Small | 12 | 24 | 48 | 1 | ~22K |
-| Medium | 16 | 32 | 64 | 2 | ~42K |
-| Large | 16 | 32 | 96 | 2 | ~56K |
-| XL | 24 | 48 | 128 | 3 | ~95K |
+## Delta Encoding
 
-All tiers use 4-head cross-attention and autoregressive heads. Inference remains sub-millisecond for all tiers on CPU.
+The policy computes three temporal channels:
 
-## ONNX Export
-
-```bash
-# Export a single tier:
-python combat_policy.py --tier large --output_dir models/v1
-
-# Distill all 5 tiers from a checkpoint:
-python -m training.distillation --teacher checkpoints/ppo_stage7_best.pt
-
-# Amplified distillation (AlphaGo-style best-of-N):
-python -m training.distillation --teacher checkpoints/ppo_stage7_best.pt \
-    --mode amplified --rollouts 16 --top_k 0.25
+```text
+current      = frame[t]
+velocity     = frame[t] - frame[t-1]
+acceleration = frame[t] - 2 * frame[t-1] + frame[t-2]
 ```
 
-The export bakes observation normalisation (running mean/std from training) into the graph via `NormalizedPolicyWrapper`. The model accepts raw observations and outputs logits — no pre/post processing needed in C++.
+This gives temporal awareness without requiring the observation builder itself to emit explicit derivatives for every field.
 
-Input: `observation` [batch, 747]. Outputs: `movement_logits` [batch, 9], `combat_logits` [batch, 8], `target_logits` [batch, 5].
+## Structured Encoder
 
-The autoregressive conditioning (argmax → embedding lookup → projection) runs inside the ONNX graph. C++ applies action masks to the output logits and takes argmax — the internal conditioning uses unmasked argmax, which is correct >95% of the time.
+Each 249-float frame is split into:
+
+- **Unique features** — `[0:74] + [187:249]`, 136 floats
+- **Hostile slots** — 4 × 17 floats
+- **Ally slots** — 3 × 15 floats
+- **Threat slots** — 3 × 3 floats extracted from projectile threat fields
+
+Hostile, ally and threat slots use shared encoders followed by cross-attention. The unique feature embedding acts as the query, so the policy can learn which entity matters in the current tactical context.
+
+## GRU Memory
+
+Both the PPO actor and exported policy include a GRU on the actor path. This gives the agent encounter-level memory beyond the 3-frame input window.
+
+The critic path in PPO does not use the GRU. It estimates value from the current encoded observation, simplifying hidden-state management during PPO updates.
+
+## Autoregressive Action Heads
+
+Action logits are produced sequentially:
+
+```text
+features -> movement logits -> movement action
+features + movement embedding -> combat logits -> combat action
+features + movement embedding + combat embedding -> target logits
+```
+
+This lets the model learn correlated decisions, such as pairing a strafe direction with a firing action and a matching target.
+
+## Tier Configurations
+
+| Tier | Entity Dim | Unique Dim | Backbone Hidden | Backbone Layers | Attention Heads | GRU Hidden |
+|---|---:|---:|---:|---:|---:|---:|
+| Micro | 8 | 16 | 32 | 1 | 2 | 32 |
+| Small | 12 | 24 | 48 | 1 | 2 | 48 |
+| Medium | 16 | 32 | 48 | 2 | 4 | 48 |
+| Large | 16 | 32 | 64 | 2 | 4 | 64 |
+| XL | 16 | 32 | 64 | 3 | 4 | 64 |
 
 ## PPO Actor-Critic
 
-During training, `ActorCritic` (in `training/methods/ppo/actor_critic.py`) uses two separate encoder+backbone streams — one for the actor (policy) and one for the critic (value). Both use the same `StructuredEncoder` with 4-head cross-attention. At export, the critic is stripped and only the actor weights are saved as a `CombatPolicy`.
+`training/methods/ppo/actor_critic.py` defines the PPO model:
 
-Key mapping: `actor_encoder.*` → `encoder.*`, `actor_backbone.*` → `backbone.*`. Critic keys (`critic_encoder`, `critic_backbone`, `value_head`) are dropped.
+- separate actor and critic encoders/backbones
+- actor GRU memory
+- autoregressive action heads
+- value head
+- auxiliary target-movement prediction head
+
+During ONNX export, the critic-specific weights are dropped and only the policy path is retained.
+
+## ONNX Export
+
+Exports produce four outputs:
+
+```text
+movement_logits  [batch, 9]
+combat_logits    [batch, 8]
+target_logits    [batch, 5]
+hidden_out       [1, batch, gru_hidden]
+```
+
+Inputs are:
+
+```text
+observation      [batch, 747]
+hidden_in        [1, batch, gru_hidden]
+```
+
+The exported graph can include observation normalisation, delta encoding, structured encoding, GRU memory and policy heads.
 
 ## Distillation
 
-Two modes available:
+Two modes are supported:
 
-**Standard** — teacher rollouts → student matches teacher logits via temperature-scaled KL divergence + hard label cross-entropy. Cascaded: Large → Medium → Small → Micro.
+- **Standard** — teacher rollouts produce observations and logits; students match teacher logits with KL + hard-label losses.
+- **Amplified** — multiple rollouts are run per scenario, the best trajectories are retained, and the policy is trained on reward-weighted winning actions.
 
-**Amplified** (AlphaGo-style) — runs N rollouts per scenario with stochastic sampling, keeps the top K% by episode reward, and trains the policy to reproduce the winning actions weighted by return. Multiple iterations ratchet quality upward: better policy → better rollouts → better training targets.
-
-Both modes produce all 5 ONNX tiers with inference benchmarks and in-sim win rate evaluation.
+The default distillation chain generates Micro, Small, Medium, Large and XL deployment tiers.
