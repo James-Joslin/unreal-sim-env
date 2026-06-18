@@ -125,13 +125,13 @@ See [`UPDATED_curriculum.md`](UPDATED_curriculum.md) for per-stage details.
 
 ## Documentation
 
-- [`UPDATED_quickstart.md`](UPDATED_quickstart.md) — setup, commands and scripts
-- [`UPDATED_architecture.md`](UPDATED_architecture.md) — policy network, PPO model and ONNX export
-- [`UPDATED_observations.md`](UPDATED_observations.md) — 249-float observation layout
-- [`UPDATED_curriculum.md`](UPDATED_curriculum.md) — stage design and progression
-- [`UPDATED_rewards.md`](UPDATED_rewards.md) — reward philosophy and component activation
-- [`UPDATED_weapons.md`](UPDATED_weapons.md) — weapon presets and arc-fire mechanics
-- [`UPDATED_web-tool.md`](UPDATED_web-tool.md) — browser debugging/testing tool
+- [`UPDATED_quickstart.md`](quickstart.md) — setup, commands and scripts
+- [`UPDATED_architecture.md`](architecture.md) — policy network, PPO model and ONNX export
+- [`UPDATED_observations.md`](observations.md) — 249-float observation layout
+- [`UPDATED_curriculum.md`](curriculum.md) — stage design and progression
+- [`UPDATED_rewards.md`](rewards.md) — reward philosophy and component activation
+- [`UPDATED_weapons.md`](weapons.md) — weapon presets and arc-fire mechanics
+- [`UPDATED_web-tool.md`](web-tool.md) — browser debugging/testing tool
 
 ## Generated Outputs
 
