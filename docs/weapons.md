@@ -1,32 +1,69 @@
-# Weapons & Loadouts
+# Weapons and Loadouts
 
-Five weapon presets are available. Stages 1-4 use a fixed preset. Stages 5-7 randomise from a pool each episode.
+Stages 1-4 use fixed weapon presets. Stages 5-7 randomise from a weapon pool each episode.
 
 ## Presets
 
 | Preset | Primary | Secondary | Melee |
 |---|---|---|---|
-| `melee_bot` | Sidearm (8 dmg, 800 range, 10 ammo, 0.4s CD, proj 3000) | — | 35 dmg, 200 range, 0.6s CD |
-| `scout` | Laser (8 dmg, 1200 range, 20 ammo, 0.2s CD, proj 4500) | — | 15 dmg, 150 range, 0.8s CD |
-| `heavy` | Cannon (35 dmg, 2000 range, 6 ammo, 1.0s CD, 0.5s wind-up, proj 2000) | Missiles (25 dmg, 1800 range, 4 ammo, 1.5s CD, arc 400 UU, proj 1200) | 40 dmg, 250 range, 1.5s CD |
-| `sniper` | Railgun (80 dmg, 3000 range, 1 ammo, 2.0s CD, 1.0s wind-up, proj 6000) | Sidearm (10 dmg, 1000 range, 12 ammo, 0.3s CD, proj 3500) | 10 dmg, 150 range, 1.0s CD |
-| `tank` | Gatling (5 dmg, 1500 range, 100 ammo, 0.08s CD, proj 4000) | — | 30 dmg, 250 range, 1.2s CD |
+| `melee_bot` | Sidearm: 8 damage, 800 range, 10 ammo, 0.4s cooldown, 3000 projectile speed | — | 35 damage, 200 range, 0.6s cooldown |
+| `scout` | Laser: 8 damage, 1200 range, 20 ammo, 0.2s cooldown, 4500 projectile speed | — | 15 damage, 150 range, 0.8s cooldown |
+| `heavy` | Cannon: 35 damage, 2000 range, 6 ammo, 1.0s cooldown, 0.5s wind-up, 2000 projectile speed | Missiles: 25 damage, 1800 range, 4 ammo, 1.5s cooldown, arc 400 UU, 1200 projectile speed | 40 damage, 250 range, 1.5s cooldown |
+| `sniper` | Railgun: 80 damage, 3000 range, 1 ammo, 2.0s cooldown, 1.0s wind-up, 6000 projectile speed | Sidearm: 10 damage, 1000 range, 12 ammo, 0.3s cooldown, 3500 projectile speed | 10 damage, 150 range, 1.0s cooldown |
+| `tank` | Gatling: 5 damage, 1500 range, 100 ammo, 0.08s cooldown, 4000 projectile speed | — | 30 damage, 250 range, 1.2s cooldown |
 
-All ranged weapons fire projectiles (not hitscan). Faster projectile speed means harder to dodge but still possible at range.
+All ranged weapons fire projectiles rather than hitscan shots. Faster projectile speeds are harder to dodge, but still dodgeable at sufficient range.
 
 ## Arc Mechanics
 
-Arc weapons (e.g. Heavy missiles) can lob projectiles over cover. Whether a weapon can clear a specific obstacle depends on two values:
+Arc weapons can fire over cover if the weapon clearance is sufficient for the obstacle height.
 
-- **MaxArcableObstacleHeight** (on `FEnemyWeaponSlot`) — the tallest obstacle this weapon can clear. Exposed in the observation vector at [211-214] as `height / 3000`.
-- **Cover Height** (per direction, [166-173]) — the actual height of the obstacle in each of 8 compass directions, normalised by 500 UU.
+Important observation fields:
 
-The model compares these to decide: "cover northeast is 200 UU, my missiles clear up to 400 UU → missiles can fire over it."
+```text
+Cover height per direction:       [195..202]
+Arc clearance per weapon slot:    [240..243]
+Can-hit-target per weapon slot:   [234..237]
+```
 
-The C++ projectile's `ArcHeight` property controls the actual trajectory apex. `MaxArcableObstacleHeight` is the designer-set tactical constraint derived from it.
+The model can learn decisions such as:
+
+```text
+cover northeast is 200 UU
+missiles clear up to 400 UU
+therefore missiles can fire over it
+```
 
 ## Weapon State in Observations
 
-The active weapon occupies 10 floats at [21-30]: slot index, ammo fraction, can-fire, reloading, reload progress, range, cooldown, wind-up, can-arc, is-ranged. Three other weapon slots get 4 floats each at [31-42]: ammo, range, reloading, can-arc.
+Active weapon state occupies `[21..30]`:
 
-Additional per-weapon observations at the end of the vector: Can Hit Target [205-208] (bool per slot — has ammo, in range, has path, not reloading) and Arc Clearance [211-214].
+```text
+active slot index
+ammo fraction
+can fire
+is reloading
+reload progress
+range
+cooldown
+wind-up
+can arc
+is ranged
+```
+
+Other weapon slots occupy `[31..42]`, with four floats each:
+
+```text
+ammo fraction
+range
+is reloading
+can arc
+```
+
+Additional weapon capability fields appear near the end of the vector:
+
+```text
+[234..237] can hit target per weapon slot
+[238]      total ammo fraction
+[240..243] arc clearance per weapon slot
+```

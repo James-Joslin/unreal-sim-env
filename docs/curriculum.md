@@ -1,171 +1,68 @@
 # Curriculum Stages
 
-Each stage builds on the previous. The best checkpoint from stage N starts stage N+1. All environments randomise arena size (±20%), obstacle count (±50%), obstacle shapes, target stats (±20%), and target behaviours per episode. See [rewards.md](rewards.md) for full reward component values.
+Training uses seven progressive stages. The best checkpoint from stage N is used to initialise stage N+1.
 
----
+All stages include per-episode randomisation such as arena size, obstacle layout, target stats, target roles, spawn positions and target behaviours.
 
-## Stage 1 — Melee Basics
+## Stage Overview
 
-**Learns:** Close distance, melee attack.
+| Stage | Focus | Summary |
+|---:|---|---|
+| 1 | Melee basics | Close distance and melee a passive target. |
+| 2 | Ranged fire/reload | Learn range positioning, firing and reload cycles. |
+| 3 | Moving targets/cover/flanking | Track moving targets, use cover, kite, flank and avoid degenerate behaviour. |
+| 4 | Multi-weapon management | Switch weapons, manage ammo and use arc fire over cover. |
+| 5 | Archetype behaviours/allies | Learn role-specific behaviour with one allied robot. |
+| 6 | Multi-target coordination | Learn focus fire, target prioritisation and ally protection. |
+| 7 | Full squad combat | Fight a full mixed party using all learned behaviours. |
 
-| Parameter | Value |
-|---|---|
-| Arena | 1500 UU |
-| Obstacles | 0 |
-| Agent weapon | `melee_bot` |
-| Agent HP / Def | 100 / 20 |
-| Max steps | 500 (100s) |
-| Targets | 1 × passive, 100 HP / 10 Def |
-| Training budget | 200K |
+## Training Budgets
 
-**Success:** Agent walks to target and melees it to death. Learns "close distance → attack → reward."
+Current PPO stage configs use these default timestep budgets:
 
-**Rewards activated:** Damage, kill, death, win/loss, optimal range, inactivity, invalid action.
+| Stage | Timesteps | Eval Episodes | Rollout Steps | Notes |
+|---:|---:|---:|---:|---|
+| 1 | 50,000 | 30 | 256 | Fast basic behaviour acquisition. |
+| 2 | 100,000 | 30 | 256 | Fire/reload loop. |
+| 3 | 1,500,000 | 50 | 512 | Moving targets and shaping-heavy learning. |
+| 4 | 6,000,000 | 80 | 512 | Weapon switching and arc/direct decisions. |
+| 5 | 20,000,000 | 100 | 1024 | Archetype behaviour and ally awareness. |
+| 6 | 20,000,000 | 120 | 2048 | Coordination and multi-target variance. |
+| 7 | 30,000,000 | 150 | 2048 | Full squad combat. |
 
----
+## Per-Stage PPO Strategy
 
-## Stage 2 — Ranged Fire & Reload
+- Early stages use higher entropy and larger policy updates to encourage exploration.
+- Later stages reduce entropy pressure and tighten update constraints to preserve coordination strategies.
+- Later stages use larger rollouts and more evaluation episodes because multi-target outcomes have higher variance.
+- Catastrophic regression reversion is enabled to protect good checkpoints when a policy update destabilises behaviour.
 
-**Learns:** Shoot, manage ammo, reload, range positioning.
+## Stage Details
 
-| Parameter | Value |
-|---|---|
-| Arena | 2000 UU |
-| Obstacles | 0 |
-| Agent weapon | `scout` |
-| Agent HP / Def | 100 / 20 |
-| Max steps | 500 |
-| Targets | 1 × passive, 150 HP / 15 Def |
-| Training budget | 300K |
+### Stage 1 — Melee Basics
 
-**Success:** Agent positions in laser range, fires 20 shots, reloads, fires again. Learns the fire→reload cycle.
+Learns the basic loop: approach target, enter melee range, attack, receive reward.
 
-**New rewards:** Ammo management (reload cover, wasted shot, fire hit).
+### Stage 2 — Ranged Fire and Reload
 
----
+Introduces ranged weapon use, ammo, reload timing and optimal range positioning.
 
-## Stage 3 — Moving Targets, Cover, Flanking
+### Stage 3 — Moving Targets, Cover and Flanking
 
-**Learns:** Track moving targets, use cover, kite melee, flank, fire while moving.
+Adds moving targets, obstacles, cover, flanking, aggression shaping and anti-degenerate penalties. Survival becomes costly, pushing the agent to end fights rather than farm shaping rewards.
 
-| Parameter | Value |
-|---|---|
-| Arena | ~2500 UU (±20%) |
-| Obstacles | ~3 (±50%) |
-| Agent weapon | `scout` |
-| Agent HP / Def | 120 / 20 |
-| Max steps | 1000 (200s) |
-| Targets | 1-2, 60% ranged / 40% melee, 300 UU/s, 50 HP / 20 Def |
-| Training budget | 500K |
+### Stage 4 — Multi-Weapon Management
 
-Target HP is intentionally low (50) — the learning objective is tracking and positioning, not sustained DPS.
+Adds weapon switching and arc-vs-direct fire decisions. The agent must choose between loaded weapons, reloads, range bands and arcing over cover.
 
-**Target attacks:** Ranged 15-22 dmg, 1000-1500 range, projectiles 2500-4500 UU/s. Melee 28-40 dmg, charges at 520-600 UU/s. Facing gated (~140° front arc).
+### Stage 5 — Archetype Behaviours and Allies
 
-**New rewards:** Anti-degenerate, flanking, aggression (passive-in-range), movement (strafe/mobile fire), multi-target progression. Alive per step goes negative (-0.02).
+Introduces role-specific shaping and allied robots. The agent observes allies but does not directly control them.
 
-**DPS math:** Agent deals ~54 max DPS, kills a 50 HP target in ~0.9s. Agent survives ~16s per ranged target. 200s budget is generous — penalties push for speed.
+### Stage 6 — Multi-Target Coordination
 
----
+Focuses on target prioritisation, ally protection, focus fire and fighting while outnumbered.
 
-## Stage 4 — Multi-Weapon Management
+### Stage 7 — Full Squad Combat
 
-**Learns:** Weapon switching, ammo management across 2+ weapons, arc fire over cover.
-
-Bridging stage — same target difficulty as stage 3 but with the full heavy weapon kit. Dense obstacles (8) force frequent arc vs direct decisions.
-
-| Parameter | Value |
-|---|---|
-| Arena | ~3000 UU |
-| Obstacles | ~8 |
-| Agent weapon | `heavy` (cannon + missiles + melee) |
-| Agent HP / Def | 100 / 20 |
-| Max steps | 500 (100s) |
-| Targets | 1-2, 60% ranged / 40% melee, 400 UU/s, 75 HP / 20 Def |
-| Training budget | 500K |
-
-**New rewards:** Weapon selection (optimal band, swap quality), arc vs direct fire (arc bonus when LOS blocked, direct preference with LOS).
-
-**Key decision:** Target at 2000 UU, cannon empty, missiles loaded — reload cannon (3s delay, optimal if target stays far), switch to missiles (0.3s delay, immediate), or close for melee?
-
----
-
-## Stage 5 — Archetype Behaviours & Allies
-
-**Learns:** Role-appropriate combat with an allied robot.
-
-First stage with allies and weapon pool randomisation. The ally fights independently — the agent observes its position, health, target, and archetype but doesn't control it.
-
-| Parameter | Value |
-|---|---|
-| Arena | ~3000 UU |
-| Obstacles | ~8 |
-| Agent weapon | Pool: `heavy`, `scout`, `sniper`, `tank` |
-| Agent HP / Def | 200 / 25 |
-| Max steps | 600 (120s) |
-| Allies | 1 |
-| Targets | 1-3, mixed roles/behaviours, 400 UU/s, 100 HP / 25 Def |
-| Training budget | 500K |
-
-**Ally observations:** 12 floats per slot [122-157] — position, distance, HP, ammo, in-combat, dodging, archetype (scalar), velocity, target hostile index.
-
-**New rewards:** Archetype-specific shaping (ranged kiting, melee gap-close, tank body-block, healer support).
-
-**Success:** Agent adapts to its random weapon loadout. Sniper kit → maintain distance, railgun. Tank kit → close range, gatling. Ally handles one target while agent handles others.
-
----
-
-## Stage 6 — Multi-Target Coordination
-
-**Learns:** Target prioritisation, focus fire, ally awareness when outnumbered.
-
-| Parameter | Value |
-|---|---|
-| Arena | ~3000 UU |
-| Obstacles | ~12 |
-| Agent weapon | Pool: `heavy`, `scout`, `sniper`, `tank` |
-| Agent HP / Def | 180 / 30 |
-| Max steps | 700 (140s) |
-| Allies | 1 |
-| Targets | 1-3, mixed, 450 UU/s, 150 HP / 25 Def |
-| Training budget | 1,000K |
-
-**New rewards:** Group coordination (target diversity), ally protection (protect low-HP ally, fire at ally's threat, ally death penalty).
-
-**Survival math:** Under max pressure (3 targets, ~27 effective DPS), agent survives ~6.7s. Using cover to fight 1v1: survives 20s, kills in 5s. Ally draws one target's aggro.
-
----
-
-## Stage 7 — Full Squad Combat
-
-**Learns:** Fight a full 4-player party using everything from stages 1-6.
-
-| Parameter | Value |
-|---|---|
-| Arena | ~4000 UU |
-| Obstacles | ~16 |
-| Agent weapon | Pool: `heavy`, `scout`, `sniper`, `tank` |
-| Agent HP / Def | 500 / 35 (boss-tier) |
-| Max steps | 800 (160s) |
-| Allies | 1 |
-| Targets | 1-4, mixed, 500 UU/s (full speed), 150 HP / 25 Def |
-| Training budget | 2,000K |
-
-**Success:** Agent isolates targets using terrain, focuses one down while using cover against others, repositions, coordinates with ally. Can't face-tank 4 attackers — must use all learned skills.
-
----
-
-## Per-Episode Randomisation (All Stages)
-
-| Element | Variation |
-|---|---|
-| Arena size | ±20% |
-| Obstacle count | ±50% |
-| Obstacle types | pillar, wall, L-shape, cover, building |
-| Target count | 1 to stage max |
-| Target roles | melee / ranged / mixed per stage distribution |
-| Target behaviours | aggressive, kiting, cover_user, passive |
-| Target stats | HP, defence, damage, range, cooldown ±20% |
-| Target projectile speed | ranged 2500-4500, melee 2000-3000, mixed 1500-2000 UU/s |
-| Spawn positions | random within arena |
-| Weapon preset | fixed stages 1-4, random pool stages 5-7 |
+Final deployment-like stage. The agent fights mixed groups with multiple targets, weapons, cover, allies and player-pattern observations.

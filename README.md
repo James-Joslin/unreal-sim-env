@@ -1,116 +1,156 @@
 # Neural Combat AI
 
-Reinforcement learning agent for Unreal Engine combat encounters. Trained in a Python simulation via curriculum learning, distilled to ONNX, and deployed in C++ at runtime.
+Reinforcement-learning combat AI for Unreal Engine encounters. The agent is trained in a fast Python/Gymnasium simulation, evaluated through deterministic seeded scenarios, distilled into multiple ONNX deployment tiers, and then consumed by the UE/C++ runtime.
+
+The current pipeline is centred around the modular `training.main` CLI and a PPO implementation backed by shared training infrastructure.
+
+## What This Project Contains
+
+- **Python combat simulator** — lightweight 2D approximation of UE combat, including movement, obstacles, LOS, projectiles, weapons, cooldowns, reloads and reward computation.
+- **Extended simulation systems** — allies, status effects, target acceleration, threat scoring, projectile tracking, sight cones and group summaries.
+- **Structured policy network** — 249-float observations, 3-frame stacking, delta encoding, entity-slot encoders, cross-attention, GRU memory and autoregressive action heads.
+- **PPO training pipeline** — vectorised rollouts, GAE, action masks, observation/return normalisation, curriculum-aware hyperparameters, deterministic evaluation and checkpointing.
+- **Distillation + ONNX export** — standard logit matching or amplified best-of-N distillation into Micro, Small, Medium, Large and XL tiers.
+- **Browser testing tool** — optional web-based debugging for ONNX inference, observation inspection and reward/action visualisation.
 
 ## Quick Start
 
 ```bash
-# Train a single stage with PPO:
+# Train a single curriculum stage with PPO
 python -m training.main --method ppo --stage 3 --tier large
 
-# Full 7-stage curriculum:
+# Run the full 7-stage curriculum
 python -m training.main --method ppo --curriculum
 
-# Train then distill + export all ONNX tiers:
+# Train through curriculum, then distill/export ONNX tiers
 python -m training.main --method ppo --curriculum --distill
 
-# Distill from an existing checkpoint (standard):
+# Distill from an existing PPO checkpoint
 python -m training.main --distill_only --teacher checkpoints/ppo_stage7_best.pt
 
-# Distill with AlphaGo-style amplification:
+# Amplified distillation directly from the distillation module
 python -m training.distillation --teacher checkpoints/ppo_stage7_best.pt \
     --mode amplified --rollouts 16 --top_k 0.25
 
-# Warm-start from a previous checkpoint:
-python -m training.main --method ppo --stage 5 \
-    --bc_checkpoint checkpoints/ppo_stage4_best.pt
-
-# Test the simulation directly:
-cd simulation && python combat_sim.py --stage 3 --render human
+# Visualise a trained checkpoint or ONNX model
+python view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
+python view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
 ```
 
-See [docs/quickstart.md](docs/quickstart.md) for full setup, dependencies, and CLI reference.
+See [`UPDATED_quickstart.md`](UPDATED_quickstart.md) for dependencies, CLI notes and common commands.
 
-## How It Works
+## Observation and Action Model
 
-The agent observes **249 normalised floats** every 0.2s (frame-stacked x3 = 747 input), and outputs actions across three autoregressive heads: movement (9), combat (8, including dodge), and target selection (5). Training progresses through 7 curriculum stages, from hitting a stationary target to fighting a full 4-player party with allies, cover, and multiple weapon loadouts.
+The runtime observation is **249 normalised floats per frame**. The policy receives a **3-frame stack**, giving a flat **747-float input**.
 
-The structured encoder uses **4-head cross-attention** over entity slots (hostiles, allies, threats) instead of max-pooling, letting the model focus on the most tactically relevant entity given its current state. **Autoregressive action heads** condition each decision on the previous: the combat action sees which movement was chosen, and target selection sees both.
+The policy outputs three autoregressive action heads:
 
-Player characters are spell-casters (Mage, Healer, Ranger) or melee fighters (Knight, Rogue) with mana pools, cast animations, and gap-closer abilities. The AI observes character type, mana fraction, commitment state, and gap-closer threat per target, enabling class-specific tactics: kiting melee characters, punishing casters mid-cast, pressuring low-mana targets.
+- **Movement** — 9 actions: hold + 8 compass directions
+- **Combat** — 8 actions: none, fire, reload, switch weapon 0/1, melee, block, dodge
+- **Target** — 5 actions: primary target + 4 hostile slots
 
-The Python simulation mirrors the C++ UE5 environment field-for-field. After training, the policy is distilled into 5 size tiers (12K-95K params) and exported to ONNX for sub-millisecond inference.
+Action selection is autoregressive: movement is chosen first, combat conditions on movement, and target selection conditions on movement + combat.
 
-## Training Methods
+## Architecture Summary
 
-The training system is modular. Each RL algorithm is a self-contained method that plugs into shared infrastructure (environments, evaluation, curriculum progression, checkpointing, ONNX export).
+```text
+747 flat observation
+  -> reshape to 3 x 249 frames
+  -> delta encoding: current, velocity, acceleration
+  -> structured encoding per channel
+       - unique features
+       - hostile entity slots
+       - ally entity slots
+       - projectile threat slots
+  -> cross-attention over entity groups
+  -> MLP backbone
+  -> GRU memory
+  -> autoregressive movement/combat/target heads
+```
 
-| Method | Status | Description |
-|---|---|---|
-| `ppo` | Complete | Proximal Policy Optimization with GAE, KL early stopping, entropy annealing |
-| `sac` | Skeleton | Discrete Soft Actor-Critic with twin Q-networks, auto-tuned entropy |
+Observation normalisation can be baked into the exported ONNX graph, so the C++ runtime can feed raw flat observations directly.
 
-Adding a new method requires one file: subclass `BaseTrainer`, implement `build_model()`, `train()`, and `extract_policy()`, then register it. Every method produces a `CombatPolicy` that exports to ONNX with identical architecture.
+## Training Pipeline
+
+The training package is modular:
+
+```text
+training/main.py                 Unified CLI for training, curriculum and distillation
+training/base_trainer.py         Shared trainer infrastructure
+training/evaluation.py           Deterministic seeded evaluation
+training/normalizers.py          Observation and return normalisation
+training/distillation.py         Standard and amplified distillation
+training/methods/ppo/config.py   Per-stage PPO hyperparameters
+training/methods/ppo/trainer.py  PPO-specific training loop
+training/methods/ppo/buffer.py   Vectorised PPO rollout buffer with GAE
+training/methods/ppo/actor_critic.py
+                                PPO actor-critic with GRU + autoregressive heads
+```
+
+PPO currently supports:
+
+- clipped surrogate objective
+- Generalized Advantage Estimation
+- KL early stopping
+- entropy annealing
+- per-head entropy weighting
+- value-function clipping
+- auxiliary target-movement prediction
+- catastrophic regression reversion
+- curriculum-aware stage configs
+
+## Curriculum
+
+Training progresses through seven stages:
+
+1. **Melee basics** — close distance and attack
+2. **Ranged fire/reload** — weapon range, shooting and reload cycle
+3. **Moving targets/cover/flanking** — tracking, kiting and anti-degenerate behaviour
+4. **Multi-weapon management** — switching, ammo management and arc fire
+5. **Archetype behaviours/allies** — role-specific behaviour and ally awareness
+6. **Multi-target coordination** — focus fire, target priority and ally protection
+7. **Full squad combat** — full 4-player party combat using all learned behaviours
+
+See [`UPDATED_curriculum.md`](UPDATED_curriculum.md) for per-stage details.
+
+## ONNX Deployment Tiers
+
+| Tier | Entity Dim | Unique Dim | Backbone | Layers | Attention Heads | GRU Hidden | Typical Use |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Micro | 8 | 16 | 32 | 1 | 2 | 32 | Ultra-low latency |
+| Small | 12 | 24 | 48 | 1 | 2 | 48 | Lightweight runtime |
+| Medium | 16 | 32 | 48 | 2 | 4 | 48 | Mid-tier deployment |
+| Large | 16 | 32 | 64 | 2 | 4 | 64 | Main training/deployment tier |
+| XL | 16 | 32 | 64 | 3 | 4 | 64 | Highest-capacity tier |
 
 ## Documentation
 
-| Document | What it covers |
-|---|---|
-| [Quickstart](docs/quickstart.md) | Dependencies, CLI reference, all runnable scripts |
-| [Curriculum](docs/curriculum.md) | Stages 1-7: environments, targets, progression, DPS math |
-| [Observations](docs/observations.md) | 249-float vector layout, encoding details, C++/Python parity |
-| [Rewards](docs/rewards.md) | All reward components, activation table, design philosophy |
-| [Weapons & Loadouts](docs/weapons.md) | 5 weapon presets, stats, arc mechanics |
-| [Architecture](docs/architecture.md) | Policy network, delta encoding, cross-attention, autoregressive heads, tiers, ONNX export |
-| [Web Testing Tool](docs/web-tool.md) | Browser-based debugging, batch evaluation, observation inspector |
+- [`UPDATED_quickstart.md`](UPDATED_quickstart.md) — setup, commands and scripts
+- [`UPDATED_architecture.md`](UPDATED_architecture.md) — policy network, PPO model and ONNX export
+- [`UPDATED_observations.md`](UPDATED_observations.md) — 249-float observation layout
+- [`UPDATED_curriculum.md`](UPDATED_curriculum.md) — stage design and progression
+- [`UPDATED_rewards.md`](UPDATED_rewards.md) — reward philosophy and component activation
+- [`UPDATED_weapons.md`](UPDATED_weapons.md) — weapon presets and arc-fire mechanics
+- [`UPDATED_web-tool.md`](UPDATED_web-tool.md) — browser debugging/testing tool
+
+## Generated Outputs
+
+Runtime and training outputs are normally excluded from git:
+
+```text
+checkpoints/       PPO checkpoints
+models/            ONNX exports and distillation reports
+runs/              TensorBoard logs
+sim_replay.mp4     Optional visualisation output
+```
 
 ## Glossary
 
-| Term | Meaning |
-|---|---|
-| **UU** | Unreal Units. 1 UU = 1 cm. |
-| **Decision tick** | 0.2s interval at which the agent observes and acts. 5 Hz standard, 10 Hz for bosses. |
-| **Frame stack** | 3 consecutive observation frames concatenated (249 x 3 = 747 floats). |
-| **Delta encoding** | Reshapes frame stack into current/velocity/acceleration channels. Baked into ONNX. |
-| **Cross-attention** | 4-head attention from unique features (query) to entity slots (key/value). Replaces max-pooling. |
-| **Autoregressive heads** | P(movement) x P(combat|movement) x P(target|movement, combat). |
-| **Entity encoder** | Shared-weight sub-network for variable-count entity slots. |
-| **Unique features** | 136 observation floats that are not entity slots. |
-| **Hostile slot** | 17 floats per target: position, HP, LOS, class, mana, commitment, gap-closer. |
-| **Ally slot** | 15 floats per ally: position, HP, velocity, target index, combat action, flanking angle. |
-| **Player patterns** | 5 EMAs: aggression, evasion, predictability, range, mana burn. |
-| **Cover height** | Obstacle height per direction [195-202], paired with arc clearance [240-243]. |
-| **Curriculum stage** | One of 7 progressive training phases. |
-| **Distillation** | Standard (logit matching) or amplified (best-of-N, AlphaGo-style). |
-| **ONNX tier** | Micro (~12K), Small (~22K), Medium (~42K), Large (~56K), XL (~95K). |
-
-## Project Structure
-
-```
-simulation/                          Python training environment
-  combat_sim.py                        Core sim (Gymnasium), mirrors UE5
-  combat_extensions.py                 Extended env: allies, debuffs, projectile tracking
-  combat_policy.py                     Structured policy + ONNX export
-  reward.py                            Reward function and per-stage weights
-  frame_stack.py                       Frame stacking and vectorised env wrappers
-  view_sim.py                          Visual debugger / replay viewer
-
-training/                            Modular RL training package
-  main.py                              Unified CLI (train, curriculum, distill)
-  base_trainer.py                      Abstract base: env setup, eval, curriculum, checkpoints
-  normalizers.py                       Observation + return normalisers
-  evaluation.py                        Deterministic seeded evaluation
-  distillation.py                      Standard + amplified distillation pipeline
-  methods/
-    ppo/
-      config.py                          Hyperparameters
-      actor_critic.py                    ActorCritic (autoregressive, cross-attention)
-      buffer.py                          Vectorised rollout buffer with GAE
-      trainer.py                         PPOTrainer
-    sac/
-      config.py, networks.py, buffer.py, trainer.py
-
-docs/                                Design documentation
-checkpoints/                         Training checkpoints (gitignored)
-runs/                                TensorBoard logs (gitignored)
-```
+- **UU** — Unreal Units. 1 UU = 1 cm.
+- **Decision tick** — simulation decision interval, commonly 0.2s / 5 Hz.
+- **Frame stack** — 3 consecutive 249-float observations concatenated into 747 floats.
+- **Delta encoding** — current, velocity and acceleration channels computed from the frame stack.
+- **Cross-attention** — unique features query hostile, ally and threat entity slots.
+- **GRU memory** — recurrent policy state used to remember encounter context.
+- **Autoregressive heads** — action heads where later decisions condition on earlier ones.
+- **Distillation** — compression from a trained teacher into smaller ONNX deployment tiers.

@@ -1,70 +1,93 @@
 # Rewards
 
+The reward function is designed to prioritise objective completion while using small shaping rewards to accelerate learning.
+
+## Design Principles
+
+1. **Objective rewards dominate** — kills and wins should be worth far more than per-step shaping.
+2. **Shaping rewards stay small** — positioning and behaviour nudges should not be farmable.
+3. **Timeouts should be unattractive** — passive survival should not outscore winning.
+4. **Damage penalties should not prevent trading** — the agent must be willing to take reasonable damage to secure kills.
+5. **Curriculum controls complexity** — later-stage rewards activate only after the basics are learned.
+
 ## Activation by Stage
 
 | Reward Component | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-|---|---|---|---|---|---|---|---|
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | Damage / Kill / Death | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Episode Win/Loss/Timeout | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Optimal Range | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Damage Inactivity | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Invalid Action | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Ammo Management | | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Anti-Degenerate | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Flanking / Positioning | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Aggression (passive-in-range) | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Movement (mobile/strafe fire) | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Multi-Target Progression | | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Weapon Selection | | | | ✓ | ✓ | ✓ | ✓ |
-| Arc vs Direct Fire | | | | ✓ | ✓ | ✓ | ✓ |
-| Archetype-Specific | | | | | ✓ | ✓ | ✓ |
-| Ally Coordination | | | | | | ✓ | ✓ |
+| Ammo Management |  | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Anti-Degenerate |  |  | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Flanking / Positioning |  |  | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Aggression |  |  | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Movement / Strafe Fire |  |  | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Multi-Target Progression |  |  | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Weapon Selection |  |  |  | ✓ | ✓ | ✓ | ✓ |
+| Arc vs Direct Fire |  |  |  | ✓ | ✓ | ✓ | ✓ |
+| Archetype-Specific |  |  |  |  | ✓ | ✓ | ✓ |
+| Ally Coordination |  |  |  |  |  | ✓ | ✓ |
 
-## Objective Rewards (all stages)
+## Core Objective Rewards
 
-| Component | Value | Notes |
-|---|---|---|
-| Damage dealt | +0.15 per 1% target HP | Scales with target max HP |
-| Kill target | +35.0 | |
-| Take damage | -0.015 per 1% own HP | |
-| Die | -10.0 | |
-| Episode win | +50.0 | + speed bonus up to ~75 total |
-| Episode loss | -5.0 | |
-| Episode timeout | -8.0 | |
-| Alive per step | +0.005 (stage 1), 0.0 (stage 2), -0.02 (stage 3+) | Negative = survival costs |
+- Damage dealt scales with target HP percentage.
+- Kills and episode wins provide the main positive signal.
+- Death, loss, timeout and surviving targets provide negative terminal pressure.
+- From stage 3 onward, per-step survival is net-negative to discourage passive play.
 
-## Shaping Rewards
+## Shaping Categories
 
-### Ammo Management (stage 2+)
-Reload behind cover (+0.1), switch to loaded weapon (+0.2), wasted shot (-0.0001), all weapons empty (-0.1), fire hit (+0.15).
+### Ammo Management
 
-### Anti-Degenerate (stage 3+)
-Idle penalty (-0.01/step), spinning (-0.03), camping (-0.03/step), wall hugging (-0.02/step), corner penalty (-0.04).
+Rewards useful reload/switch behaviour and penalises wasteful fire or empty-weapon states.
 
-### Flanking (stage 3+)
-Behind target (+0.008/step), at side (+0.003/step), fire from behind (+0.06/shot), fire from side (+0.03/shot), cover flank (+0.08), lost flanking (-0.02).
+### Anti-Degenerate Behaviour
 
-### Aggression (stage 3+)
-Passive in range (-0.08/step) — per-step penalty for not firing when the agent could.
+Penalises idle behaviour, spinning, camping, wall hugging and corner abuse.
 
-### Movement (stage 3+)
-Mobile fire (+0.02/shot), strafe fire (+0.04/shot).
+### Flanking and Positioning
 
-### Multi-Target (stage 3+)
-Retarget urgency (-0.06/step when current target dead but others alive), target low HP bonus (+3.0), surviving target penalty (-8.0 per living target at episode end).
+Encourages tactically useful side/rear angles and firing from advantageous positions.
 
-### Weapon Selection (stage 4+)
-Fire in optimal band (+0.06/shot), fire outside optimal (-0.02/shot), swap to better range (+0.08), swap to worse (-0.1), smart reload swap (+0.1), holding wrong weapon (-0.0025/step).
+### Aggression
 
-### Arc vs Direct (stage 4+)
-Arc over cover (+0.03/shot when LOS blocked), direct with LOS (+0.02/shot), holding arc with LOS (-0.005/step).
+Penalises being passive when a valid shot is available.
 
-### Archetype-Specific (stage 5+)
-Per-archetype shaping — ranged kiting, melee gap-closing, tank body-blocking, healer ally support. See [curriculum.md](curriculum.md) stages 5-7 for full values.
+### Movement
 
-### Ally Coordination (stage 6+)
-Protect low-HP ally (+0.015/step), fire at ally's threat (+0.04/shot), ally died nearby (-1.5), ally collision (-0.04).
+Rewards firing while moving and useful strafe-fire behaviour.
 
-## Design Philosophy
+### Multi-Target Progression
 
-Objective rewards (kill, win, loss) represent >80% of a winning episode's total. Shaping rewards are kept under 15% to prevent reward farming. Per-step survival is negative (-0.02/step from stage 3) so passive play is net-negative — only dealing damage overcomes the survival cost. The surviving target penalty (-8.0 per living target) creates a gradient between partial and full clears.
+Encourages retargeting dead targets quickly, finishing low-HP enemies and clearing all remaining targets.
+
+### Weapon Selection
+
+Rewards using the right weapon for the current range/ammo/LOS/cover situation.
+
+### Arc vs Direct Fire
+
+Rewards arcing over cover when direct LOS is blocked, while preferring direct weapons when LOS exists.
+
+### Archetype-Specific Behaviour
+
+Adds role-specific nudges for ranged, melee, healer and tank behaviours.
+
+### Ally Coordination
+
+Encourages protecting low-HP allies, attacking ally threats and avoiding ally collision/stacking.
+
+## Practical Debugging
+
+If reward rises but win rate stays flat, check for shaping farming. The intended pattern is:
+
+```text
+win rate improves
+kills increase
+episode length decreases or stabilises
+reward increases for objective reasons, not passive shaping
+```
+
+The web tool reward budget view is useful for detecting episodes where reward exceeds a sensible win budget without corresponding kills.
