@@ -196,16 +196,16 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
     ),
 
     5: PPOStageConfig(
-        lr=2.0e-4,
+        lr=3.0e-4,
         clip_range=0.16,
         entropy_coef=0.002,          # 2x S4 final (0.001)
         entropy_coef_final=0.0005,
         num_steps=1024,
         update_epochs=5,
         target_kl=0.015,
-        total_timesteps=10_000_000,
+        total_timesteps=20_000_000,
         num_eval_episodes=100,
-        revert_patience=30,
+        revert_patience=5,
     ),
 
     6: PPOStageConfig(
@@ -223,19 +223,22 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
     ),
 
     7: PPOStageConfig(
-        lr=2e-4,
+        lr=3e-4,
         clip_range=0.16,
-        entropy_coef=0.001,         # 2x S5 final (0.0003)
+        entropy_coef=0.002,         
         entropy_coef_final=0.0001,
         num_steps=2048,
         mini_batch_size=1024,
         update_epochs=6,
-        target_kl=0.010,
+        target_kl=0.015,
         total_timesteps=30_000_000,
         eval_interval=15_000,
         num_eval_episodes=150,
-        revert_patience=10,
+        revert_patience=15,
         revert_min_drop=0.10,
+        entropy_target_ratio=1.5,   # needs MORE target exploration, not less
+        entropy_combat_ratio=1.0,
+        entropy_move_ratio=1.5,
     ),
 
 }
