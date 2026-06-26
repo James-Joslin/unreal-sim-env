@@ -239,6 +239,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         entropy_target_ratio=1.5,   # needs MORE target exploration, not less
         entropy_combat_ratio=1.0,
         entropy_move_ratio=1.5,
+        aux_pred_coef=0.0
     ),
 
 }
