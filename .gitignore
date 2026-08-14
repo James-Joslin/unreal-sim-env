@@ -299,3 +299,4 @@ docs/_build/
 # PyBuilder
 target/
 maildir
+AGENT.md
