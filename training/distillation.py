@@ -55,12 +55,14 @@ def generate_teacher_dataset(
     num_episodes: int = 500,
     obs_normalizer=None,
 ) -> dict:
-    """Roll out the teacher, collect (obs, logits) pairs."""
+    """Roll out the teacher and preserve masks plus episode sequences."""
     from combat_extensions import make_extended_curriculum_env
     from frame_stack import FrameStackEnvWrapper
 
     teacher.eval()
     all_obs, all_m, all_c, all_t = [], [], [], []
+    all_m_masks, all_c_masks, all_t_masks = [], [], []
+    all_episode_starts, all_stages = [], []
 
     eps_per_stage = max(1, num_episodes // len(stages))
 
@@ -69,8 +71,9 @@ def generate_teacher_dataset(
         env = FrameStackEnvWrapper(raw_env, frame_stack=frame_stack)
 
         for ep in range(eps_per_stage):
-            obs, _ = env.reset()
+            obs, _ = env.reset(seed=stage * 100_000 + ep)
             done = False
+            episode_start = True
 
             # GRU hidden state — reset per episode.
             hidden = None
@@ -79,18 +82,40 @@ def generate_teacher_dataset(
 
             while not done:
                 obs_n = obs_normalizer.normalize(obs) if obs_normalizer else obs
-                with torch.no_grad():
-                    obs_t = torch.from_numpy(obs_n).float().unsqueeze(0).to(device)
-                    m_l, c_l, t_l, hidden = teacher(obs_t, hidden)
+                mask_dict = raw_env.build_action_mask()
+                if mask_dict.get("skip_inference", False):
+                    # Production does not call ONNX on locked ticks. Omit the
+                    # transition and keep recurrent state frozen; the next
+                    # recorded stacked observation still contains this frame.
+                    m = int(np.flatnonzero(mask_dict["m_mask"])[0])
+                    c = int(np.flatnonzero(mask_dict["c_mask"])[0])
+                    t = int(np.flatnonzero(mask_dict["t_mask"])[0])
+                else:
+                    with torch.no_grad():
+                        obs_t = torch.from_numpy(
+                            obs_n).float().unsqueeze(0).to(device)
+                        m_l, c_l, t_l, hidden = teacher(obs_t, hidden)
 
-                all_obs.append(obs_n.copy())
-                all_m.append(m_l.cpu().squeeze(0).numpy())
-                all_c.append(c_l.cpu().squeeze(0).numpy())
-                all_t.append(t_l.cpu().squeeze(0).numpy())
+                    all_obs.append(obs_n.copy())
+                    all_m.append(m_l.cpu().squeeze(0).numpy())
+                    all_c.append(c_l.cpu().squeeze(0).numpy())
+                    all_t.append(t_l.cpu().squeeze(0).numpy())
+                    all_m_masks.append(mask_dict["m_mask"].copy())
+                    all_c_masks.append(mask_dict["c_mask"].copy())
+                    all_t_masks.append(mask_dict["t_mask"].copy())
+                    all_episode_starts.append(episode_start)
+                    all_stages.append(stage)
+                    episode_start = False
 
-                m = m_l.argmax(1).item()
-                c = c_l.argmax(1).item()
-                t = t_l.argmax(1).item()
+                    m_mask = torch.from_numpy(
+                        mask_dict["m_mask"]).unsqueeze(0).to(device)
+                    c_mask = torch.from_numpy(
+                        mask_dict["c_mask"]).unsqueeze(0).to(device)
+                    t_mask = torch.from_numpy(
+                        mask_dict["t_mask"]).unsqueeze(0).to(device)
+                    m = m_l.masked_fill(~m_mask, -1e8).argmax(1).item()
+                    c = c_l.masked_fill(~c_mask, -1e8).argmax(1).item()
+                    t = t_l.masked_fill(~t_mask, -1e8).argmax(1).item()
                 obs, _, done, trunc, _ = env.step(np.array([m, c, t]))
                 if trunc:
                     break
@@ -103,6 +128,11 @@ def generate_teacher_dataset(
         "m_logits": np.array(all_m, dtype=np.float32),
         "c_logits": np.array(all_c, dtype=np.float32),
         "t_logits": np.array(all_t, dtype=np.float32),
+        "m_masks": np.array(all_m_masks, dtype=bool),
+        "c_masks": np.array(all_c_masks, dtype=bool),
+        "t_masks": np.array(all_t_masks, dtype=bool),
+        "episode_starts": np.array(all_episode_starts, dtype=bool),
+        "stages": np.array(all_stages, dtype=np.int64),
     }
 
 
@@ -146,6 +176,11 @@ def generate_amplified_dataset(
     all_c_acts = []
     all_t_acts = []
     all_weights = []
+    all_m_masks = []
+    all_c_masks = []
+    all_t_masks = []
+    all_episode_starts = []
+    all_stages = []
 
     total_episodes = 0
     total_kept = 0
@@ -164,7 +199,9 @@ def generate_amplified_dataset(
 
                 raw_env = make_extended_curriculum_env(stage, archetype)
                 env = FrameStackEnvWrapper(raw_env, frame_stack=frame_stack)
-                obs, _ = env.reset()
+                # Every candidate rollout must start from the same arena.
+                # Policy sampling still differs through the rollout torch seed.
+                obs, _ = env.reset(seed=base_seed)
 
                 transitions = []
                 ep_reward = 0.0
@@ -178,32 +215,56 @@ def generate_amplified_dataset(
                 while not done:
                     obs_n = (obs_normalizer.normalize(obs)
                              if obs_normalizer else obs)
-                    with torch.no_grad():
-                        obs_t = torch.from_numpy(obs_n).float().unsqueeze(0).to(device)
+                    mask_dict = raw_env.build_action_mask()
+                    if mask_dict.get("skip_inference", False):
+                        m = int(np.flatnonzero(mask_dict["m_mask"])[0])
+                        c = int(np.flatnonzero(mask_dict["c_mask"])[0])
+                        t = int(np.flatnonzero(mask_dict["t_mask"])[0])
+                    else:
+                        with torch.no_grad():
+                            obs_t = torch.from_numpy(
+                                obs_n).float().unsqueeze(0).to(device)
+                            masks_t = (
+                                torch.from_numpy(mask_dict["m_mask"])
+                                .unsqueeze(0).to(device),
+                                torch.from_numpy(mask_dict["c_mask"])
+                                .unsqueeze(0).to(device),
+                                torch.from_numpy(mask_dict["t_mask"])
+                                .unsqueeze(0).to(device),
+                            )
 
-                        if hasattr(policy, 'sample_actions'):
-                            result = policy.sample_actions(obs_t, hidden=hidden)
-                            (m_a, c_a, t_a), _ = result[0], result[1]
-                            if len(result) > 2:
-                                hidden = result[2]
-                            m, c, t = m_a.item(), c_a.item(), t_a.item()
-                        elif hasattr(policy, 'get_action_and_value'):
-                            result = policy.get_action_and_value(
-                                obs_t, hidden=hidden)
-                            (m_a, c_a, t_a) = result[0]
-                            if len(result) > 4:
-                                hidden = result[4]
-                            m, c, t = m_a.item(), c_a.item(), t_a.item()
-                        else:
-                            m_l, c_l, t_l, hidden = policy(obs_t, hidden)
-                            m_dist = torch.distributions.Categorical(logits=m_l)
-                            c_dist = torch.distributions.Categorical(logits=c_l)
-                            t_dist = torch.distributions.Categorical(logits=t_l)
-                            m = m_dist.sample().item()
-                            c = c_dist.sample().item()
-                            t = t_dist.sample().item()
+                            if hasattr(policy, 'sample_actions'):
+                                result = policy.sample_actions(
+                                    obs_t, masks=masks_t, hidden=hidden)
+                                (m_a, c_a, t_a), _ = result[0], result[1]
+                                if len(result) > 2:
+                                    hidden = result[2]
+                                m, c, t = m_a.item(), c_a.item(), t_a.item()
+                            elif hasattr(policy, 'get_action_and_value'):
+                                result = policy.get_action_and_value(
+                                    obs_t, masks=masks_t, hidden=hidden)
+                                (m_a, c_a, t_a) = result[0]
+                                if len(result) > 4:
+                                    hidden = result[4]
+                                m, c, t = m_a.item(), c_a.item(), t_a.item()
+                            else:
+                                m_l, c_l, t_l, hidden = policy(obs_t, hidden)
+                                m_l = m_l.masked_fill(~masks_t[0], -1e8)
+                                c_l = c_l.masked_fill(~masks_t[1], -1e8)
+                                t_l = t_l.masked_fill(~masks_t[2], -1e8)
+                                m_dist = torch.distributions.Categorical(logits=m_l)
+                                c_dist = torch.distributions.Categorical(logits=c_l)
+                                t_dist = torch.distributions.Categorical(logits=t_l)
+                                m = m_dist.sample().item()
+                                c = c_dist.sample().item()
+                                t = t_dist.sample().item()
 
-                    transitions.append((obs_n.copy(), m, c, t))
+                        transitions.append((
+                            obs_n.copy(), m, c, t,
+                            mask_dict["m_mask"].copy(),
+                            mask_dict["c_mask"].copy(),
+                            mask_dict["t_mask"].copy(),
+                        ))
                     obs, reward, done, trunc, _ = env.step(np.array([m, c, t]))
                     ep_reward += reward
                     if trunc:
@@ -229,12 +290,18 @@ def generate_amplified_dataset(
 
             for i, (ep_r, transitions) in enumerate(kept):
                 w = weights[i]
-                for obs_n, m, c, t in transitions:
+                for step_idx, (obs_n, m, c, t,
+                               m_mask, c_mask, t_mask) in enumerate(transitions):
                     all_obs.append(obs_n)
                     all_m_acts.append(m)
                     all_c_acts.append(c)
                     all_t_acts.append(t)
                     all_weights.append(w)
+                    all_m_masks.append(m_mask)
+                    all_c_masks.append(c_mask)
+                    all_t_masks.append(t_mask)
+                    all_episode_starts.append(step_idx == 0)
+                    all_stages.append(stage)
 
         print(f"  Stage {stage}: {scenarios_per_stage} scenarios × "
               f"{rollouts_per_scenario} rollouts, "
@@ -250,6 +317,11 @@ def generate_amplified_dataset(
         "c_acts": np.array(all_c_acts, dtype=np.int64),
         "t_acts": np.array(all_t_acts, dtype=np.int64),
         "weights": np.array(all_weights, dtype=np.float32),
+        "m_masks": np.array(all_m_masks, dtype=bool),
+        "c_masks": np.array(all_c_masks, dtype=bool),
+        "t_masks": np.array(all_t_masks, dtype=bool),
+        "episode_starts": np.array(all_episode_starts, dtype=bool),
+        "stages": np.array(all_stages, dtype=np.int64),
     }
 
 
@@ -257,40 +329,129 @@ def generate_amplified_dataset(
 #  Standard KD Training
 # ─────────────────────────────────────────────────────────────────
 
+def _episode_ranges(dataset):
+    """Return half-open episode ranges, validating dataset alignment."""
+    n = len(dataset["obs"])
+    if n == 0:
+        raise ValueError("Distillation dataset is empty")
+    for key, values in dataset.items():
+        if len(values) != n:
+            raise ValueError(
+                f"Dataset field '{key}' has {len(values)} rows; expected {n}")
+    starts = np.asarray(dataset["episode_starts"], dtype=bool)
+    if not starts[0]:
+        raise ValueError("First distillation transition must start an episode")
+    begin = np.flatnonzero(starts)
+    end = np.concatenate((begin[1:], np.array([n], dtype=np.int64)))
+    return [(int(a), int(b)) for a, b in zip(begin, end)]
+
+
+def _split_episode_ranges(ranges, validation_fraction=0.1):
+    """Split on episode boundaries so recurrent context is never severed."""
+    if len(ranges) < 2:
+        return list(ranges), list(ranges)
+    val_n = max(1, int(round(len(ranges) * validation_fraction)))
+    val_n = min(val_n, len(ranges) - 1)
+    return list(ranges[val_n:]), list(ranges[:val_n])
+
+
+def _pad_episode_batch(dataset, ranges):
+    batch = len(ranges)
+    steps = max(end - start for start, end in ranges)
+    valid = np.zeros((batch, steps), dtype=bool)
+    padded = {}
+    for key, values in dataset.items():
+        if key == "episode_starts":
+            continue
+        values = np.asarray(values)
+        padded[key] = np.zeros(
+            (batch, steps) + values.shape[1:], dtype=values.dtype)
+    for row, (start, end) in enumerate(ranges):
+        length = end - start
+        valid[row, :length] = True
+        for key in padded:
+            padded[key][row, :length] = dataset[key][start:end]
+    padded["valid"] = valid
+    return padded
+
+
+def _iter_sequence_batches(dataset, ranges, batch_size, shuffle):
+    """Yield padded batches of complete episodes near a transition budget."""
+    ordered = list(ranges)
+    if shuffle:
+        np.random.shuffle(ordered)
+    pending, transitions = [], 0
+    for episode in ordered:
+        length = episode[1] - episode[0]
+        if pending and transitions + length > batch_size:
+            yield _pad_episode_batch(dataset, pending)
+            pending, transitions = [], 0
+        pending.append(episode)
+        transitions += length
+    if pending:
+        yield _pad_episode_batch(dataset, pending)
+
+
+def _effective_action_masks(student, batch, device):
+    """Intersect recorded environment masks with the student tier contract."""
+    masks = []
+    for key, availability in (
+        ("m_masks", student.movement_availability),
+        ("c_masks", student.combat_availability),
+        ("t_masks", student.target_availability),
+    ):
+        env_mask = torch.from_numpy(batch[key]).bool().to(device)
+        masks.append(env_mask & availability.view(1, 1, -1))
+    return tuple(masks)
+
+
+def _masked_kd_per_step(student_logits, teacher_logits, masks,
+                        alpha, temperature):
+    """Independent-head KD after projecting teacher mass onto valid actions."""
+    total = torch.zeros(student_logits[0].shape[:2],
+                        device=student_logits[0].device)
+    for student_logit, teacher_logit, mask in zip(
+            student_logits, teacher_logits, masks):
+        student_logit = student_logit.masked_fill(~mask, -1e8)
+        teacher_logit = teacher_logit.masked_fill(~mask, -1e8)
+        teacher_soft = F.softmax(teacher_logit / temperature, dim=-1)
+        teacher_log = F.log_softmax(teacher_logit / temperature, dim=-1)
+        student_log = F.log_softmax(student_logit / temperature, dim=-1)
+        kd = (teacher_soft * (teacher_log - student_log)).sum(dim=-1)
+        kd = kd * (temperature ** 2)
+        hard = teacher_logit.argmax(dim=-1)
+        ce = F.cross_entropy(
+            student_logit.reshape(-1, student_logit.shape[-1]),
+            hard.reshape(-1), reduction="none").reshape_as(hard)
+        total = total + alpha * kd + (1.0 - alpha) * ce
+    return total
+
 def distill_student(student, dataset, alpha=0.7, temperature=3.0,
                     epochs=50, batch_size=256, lr=3e-4,
                     device=torch.device("cpu"), tier_name=""):
-    """Train student to match teacher logits (standard KD)."""
+    """Train independent heads on complete recurrent episode sequences."""
     student = student.to(device).train()
     opt = torch.optim.Adam(student.parameters(), lr=lr)
-
-    obs_arr = dataset["obs"]
-    m_arr, c_arr, t_arr = dataset["m_logits"], dataset["c_logits"], dataset["t_logits"]
-
-    n = len(obs_arr)
-    val_n = max(1, int(n * 0.1))
-    indices = np.arange(n)
-    val_idx, train_idx = indices[:val_n], indices[val_n:]
+    train_ranges, val_ranges = _split_episode_ranges(
+        _episode_ranges(dataset))
+    print(f"  {tier_name or student.tier}: {len(train_ranges)} train / "
+          f"{len(val_ranges)} validation episodes; recurrent context kept")
 
     for epoch in range(epochs):
-        np.random.shuffle(train_idx)
         total_loss, n_b = 0.0, 0
-
-        for i in range(0, len(train_idx), batch_size):
-            idx = train_idx[i:i + batch_size]
-            b_obs = torch.from_numpy(obs_arr[idx]).to(device)
-            t_m = torch.from_numpy(m_arr[idx]).to(device)
-            t_c = torch.from_numpy(c_arr[idx]).to(device)
-            t_t = torch.from_numpy(t_arr[idx]).to(device)
-
-            s_m, s_c, s_t, _ = student(b_obs)
-            loss = torch.tensor(0.0, device=device)
-            for s_l, t_l in [(s_m, t_m), (s_c, t_c), (s_t, t_t)]:
-                t_soft = F.softmax(t_l / temperature, dim=-1)
-                s_log = F.log_softmax(s_l / temperature, dim=-1)
-                kd = F.kl_div(s_log, t_soft, reduction="batchmean") * (temperature ** 2)
-                ce = F.cross_entropy(s_l, t_l.argmax(dim=-1))
-                loss = loss + alpha * kd + (1 - alpha) * ce
+        for batch in _iter_sequence_batches(
+                dataset, train_ranges, batch_size, shuffle=True):
+            b_obs = torch.from_numpy(batch["obs"]).float().to(device)
+            teacher_logits = tuple(
+                torch.from_numpy(batch[key]).float().to(device)
+                for key in ("m_logits", "c_logits", "t_logits"))
+            valid = torch.from_numpy(batch["valid"]).bool().to(device)
+            masks = _effective_action_masks(student, batch, device)
+            s_m, s_c, s_t, _ = student.forward_sequence(b_obs)
+            per_step = _masked_kd_per_step(
+                (s_m, s_c, s_t), teacher_logits, masks,
+                alpha, temperature)
+            loss = per_step[valid].mean()
 
             opt.zero_grad()
             loss.backward()
@@ -302,17 +463,24 @@ def distill_student(student, dataset, alpha=0.7, temperature=3.0,
             student.eval()
             v_loss, v_b = 0.0, 0
             with torch.no_grad():
-                for i in range(0, len(val_idx), batch_size):
-                    idx = val_idx[i:i + batch_size]
-                    b = torch.from_numpy(obs_arr[idx]).to(device)
-                    s_m, s_c, s_t, _ = student(b)
-                    for s_l, t_l_np in [(s_m, m_arr[idx]), (s_c, c_arr[idx]), (s_t, t_arr[idx])]:
-                        t_l = torch.from_numpy(t_l_np).to(device)
-                        v_loss += F.cross_entropy(s_l, t_l.argmax(dim=-1)).item()
+                for batch in _iter_sequence_batches(
+                        dataset, val_ranges, batch_size, shuffle=False):
+                    b_obs = torch.from_numpy(
+                        batch["obs"]).float().to(device)
+                    teacher_logits = tuple(
+                        torch.from_numpy(batch[key]).float().to(device)
+                        for key in ("m_logits", "c_logits", "t_logits"))
+                    valid = torch.from_numpy(
+                        batch["valid"]).bool().to(device)
+                    masks = _effective_action_masks(student, batch, device)
+                    logits = student.forward_sequence(b_obs)[:3]
+                    per_step = _masked_kd_per_step(
+                        logits, teacher_logits, masks, 0.0, 1.0)
+                    v_loss += per_step[valid].mean().item()
                     v_b += 1
             print(f"    Epoch {epoch+1}/{epochs}: "
                   f"train={total_loss/max(n_b,1):.4f}, "
-                  f"val_ce={v_loss/max(v_b*3,1):.4f}")
+                  f"val_ce={v_loss/max(v_b,1):.4f}")
             student.train()
 
     student.eval()
@@ -336,37 +504,41 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
     """
     student = student.to(device).train()
     opt = torch.optim.Adam(student.parameters(), lr=lr)
-
-    obs_arr = dataset["obs"]
-    m_arr = dataset["m_acts"]
-    c_arr = dataset["c_acts"]
-    t_arr = dataset["t_acts"]
-    w_arr = dataset["weights"]
-
-    n = len(obs_arr)
-    val_n = max(1, int(n * 0.1))
-    indices = np.arange(n)
-    val_idx, train_idx = indices[:val_n], indices[val_n:]
+    train_ranges, val_ranges = _split_episode_ranges(
+        _episode_ranges(dataset))
+    print(f"  {tier_name or student.tier}: {len(train_ranges)} train / "
+          f"{len(val_ranges)} validation episodes; recurrent context kept")
 
     for epoch in range(epochs):
-        np.random.shuffle(train_idx)
         total_loss, n_b = 0.0, 0
+        for batch in _iter_sequence_batches(
+                dataset, train_ranges, batch_size, shuffle=True):
+            b_obs = torch.from_numpy(batch["obs"]).float().to(device)
+            labels = tuple(
+                torch.from_numpy(batch[key]).long().to(device)
+                for key in ("m_acts", "c_acts", "t_acts"))
+            weights = torch.from_numpy(batch["weights"]).float().to(device)
+            valid = torch.from_numpy(batch["valid"]).bool().to(device)
+            masks = _effective_action_masks(student, batch, device)
+            logits = student.forward_sequence(b_obs)[:3]
 
-        for i in range(0, len(train_idx), batch_size):
-            idx = train_idx[i:i + batch_size]
-            b_obs = torch.from_numpy(obs_arr[idx]).to(device)
-            b_m = torch.from_numpy(m_arr[idx]).long().to(device)
-            b_c = torch.from_numpy(c_arr[idx]).long().to(device)
-            b_t = torch.from_numpy(t_arr[idx]).long().to(device)
-            b_w = torch.from_numpy(w_arr[idx]).to(device)
-
-            s_m, s_c, s_t, _ = student(b_obs)
-
-            # Weighted cross-entropy: high-reward episodes count more.
-            ce_m = F.cross_entropy(s_m, b_m, reduction="none")
-            ce_c = F.cross_entropy(s_c, b_c, reduction="none")
-            ce_t = F.cross_entropy(s_t, b_t, reduction="none")
-            loss = (b_w * (ce_m + ce_c + ce_t)).mean()
+            # Heads are independent. Keep supervision for each available
+            # action and deterministically drop only that head's unavailable
+            # label when the source tier has a broader action contract.
+            numerator = torch.tensor(0.0, device=device)
+            denominator = torch.tensor(0.0, device=device)
+            for logit, label, mask in zip(logits, labels, masks):
+                logit = logit.masked_fill(~mask, -1e8)
+                allowed = mask.gather(-1, label.unsqueeze(-1)).squeeze(-1)
+                supervised = valid & allowed
+                ce = F.cross_entropy(
+                    logit.reshape(-1, logit.shape[-1]), label.reshape(-1),
+                    reduction="none").reshape_as(label)
+                numerator = numerator + (ce * weights * supervised).sum()
+                denominator = denominator + (weights * supervised).sum()
+            if denominator.item() <= 0:
+                continue
+            loss = numerator / denominator
 
             opt.zero_grad()
             loss.backward()
@@ -378,17 +550,35 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
             student.eval()
             v_loss, v_b = 0.0, 0
             with torch.no_grad():
-                for i in range(0, len(val_idx), batch_size):
-                    idx = val_idx[i:i + batch_size]
-                    b = torch.from_numpy(obs_arr[idx]).to(device)
-                    s_m, s_c, s_t, _ = student(b)
-                    v_loss += F.cross_entropy(s_m, torch.from_numpy(m_arr[idx]).long().to(device)).item()
-                    v_loss += F.cross_entropy(s_c, torch.from_numpy(c_arr[idx]).long().to(device)).item()
-                    v_loss += F.cross_entropy(s_t, torch.from_numpy(t_arr[idx]).long().to(device)).item()
-                    v_b += 1
+                for batch in _iter_sequence_batches(
+                        dataset, val_ranges, batch_size, shuffle=False):
+                    b_obs = torch.from_numpy(
+                        batch["obs"]).float().to(device)
+                    labels = tuple(
+                        torch.from_numpy(batch[key]).long().to(device)
+                        for key in ("m_acts", "c_acts", "t_acts"))
+                    valid = torch.from_numpy(
+                        batch["valid"]).bool().to(device)
+                    masks = _effective_action_masks(student, batch, device)
+                    logits = student.forward_sequence(b_obs)[:3]
+                    head_losses = []
+                    for logit, label, mask in zip(logits, labels, masks):
+                        logit = logit.masked_fill(~mask, -1e8)
+                        allowed = mask.gather(
+                            -1, label.unsqueeze(-1)).squeeze(-1)
+                        supervised = valid & allowed
+                        if supervised.any():
+                            ce = F.cross_entropy(
+                                logit.reshape(-1, logit.shape[-1]),
+                                label.reshape(-1), reduction="none"
+                            ).reshape_as(label)
+                            head_losses.append(ce[supervised].mean())
+                    if head_losses:
+                        v_loss += torch.stack(head_losses).mean().item()
+                        v_b += 1
             print(f"    Epoch {epoch+1}/{epochs}: "
                   f"train={total_loss/max(n_b,1):.4f}, "
-                  f"val_ce={v_loss/max(v_b*3,1):.4f}")
+                  f"val_ce={v_loss/max(v_b,1):.4f}")
             student.train()
 
     student.eval()
@@ -449,7 +639,6 @@ DEFAULT_DISTILL_CHAIN = [
     ("medium", "large",  0.7, 3.0, 1),
     ("small",  "medium", 0.7, 3.0, 1),
     ("micro",  "small",  0.5, 4.0, 1),
-    ("xl",     "large",  0.7, 3.0, 1),
 ]
 
 
@@ -469,19 +658,23 @@ def run_distillation(
     """Full distillation pipeline.
 
     Modes:
-        standard:  Match teacher logits → 5 ONNX tiers.
+        standard:  Match teacher logits → active ONNX tiers.
         amplified: Best-of-N self-improvement → distill → ONNX tiers.
                    With iterations > 1, repeats the amplify/distill
                    loop (iterated amplification à la AlphaGo Zero).
     """
     from combat_policy import (
         load_teacher_from_checkpoint, export_onnx, verify_export,
-        make_policy, OBS_SIZE,
+        make_policy, resolve_tier, ACTIVE_TIERS, TRAINABLE_ARCHETYPES,
+        BEHAVIOR_TIER_DEFINITIONS,
     )
     from frame_stack import stacked_obs_size
 
-    if distill_chain is None:
-        distill_chain = DEFAULT_DISTILL_CHAIN
+    use_default_chain = distill_chain is None
+    if archetype not in TRAINABLE_ARCHETYPES:
+        raise ValueError(
+            f"Archetype '{archetype}' is not trainable. Active archetypes: "
+            f"{', '.join(TRAINABLE_ARCHETYPES)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
@@ -490,9 +683,25 @@ def run_distillation(
     ckpt = torch.load(teacher_path, map_location="cpu", weights_only=False)
     fs = ckpt.get("frame_stack", frame_stack)
     input_size = stacked_obs_size(fs)
-    teacher_tier = ckpt.get("tier", "large")
-    teacher_stage = ckpt.get("stage", 3)
-    stages = list(range(1, min(teacher_stage + 1, 8)))
+    raw_teacher_tier = ckpt.get("tier", "large")
+    teacher_tier = resolve_tier(raw_teacher_tier)
+    teacher_stage = max(1, min(int(ckpt.get("stage", 3)), 7))
+    stages = list(range(1, teacher_stage + 1))
+
+    if use_default_chain:
+        start = [tier for tier, *_ in DEFAULT_DISTILL_CHAIN].index(
+            teacher_tier)
+        selected = DEFAULT_DISTILL_CHAIN[start:]
+        distill_chain = []
+        for index, (tier, _, alpha, temp, epoch_mult) in enumerate(selected):
+            source = None if index == 0 else selected[index - 1][0]
+            distill_chain.append((tier, source, alpha, temp, epoch_mult))
+    for tier, source, *_ in distill_chain:
+        if tier not in ACTIVE_TIERS or (
+                source is not None and source not in ACTIVE_TIERS):
+            raise ValueError(
+                "Distillation chains may use only active tiers: "
+                f"{', '.join(ACTIVE_TIERS)}")
 
     obs_normalizer = None
     if "obs_normalizer" in ckpt:
@@ -502,7 +711,8 @@ def run_distillation(
         print(f"Loaded observation normalizer")
 
     teacher = load_teacher_from_checkpoint(teacher_path, device)
-    print(f"Teacher: tier={teacher_tier}, stage={teacher_stage}, "
+    print(f"Teacher: tier={raw_teacher_tier} -> {teacher_tier}, "
+          f"stage={teacher_stage}, "
           f"params={sum(p.numel() for p in teacher.parameters()):,}")
 
     current_policy = teacher
@@ -572,7 +782,7 @@ def run_distillation(
                     # from the source tier model.
                     if src_tier != teacher_tier:
                         src_dataset = _regenerate_logits(
-                            models[src_tier], dataset["obs"], device)
+                            models[src_tier], dataset, device)
                     else:
                         src_dataset = dataset
                     student = train_fn(
@@ -589,7 +799,8 @@ def run_distillation(
             verify_export(
                 models[tier], onnx_path,
                 frame_stack=fs, obs_normalizer=obs_normalizer)
-            ms = benchmark_onnx(onnx_path, input_size)
+            ms = benchmark_onnx(
+                onnx_path, input_size, models[tier].gru_hidden)
 
             # In-sim evaluation — the real test of distillation quality.
             eval_stats = _evaluate_tier(
@@ -602,6 +813,7 @@ def run_distillation(
                 "win_rate": eval_stats["win_rate"],
                 "mean_reward": eval_stats["mean_reward"],
                 "mean_kills": eval_stats["mean_kills"],
+                "behavior": BEHAVIOR_TIER_DEFINITIONS[tier]["label"],
             }
 
         # For iterated amplification, the improved teacher-tier model
@@ -627,7 +839,7 @@ def _evaluate_tier(model, stage, archetype, frame_stack,
     """Run in-sim evaluation for a distilled model tier.
 
     Uses the same seeded evaluation as training — deterministic
-    scenarios with autoregressive masked action selection.
+    scenarios with independent, masked action selection.
     """
     from training.evaluation import evaluate
 
@@ -645,31 +857,29 @@ def _evaluate_tier(model, stage, archetype, frame_stack,
     return stats
 
 
-def _regenerate_logits(model, obs_array, device, batch_size=512):
-    """Regenerate logits from a source-tier model for cascaded KD.
-
-    NOTE: GRU hidden state is zero-initialised for every batch because
-    the dataset has no episode structure (observations are shuffled).
-    The regenerated logits therefore don't reflect temporal context.
-    This is acceptable for cascaded distillation — the student learns
-    a per-observation logit mapping, and the GRU builds context at
-    sequential inference time.
-    """
-    model.eval()
-    all_m, all_c, all_t = [], [], []
-    for i in range(0, len(obs_array), batch_size):
-        batch = torch.from_numpy(obs_array[i:i+batch_size]).to(device)
-        with torch.no_grad():
-            m, c, t, _ = model(batch)
-        all_m.append(m.cpu().numpy())
-        all_c.append(c.cpu().numpy())
-        all_t.append(t.cpu().numpy())
-    return {
-        "obs": obs_array,
-        "m_logits": np.concatenate(all_m),
-        "c_logits": np.concatenate(all_c),
-        "t_logits": np.concatenate(all_t),
+def _regenerate_logits(model, dataset, device):
+    """Regenerate cascaded teacher logits with intact recurrent context."""
+    model.eval().to(device)
+    regenerated = {
+        key: np.array(values, copy=True)
+        for key, values in dataset.items()
     }
+    n = len(dataset["obs"])
+    regenerated["m_logits"] = np.empty(
+        (n, len(model.movement_availability)), dtype=np.float32)
+    regenerated["c_logits"] = np.empty(
+        (n, len(model.combat_availability)), dtype=np.float32)
+    regenerated["t_logits"] = np.empty(
+        (n, len(model.target_availability)), dtype=np.float32)
+    for start, end in _episode_ranges(dataset):
+        obs = torch.from_numpy(
+            dataset["obs"][start:end]).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            movement, combat, target, _ = model.forward_sequence(obs)
+        regenerated["m_logits"][start:end] = movement[0].cpu().numpy()
+        regenerated["c_logits"][start:end] = combat[0].cpu().numpy()
+        regenerated["t_logits"][start:end] = target[0].cpu().numpy()
+    return regenerated
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -677,6 +887,7 @@ def _regenerate_logits(model, obs_array, device, batch_size=512):
 # ─────────────────────────────────────────────────────────────────
 
 def main():
+    from combat_policy import TRAINABLE_ARCHETYPES
     parser = argparse.ArgumentParser(
         description="Distill combat AI into ONNX tiers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -698,7 +909,8 @@ Examples:
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--frame_stack", type=int, default=3)
-    parser.add_argument("--archetype", default="ranged")
+    parser.add_argument("--archetype", default="ranged",
+                        choices=TRAINABLE_ARCHETYPES)
     parser.add_argument("--mode", choices=["standard", "amplified"],
                         default="standard")
     parser.add_argument("--rollouts", type=int, default=16,

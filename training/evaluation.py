@@ -12,7 +12,6 @@ DETERMINISTIC EVALUATION
     so reward/win rate differences reflect genuine improvement, not luck.
 """
 
-import random as _random
 from typing import Dict, Optional, Callable
 
 import numpy as np
@@ -50,12 +49,9 @@ def evaluate(
     kills = []
 
     for ep_idx in range(num_episodes):
-        # Seed BEFORE reset — controls arena, spawns, target composition.
-        _random.seed(base_seed + ep_idx)
-        np.random.seed(base_seed + ep_idx)
-        torch.manual_seed(base_seed + ep_idx)
-
-        obs, _ = env.reset()
+        # Seed the environment's per-instance RNG, not only module globals.
+        # This keeps every evaluation checkpoint on the exact same arenas.
+        obs, _ = env.reset(seed=base_seed + ep_idx)
         ep_reward = 0.0
         ep_length = 0
         done = False
@@ -75,45 +71,52 @@ def evaluate(
             # Build action mask (same as training — prevents invalid actions).
             mask_dict = raw_env.build_action_mask()
 
-            with torch.no_grad():
-                obs_t = torch.from_numpy(obs_normed).float().unsqueeze(0).to(device)
+            if mask_dict.get("skip_inference", False):
+                # Match production: the frame stack still advances, but ONNX
+                # and its GRU are not called while the action lock owns input.
+                m = int(np.flatnonzero(mask_dict["m_mask"])[0])
+                c = int(np.flatnonzero(mask_dict["c_mask"])[0])
+                t = int(np.flatnonzero(mask_dict["t_mask"])[0])
+            else:
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(
+                        obs_normed).float().unsqueeze(0).to(device)
 
-                if hasattr(model, 'select_actions'):
-                    m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
-                    c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
-                    t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
-                    result = model.select_actions(
-                        obs_t, (m_mask_t, c_mask_t, t_mask_t), hidden)
-                    # GRU models return (m, c, t, hidden_out).
-                    # Non-GRU models return (m, c, t).
-                    if len(result) == 4:
-                        m_a, c_a, t_a, hidden = result
+                    if hasattr(model, 'select_actions'):
+                        m_mask_t = torch.from_numpy(
+                            mask_dict["m_mask"]).unsqueeze(0).to(device)
+                        c_mask_t = torch.from_numpy(
+                            mask_dict["c_mask"]).unsqueeze(0).to(device)
+                        t_mask_t = torch.from_numpy(
+                            mask_dict["t_mask"]).unsqueeze(0).to(device)
+                        result = model.select_actions(
+                            obs_t, (m_mask_t, c_mask_t, t_mask_t), hidden)
+                        if len(result) == 4:
+                            m_a, c_a, t_a, hidden = result
+                        else:
+                            m_a, c_a, t_a = result
+                        m = m_a.item()
+                        c = c_a.item()
+                        t = t_a.item()
                     else:
-                        m_a, c_a, t_a = result
-                    m = m_a.item()
-                    c = c_a.item()
-                    t = t_a.item()
-                else:
-                    outputs = model(obs_t, hidden)
-                    if is_actor_critic:
-                        # ActorCritic: (m, c, t, value, hidden_out)
+                        outputs = model(obs_t, hidden)
                         m_l, c_l, t_l = outputs[0], outputs[1], outputs[2]
-                        if len(outputs) > 4:
+                        if is_actor_critic and len(outputs) > 4:
                             hidden = outputs[4]
-                    else:
-                        # CombatPolicy: (m, c, t, hidden_out)
-                        m_l, c_l, t_l = outputs[0], outputs[1], outputs[2]
-                        if len(outputs) > 3:
+                        elif not is_actor_critic and len(outputs) > 3:
                             hidden = outputs[3]
-                    m_mask_t = torch.from_numpy(mask_dict["m_mask"]).unsqueeze(0).to(device)
-                    c_mask_t = torch.from_numpy(mask_dict["c_mask"]).unsqueeze(0).to(device)
-                    t_mask_t = torch.from_numpy(mask_dict["t_mask"]).unsqueeze(0).to(device)
-                    m_l = m_l.masked_fill(~m_mask_t, -1e8)
-                    c_l = c_l.masked_fill(~c_mask_t, -1e8)
-                    t_l = t_l.masked_fill(~t_mask_t, -1e8)
-                    m = m_l.argmax(1).item()
-                    c = c_l.argmax(1).item()
-                    t = t_l.argmax(1).item()
+                        m_mask_t = torch.from_numpy(
+                            mask_dict["m_mask"]).unsqueeze(0).to(device)
+                        c_mask_t = torch.from_numpy(
+                            mask_dict["c_mask"]).unsqueeze(0).to(device)
+                        t_mask_t = torch.from_numpy(
+                            mask_dict["t_mask"]).unsqueeze(0).to(device)
+                        m_l = m_l.masked_fill(~m_mask_t, -1e8)
+                        c_l = c_l.masked_fill(~c_mask_t, -1e8)
+                        t_l = t_l.masked_fill(~t_mask_t, -1e8)
+                        m = m_l.argmax(1).item()
+                        c = c_l.argmax(1).item()
+                        t = t_l.argmax(1).item()
 
             obs, reward, done, truncated, _ = env.step(np.array([m, c, t]))
             ep_reward += reward
@@ -130,7 +133,7 @@ def evaluate(
         kills.append(targets_killed)
 
     env.close()
-    return {
+    stats = {
         "mean_reward": np.mean(rewards),
         "std_reward": np.std(rewards),
         "mean_length": np.mean(lengths),
@@ -138,3 +141,5 @@ def evaluate(
         "mean_kills": np.mean(kills),
         "reward_ci95": 1.96 * np.std(rewards) / max(np.sqrt(len(rewards)), 1),
     }
+
+    return stats

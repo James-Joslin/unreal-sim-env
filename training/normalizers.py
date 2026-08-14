@@ -67,12 +67,20 @@ class RunningNormalizer:
         )
 
     def state_dict(self):
-        return {"mean": self.mean.copy(), "var": self.var.copy(), "count": self.count}
+        return {
+            "mean": self.mean.copy(),
+            "var": self.var.copy(),
+            "count": self.count,
+            "clip": self.clip,
+            "epsilon": self.epsilon,
+        }
 
     def load_state_dict(self, state):
         self.mean = state["mean"].copy()
         self.var = state["var"].copy()
         self.count = state["count"]
+        self.clip = state.get("clip", self.clip)
+        self.epsilon = state.get("epsilon", self.epsilon)
 
 
 class ReturnNormalizer:
@@ -86,21 +94,43 @@ class ReturnNormalizer:
     def __init__(self, gamma: float = 0.99, epsilon: float = 1e-8):
         self.gamma = gamma
         self.epsilon = epsilon
-        self.running_return = 0.0
+        # One discounted-return accumulator per vectorized environment.
+        self.running_return = None
         self.running_mean = 0.0
         self.running_var = 1.0
         self.count = 1e-4
 
     def update(self, rewards: np.ndarray, dones: np.ndarray):
         """Update with a batch of (rewards, dones) from one timestep."""
-        for r, d in zip(rewards, dones):
-            self.running_return = r + self.gamma * self.running_return * (1 - d)
-            self.count += 1
-            # Welford's online algorithm for mean and variance.
-            delta = self.running_return - self.running_mean
-            self.running_mean += delta / self.count
-            delta2 = self.running_return - self.running_mean
-            self.running_var += (delta * delta2 - self.running_var) / self.count
+        rewards = np.asarray(rewards, dtype=np.float64).reshape(-1)
+        dones = np.asarray(dones, dtype=bool).reshape(-1)
+        if rewards.shape != dones.shape:
+            raise ValueError("rewards and dones must have the same shape")
+
+        if (self.running_return is None
+                or self.running_return.shape != rewards.shape):
+            self.running_return = np.zeros_like(rewards)
+
+        self.running_return = rewards + self.gamma * self.running_return
+        return_batch = self.running_return.copy()
+        self.running_return[dones] = 0.0
+
+        batch_count = return_batch.size
+        if batch_count == 0:
+            return
+        batch_mean = float(return_batch.mean())
+        batch_var = float(return_batch.var())
+
+        # Parallel Welford update over the independent environment returns.
+        delta = batch_mean - self.running_mean
+        total_count = self.count + batch_count
+        m_a = self.running_var * self.count
+        m_b = batch_var * batch_count
+        m2 = (m_a + m_b
+              + delta * delta * self.count * batch_count / total_count)
+        self.running_mean += delta * batch_count / total_count
+        self.running_var = m2 / total_count
+        self.count = total_count
 
     def normalize(self, rewards: np.ndarray) -> np.ndarray:
         return rewards / (np.sqrt(max(self.running_var, 1e-6)) + self.epsilon)
