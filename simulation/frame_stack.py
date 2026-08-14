@@ -5,7 +5,7 @@ frame_stack.py — Frame stacking for both BC (offline) and PPO (online),
 THE PROBLEM THIS SOLVES
     The C++ NeuralCombatComponent stacks N consecutive observation frames
     into one flat tensor before feeding it to the model. A model with
-    FrameStackCount=3 receives 198×3 = 594 floats, not 198. The model
+    FrameStackCount=3 receives 249×3 = 747 floats, not 249. The model
     needs temporal context to learn timing-dependent behaviour like
     "the target is accelerating left" or "I'm 80% through a reload."
 
@@ -25,21 +25,21 @@ THE PROBLEM THIS SOLVES
        rollout, dramatically stabilising advantage estimates.
 
     All produce the same flat tensor layout as the C++ BuildFlatInput():
-       [frame_oldest, ..., frame_newest] where each frame is 198 floats.
+       [frame_oldest, ..., frame_newest] where each frame is 249 floats.
 
 USAGE (BC):
     dataset = FrameStackedDataset("Saved/NeuralData/Default", frame_stack=3)
 
 USAGE (PPO, single env):
     env = FrameStackEnvWrapper(CombatEnv(config), frame_stack=3)
-    obs, info = env.reset()  # obs.shape == (594,)
+    obs, info = env.reset()  # obs.shape == (747,)
 
 USAGE (PPO, vectorized):
     vec_env = VecFrameStackEnv(
         env_fns=[lambda: make_curriculum_env(3, "ranged") for _ in range(8)],
         frame_stack=3,
     )
-    obs = vec_env.reset()  # obs.shape == (8, 594)
+    obs = vec_env.reset()  # obs.shape == (8, 747)
     obs, rewards, dones, truncs, infos = vec_env.step(actions)  # actions.shape == (8, 3)
 """
 
@@ -81,9 +81,9 @@ class FrameStackedDataset(Dataset):
     """Loads CSV recordings and builds frame-stacked training samples.
 
     Each sample is a rolling window of `frame_stack` consecutive rows
-    from the same episode (same enemy in the same encounter). The action
-    label comes from the LAST row in the window — the decision the
-    scripted brain made given the full temporal context.
+    within one CSV. EncounterID is not currently used to partition a file,
+    so data collection must keep encounters separate until that is fixed.
+    The action label comes from the LAST row in the window.
 
     If an episode has fewer than `frame_stack` rows, the first frame
     is repeated to fill the missing slots (same as C++ BuildFlatInput).
@@ -233,7 +233,7 @@ class VecFrameStackEnv:
             env_fns=[lambda: make_curriculum_env(3, "ranged") for _ in range(8)],
             frame_stack=3,
         )
-        obs = vec_env.reset()                    # (8, 594)
+        obs = vec_env.reset()                    # (8, 747)
         obs, rew, done, trunc, info = vec_env.step(actions)  # actions: (8, 3)
 
     AUTORESET

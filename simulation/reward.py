@@ -59,6 +59,8 @@ class CombatAction(IntEnum):
     SWITCH_1 = 4
     MELEE = 5
     BLOCK = 6
+    DODGE = 7
+    REPOSITION = 8
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -102,8 +104,11 @@ class CombatState:
     prev_weapon_index: int = 0
 
     # Target
+    target_id: int = -1
     target_hp: float = 1.0
     target_alive: bool = True
+    reward_target_hp: float = 1.0
+    selected_target_damage: float = 0.0
     target_distance: float = 500.0
     has_los: bool = True
     target_in_range: bool = True
@@ -136,12 +141,12 @@ class CombatState:
     nearest_ally_distance: float = 9999.0
     ally_overlap: bool = False       # overlapping another enemy
 
-    # Allies needing help (healer/tank)
+    # Ally-protection context (currently used by the tank objective)
     lowest_ally_hp: float = 1.0
     ally_in_danger: bool = False     # ally < 30% HP
     ally_just_died: bool = False     # an ally died this step
     self_between_threat_and_ally: bool = False  # tank body-blocking
-    ally_target_index: int = -1      # which target slot the ally is attacking (-1 = none)
+    ally_target_id: int = -1         # stable ID of the ally's target (-1 = none)
 
     # Step metadata
     step_count: int = 0
@@ -183,7 +188,7 @@ DESIGN PRINCIPLES FOR V2
     4. DAMAGE TAKEN PENALTY MUST BE MILD ENOUGH that the agent is willing
        to trade HP for kills. In a 4v1 fight, taking damage is INEVITABLE.
 
-REWARD BUDGET ANALYSIS (Stage 7, 4 targets, 1200 steps)
+REWARD BUDGET ANALYSIS (Stage 7, up to 4 targets, 800 steps)
 
     Winning episode (kill all 4, agent takes 60% HP damage):
         Damage dealt:     0.25 × 400 (4 targets × 100%)  = +100.0
@@ -462,14 +467,6 @@ class RewardWeights:
     ranged_standing_still_threat: float = -0.02  # Was -0.03
     ranged_stagger_ammo: float = 0.05
 
-    # ── Healer archetype ─────────────────────────────────────────
-    healer_heal_ally: float = 0.15
-    healer_ally_died: float = -2.0
-    healer_apply_buff: float = 0.1
-    healer_maintain_distance: float = 0.005  # Was 0.01. Halved.
-    healer_overheal: float = -0.05
-    healer_reload_heal: float = 0.03
-
     # ── Tank archetype ───────────────────────────────────────────
     tank_absorb_damage: float = 0.1
     tank_body_block: float = 0.005    # Was 0.01. Halved (per-step).
@@ -611,15 +608,10 @@ class CombatRewardFunction:
         # without killing anything" exploit where the agent earns damage_dealt
         # reward without ever focusing a target to 0 HP.
         focus_mult = 1.0
-        if total_damage > 1e-6 and curr.target_alive:
-            # How much of this step's damage went to the selected target?
-            # Use per-target HP tracking from the env.
-            selected_dmg = max(0.0, prev.target_hp - curr.target_hp)
-            # Only count selected_dmg if it's plausible (not from target switch)
-            if selected_dmg <= total_damage + 1e-6:
-                focus_ratio = selected_dmg / total_damage
-            else:
-                focus_ratio = 0.0  # target switch — don't credit
+        if total_damage > 1e-6 and curr.target_id >= 0:
+            # Stable target-ID damage captured before allies/status systems act.
+            selected_dmg = curr.selected_target_damage
+            focus_ratio = min(selected_dmg / total_damage, 1.0)
             focus_mult = 0.5 + focus_ratio  # 0.5 for spread, 1.5 for focused
             info["focus_ratio"] = focus_ratio
 
@@ -628,9 +620,8 @@ class CombatRewardFunction:
         self._episode_damage_dealt += total_damage
 
         # Kill.
-        r_kill = 0.0
-        if prev.target_alive and not curr.target_alive:
-            r_kill = self.w.kill_target
+        kills_this_step = max(0, curr.targets_killed - prev.targets_killed)
+        r_kill = self.w.kill_target * kills_this_step
         info["kill"] = r_kill
 
         # ── Multi-Target Progression ──────────────────────────────
@@ -648,11 +639,11 @@ class CombatRewardFunction:
         # 30%. Creates a "finish them off" gradient. Gated on actual damage
         # to prevent phantom triggers when switching from high-HP to low-HP target.
         r_low_hp = 0.0
-        if (curr.target_alive and curr.target_hp < 0.3
-                and curr.total_damage_all_targets > 0
-                and target_action not in self._targets_seen_low_hp):
+        if (0.0 < curr.reward_target_hp < 0.3
+                and curr.selected_target_damage > 0
+                and curr.target_id not in self._targets_seen_low_hp):
             r_low_hp = self.w.target_low_hp_bonus
-            self._targets_seen_low_hp.add(target_action)
+            self._targets_seen_low_hp.add(curr.target_id)
             info["target_low_hp"] = r_low_hp
 
         # Damage taken.
@@ -1260,8 +1251,6 @@ class CombatRewardFunction:
             return self._melee_rewards(prev, curr, action, info) * ramp
         elif self.archetype == Archetype.RANGED:
             return self._ranged_rewards(prev, curr, action, info) * ramp
-        elif self.archetype == Archetype.HEALER:
-            return self._healer_rewards(prev, curr, action, info) * ramp
         elif self.archetype == Archetype.TANK:
             return self._tank_rewards(prev, curr, action, info) * ramp
         return 0.0
@@ -1353,23 +1342,6 @@ class CombatRewardFunction:
 
         return r
 
-    def _healer_rewards(self, prev, curr, action, info) -> float:
-        r = 0.0
-        _, combat_action, _ = action
-
-        # Maintaining safe distance from threats.
-        safe_distance = curr.active_weapon_range * 0.6
-        if curr.target_distance > safe_distance:
-            r += self.w.healer_maintain_distance
-            info["healer_safe_distance"] = self.w.healer_maintain_distance
-
-        # Ally in danger and healer not helping (placeholder — needs heal action tracking).
-        if curr.ally_in_danger and combat_action == CombatAction.NONE:
-            r -= 0.03
-            info["healer_ignoring_ally"] = -0.03
-
-        return r
-
     def _tank_rewards(self, prev, curr, action, info) -> float:
         r = 0.0
         _, combat_action, _ = action
@@ -1416,8 +1388,8 @@ class CombatRewardFunction:
         # No HP gate: focus fire is ALWAYS good, not just in emergencies.
         if (combat_action == CombatAction.FIRE and prev.can_fire
                 and curr.total_damage_all_targets > 0
-                and curr.ally_target_index >= 0
-                and target_action == curr.ally_target_index):
+                and curr.ally_target_id >= 0
+                and curr.target_id == curr.ally_target_id):
             r += self.w.focus_fire_bonus
             info["focus_fire"] = self.w.focus_fire_bonus
 
@@ -1509,8 +1481,19 @@ def compute_reward_budget(weights: RewardWeights = None,
     comments don't go stale.
     """
     w = weights or RewardWeights()
-    num_targets = 4 if stage >= 7 else 3
-    max_steps = {1: 500, 2: 500, 3: 1000, 4: 400, 5: 1000, 6: 1000, 7: 1200}.get(stage, 1000)
+    # Stages 1-6 have one player target. Stage 7 samples the four equal-team
+    # buckets uniformly, so its expected target count is mean(1, 2, 3, 4).
+    num_targets = 2.5 if stage >= 7 else 1
+    # Keep this analysis helper aligned with make_curriculum_env().
+    max_steps = {
+        1: 500,
+        2: 500,
+        3: 1000,
+        4: 500,
+        5: 600,
+        6: 700,
+        7: 800,
+    }.get(stage, 1000)
 
     # Winning episode: kill all targets, take 60% HP damage.
     # Assume ~150 steps to win.
@@ -1600,7 +1583,7 @@ def get_curriculum_description(stage: int) -> str:
         4: "1v1 multi-weapon vs moving — ammo management + switching",
         5: "1v1 per archetype vs moving — archetype-specific behaviours",
         6: "2v1 enemies vs player — coordination emerges, don't stack",
-        7: "4v4 squad vs party — full group coordination",
+        7: "stratified equal teams (1v1 through 4v4) — full group coordination",
     }
     return descriptions.get(stage, f"Unknown stage {stage}")
 

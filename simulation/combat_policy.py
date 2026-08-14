@@ -20,7 +20,7 @@ ARCHITECTURE
             channel_emb = [unique_emb ‖ hostile_attn ‖ ally_attn ‖ threat_attn]
 
     Stage 3 — Policy Backbone:
-        Concat 3 channels → MLP backbone → GRU → 3 autoregressive heads
+        Concat 3 channels → MLP backbone → GRU → 3 independent heads
 
 OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
 
@@ -39,10 +39,10 @@ OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
     [ 14]       height_above_ground (≈0.176)
     [ 15]       is_action_locked
     [ 16]       action_lock_progress
-    [ 17]       action_lock_reason / 6
+    [ 17]       action_lock_reason / 7
     [ 18]       is_dodging
     [ 19]       dodge_ready
-    [ 20]       invulnerable (= is_dodging)
+    [ 20]       invulnerable
 
     Weapon State (22)
     [ 21]       active_weapon / (n_slots - 1)
@@ -63,7 +63,7 @@ OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
     [ 48]       has_any_ammo
     [ 49]       melee_ready
 
-    Primary Target (24)  ← BUG: live path writes 23, see note below
+    Primary Target (24)
     [ 50]       rel X / 5000
     [ 51]       rel Y / 5000
     [ 52]       dist / 5000
@@ -87,7 +87,7 @@ OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
     [ 70]       mana_fraction   (Phase 1)
     [ 71]       commitment      (Phase 1)
     [ 72]       gap_closer_threat (Phase 1)
-    [ 73]       *** MISSING — live path only advances 23 ***
+    [ 73]       reposition_ready
 
     Hostile Targets (68 = 4 x 17)    _HOSTILE_START = 74
     [ 74.. 90]  slot 0   [ 91..107]  slot 1
@@ -128,7 +128,7 @@ OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
         [+10] is_reloading
         [+11] fire_cooldown / 2
         [+12] target_idx (Phase 1): (idx+1)/5
-        [+13] combat_action (Phase 1): action/7
+        [+13] combat_action (Phase 1): action/8
         [+14] flanking_angle (Phase 1): cos(my→tgt, ally→tgt)
 
     ─── Unique features continued (frame[:, 187:249]) ───
@@ -172,18 +172,6 @@ OBSERVATION LAYOUT (249 per frame — must match NeuralCombatTypes.h)
     Player Patterns (5)              [244..248]
         aggression, evasion, predictability, preferred_range, mana_burn_rate
 
-    BUG — PRIMARY TARGET OFF-BY-ONE (combat_sim.py _build_observation)
-        Live path advances idx by 23. Else branch does idx += 24.
-        When the primary target is alive, every section from Hostile Targets
-        onward is written 1 index earlier than this layout describes. The
-        observation flips alignment when targets die (else path restores the
-        intended layout for that step). This also makes the hardcoded indices
-        in combat_extensions.py (obs[220], [222], [224]) and the encoder
-        constants (_HOSTILE_START=74, _ALLY_START=142, threat slot indices)
-        point to the wrong fields during normal (target-alive) operation.
-        Verify against NeuralCombatComponent.cpp and fix whichever side is
-        wrong before implementing attention masking.
-
 TIER ARCHITECTURE (structured)
     | Tier   | entity | unique | backbone | layers | attn_heads | gru  |
     |--------|--------|--------|----------|--------|------------|------|
@@ -191,10 +179,10 @@ TIER ARCHITECTURE (structured)
     | Small  | 12     | 24     | 48       | 1      | 2          | 48   |
     | Medium | 16     | 32     | 48       | 2      | 4          | 48   |
     | Large  | 16     | 32     | 64       | 2      | 4          | 64   |
-    | XL     | 16     | 32     | 64       | 3      | 4          | 64   |
 """
 
 import os
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
@@ -206,8 +194,9 @@ import torch.nn.functional as F
 
 OBS_SIZE = 249
 MOVEMENT_ACTIONS = 9
-COMBAT_ACTIONS = 8   # Added Dodge (action 7)
+COMBAT_ACTIONS = 9   # 0-7 existing actions; 8 = Reposition
 TARGET_ACTIONS = 5
+REPOSITION_ACTION = 8
 
 DEFAULT_FRAME_STACK = 3
 
@@ -273,19 +262,123 @@ TIER_CONFIGS = {
         backbone_layers=2,
         attention_heads=4,
         gru_hidden=64
-    ),
-    
-    # d_k = 8. High-capacity tier for S7 training.
-    # Widest representations for full 4-target squad combat.
-    "xl": dict(
-        entity_dim=16,
-        unique_dim=32,
-        backbone_hidden=64,
-        backbone_layers=3,
-        attention_heads=4,
-        gru_hidden=64
     )
 }
+
+ACTIVE_TIERS = tuple(TIER_CONFIGS)
+TRAINABLE_ARCHETYPES = ("ranged", "melee", "tank")
+
+# Product-facing difficulty definitions. Architecture stays in TIER_CONFIGS;
+# these labels define what each deployed tier is expected to feel like.
+BEHAVIOR_TIER_DEFINITIONS = {
+    "micro": {
+        "label": "reactive",
+        "description": "Immediate valid responses with limited tactical depth.",
+        "movement_actions": tuple(range(MOVEMENT_ACTIONS)),
+        "combat_actions": (0, 1, 2, 5),
+        "target_actions": (0, 4),
+        "curriculum_stages": tuple(range(1, 8)),
+        "training_focus": "Reactive survival and direct engagement.",
+    },
+    "small": {
+        "label": "competent",
+        "description": "Consistent basic combat, movement, and target selection.",
+        "movement_actions": tuple(range(MOVEMENT_ACTIONS)),
+        "combat_actions": tuple(range(REPOSITION_ACTION)),
+        "target_actions": tuple(range(TARGET_ACTIONS)),
+        "curriculum_stages": tuple(range(1, 8)),
+        "training_focus": "Reliable core combat and basic target switching.",
+    },
+    "medium": {
+        "label": "tactical",
+        "description": "Purposeful positioning, cooldown use, and target switching.",
+        "movement_actions": tuple(range(MOVEMENT_ACTIONS)),
+        "combat_actions": tuple(range(COMBAT_ACTIONS)),
+        "target_actions": tuple(range(TARGET_ACTIONS)),
+        "curriculum_stages": tuple(range(1, 8)),
+        "training_focus": "Threat scoring, cover, flanking, and repositioning.",
+    },
+    "large": {
+        "label": "advanced",
+        "description": "Strong context use and multi-actor tactical decisions.",
+        "movement_actions": tuple(range(MOVEMENT_ACTIONS)),
+        "combat_actions": tuple(range(COMBAT_ACTIONS)),
+        "target_actions": tuple(range(TARGET_ACTIONS)),
+        "curriculum_stages": tuple(range(1, 8)),
+        "training_focus": "Full ally coordination and opponent adaptation.",
+    },
+}
+
+# Per-frame observation visibility is a deployment contract, not a training
+# hint. The mask is applied after optional normalisation and before temporal
+# delta encoding, so PPO, distillation, PyTorch inference, and ONNX all see the
+# same progressively richer information while retaining the 249-float ABI.
+# Ranges are half-open [start, stop) indices into one observation frame.
+_BASIC_HOSTILE_RANGES = tuple(
+    item
+    for slot in range(_HOSTILE_SLOTS)
+    for item in (
+        (_HOSTILE_START + slot * _HOSTILE_SLOT_SIZE,
+         _HOSTILE_START + slot * _HOSTILE_SLOT_SIZE + 7),
+        (_HOSTILE_START + slot * _HOSTILE_SLOT_SIZE + 10,
+         _HOSTILE_START + slot * _HOSTILE_SLOT_SIZE + 12),
+    )
+)
+
+FEATURE_VISIBILITY_RANGES = {
+    # Agent/weapon/archetype and primary-target state, with primary cover
+    # fields [65:67) deliberately withheld. Spatial/nav viability keeps this
+    # reactive tier functional around collision in every scenario stage.
+    "micro": ((0, 65), (67, 74), (187, 195), (211, 220)),
+    # Add basic hostile occupancy/position/HP/LOS/identity/velocity so target
+    # choices 0-3 have observable meaning, plus projectile/can-hit readiness.
+    "small": (
+        ((0, 65), (67, 74))
+        + _BASIC_HOSTILE_RANGES
+        + ((187, 195), (203, 220), (227, 239))
+    ),
+    # Add hostile roster, cover, spawn/leash, and full tactical readiness;
+    # ally slots, group summary, and player patterns remain unavailable.
+    "medium": ((0, 142), (187, 220), (226, 244)),
+    # Full coordination and opponent-pattern context.
+    "large": ((0, OBS_SIZE),),
+}
+
+# Metrics already produced by the shared evaluator. Tier comparisons should be
+# reported in ACTIVE_TIERS order; no speculative numeric thresholds are baked in.
+BEHAVIOR_METRICS = {
+    "primary": "win_rate",
+    "secondary": ("mean_reward", "mean_kills"),
+    "guardrail": "mean_length",
+    "expected_order": ACTIVE_TIERS,
+}
+
+
+def resolve_tier(tier: str) -> str:
+    """Return an active tier name, mapping the removed legacy XL tier."""
+    normalized = str(tier).lower()
+    if normalized == "xl":
+        warnings.warn(
+            "Legacy XL tier is no longer active; mapping it to Large. "
+            "XL-shaped checkpoint tensors that do not fit Large are skipped.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return "large"
+    if normalized not in TIER_CONFIGS:
+        raise ValueError(
+            f"Unknown policy tier '{tier}'. Active tiers: "
+            f"{', '.join(ACTIVE_TIERS)}")
+    return normalized
+
+
+def build_feature_visibility(tier: str) -> torch.Tensor:
+    """Build the immutable 249-feature visibility mask for a policy tier."""
+    tier = resolve_tier(tier)
+    visible = torch.zeros(OBS_SIZE, dtype=torch.bool)
+    for start, stop in FEATURE_VISIBILITY_RANGES[tier]:
+        visible[start:stop] = True
+    return visible
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -448,8 +541,8 @@ class StructuredEncoder(nn.Module):
 class DeltaEncoder(nn.Module):
     """Reshapes flat frame-stacked input and computes temporal deltas.
 
-    Input:  [batch, frame_stack * 215]  (flat, from C++ frame stacking)
-    Output: [batch, 3, 215]  (current, velocity, acceleration)
+    Input:  [batch, frame_stack * 249]  (flat, from C++ frame stacking)
+    Output: [batch, 3, 249]  (current, velocity, acceleration)
 
     Baked into ONNX — C++ feeds raw flat observations unchanged.
     """
@@ -462,7 +555,7 @@ class DeltaEncoder(nn.Module):
     def forward(self, flat_obs: torch.Tensor) -> torch.Tensor:
         batch = flat_obs.shape[0]
 
-        # Reshape: [batch, N*215] → [batch, N, 215]
+        # Reshape: [batch, N*249] → [batch, N, 249]
         frames = flat_obs.view(batch, self.frame_stack, self.obs_size)
 
         # Delta encoding. Frames are oldest-first: [t-2, t-1, t].
@@ -470,7 +563,7 @@ class DeltaEncoder(nn.Module):
         velocity = frames[:, -1] - frames[:, -2]                       # t - (t-1)
         acceleration = frames[:, -1] - 2.0 * frames[:, -2] + frames[:, -3]  # t - 2(t-1) + (t-2)
 
-        # Stack as [batch, 3, 215]: channels = (current, velocity, acceleration).
+        # Stack as [batch, 3, 249]: channels = (current, velocity, acceleration).
         return torch.stack([current, velocity, acceleration], dim=1)
 
 
@@ -490,10 +583,23 @@ class CombatPolicy(nn.Module):
     def __init__(self, frame_stack: int = DEFAULT_FRAME_STACK,
                  entity_dim: int = 16, unique_dim: int = 32,
                  backbone_hidden: int = 96, backbone_layers: int = 2,
-                 attention_heads = 4, gru_hidden = 32):
+                 attention_heads=4, gru_hidden=32, tier: str = "large"):
         super().__init__()
+        self.tier = resolve_tier(tier)
         self.frame_stack = frame_stack
+        self.backbone_hidden = backbone_hidden
         self.gru_hidden = gru_hidden
+        self.register_buffer(
+            "feature_visibility", build_feature_visibility(self.tier))
+        behavior = BEHAVIOR_TIER_DEFINITIONS[self.tier]
+        for name, size in (
+            ("movement", MOVEMENT_ACTIONS),
+            ("combat", COMBAT_ACTIONS),
+            ("target", TARGET_ACTIONS),
+        ):
+            available = torch.zeros(size, dtype=torch.bool)
+            available[list(behavior[f"{name}_actions"])] = True
+            self.register_buffer(f"{name}_availability", available)
 
         # Stage 1: Delta encoding (no params).
         self.delta = DeltaEncoder(frame_stack)
@@ -518,17 +624,13 @@ class CombatPolicy(nn.Module):
         self.gru = nn.GRU(backbone_hidden, gru_hidden, num_layers=1,
                           batch_first=True)
 
-        # Stage 5: Autoregressive policy heads (on GRU output).
-        ACTION_EMBED_DIM = 16
-        self.move_head = layer_init(nn.Linear(gru_hidden, MOVEMENT_ACTIONS), std=0.01)
-
-        self.move_embed = nn.Embedding(MOVEMENT_ACTIONS, ACTION_EMBED_DIM)
-        self.combat_proj = layer_init(nn.Linear(gru_hidden + ACTION_EMBED_DIM, gru_hidden))
-        self.combat_head = layer_init(nn.Linear(gru_hidden, COMBAT_ACTIONS), std=0.01)
-
-        self.combat_embed = nn.Embedding(COMBAT_ACTIONS, ACTION_EMBED_DIM)
-        self.target_proj = layer_init(nn.Linear(gru_hidden + 2 * ACTION_EMBED_DIM, gru_hidden))
-        self.target_head = layer_init(nn.Linear(gru_hidden, TARGET_ACTIONS), std=0.01)
+        # Stage 5: Independent one-pass policy heads on shared GRU features.
+        self.move_head = layer_init(
+            nn.Linear(gru_hidden, MOVEMENT_ACTIONS), std=0.01)
+        self.combat_head = layer_init(
+            nn.Linear(gru_hidden, COMBAT_ACTIONS), std=0.01)
+        self.target_head = layer_init(
+            nn.Linear(gru_hidden, TARGET_ACTIONS), std=0.01)
 
     def init_hidden(self, batch_size: int = 1, device=None):
         """Create zero-initialised hidden state."""
@@ -538,7 +640,12 @@ class CombatPolicy(nn.Module):
 
     def _encode_features(self, obs):
         """Encode obs through delta → structured encoder → backbone."""
-        deltas = self.delta(obs)
+        # Normalization (when present) happens outside this module. Masking
+        # here therefore prevents hidden features' normalized offsets from
+        # leaking into a lower tier and is baked into the exported ONNX graph.
+        frames = obs.reshape(-1, self.frame_stack, OBS_SIZE)
+        frames = frames * self.feature_visibility.to(obs.dtype).view(1, 1, -1)
+        deltas = self.delta(frames.reshape_as(obs))
         batch = deltas.shape[0]
         channels_flat = deltas.view(batch * 3, OBS_SIZE)
         embeddings_flat = self.encoder(channels_flat)
@@ -546,22 +653,14 @@ class CombatPolicy(nn.Module):
         return self.backbone(embeddings)  # [batch, backbone_hidden]
 
     def _heads(self, features):
-        """Autoregressive heads with unmasked argmax conditioning."""
-        m = self.move_head(features)
-        m_action = m.argmax(dim=-1)
-
-        m_emb = self.move_embed(m_action)
-        c_feat = F.gelu(self.combat_proj(
-            torch.cat([features, m_emb], dim=-1)))
-        c = self.combat_head(c_feat)
-        c_action = c.argmax(dim=-1)
-
-        c_emb = self.combat_embed(c_action)
-        t_feat = F.gelu(self.target_proj(
-            torch.cat([features, m_emb, c_emb], dim=-1)))
-        t = self.target_head(t_feat)
-
-        return m, c, t
+        """Return independent logits from the same recurrent features."""
+        movement = self.move_head(features).masked_fill(
+            ~self.movement_availability, -1e8)
+        combat = self.combat_head(features).masked_fill(
+            ~self.combat_availability, -1e8)
+        target = self.target_head(features).masked_fill(
+            ~self.target_availability, -1e8)
+        return movement, combat, target
 
     def forward(self, obs: torch.Tensor, hidden: torch.Tensor = None):
         """Forward pass for ONNX export.
@@ -584,38 +683,52 @@ class CombatPolicy(nn.Module):
         m, c, t = self._heads(features)
         return m, c, t, hidden_out
 
-    def select_actions(self, obs, masks, hidden=None):
-        """Autoregressive masked action selection with GRU."""
-        batch = obs.shape[0]
+    def forward_sequence(self, obs: torch.Tensor,
+                         hidden: torch.Tensor = None):
+        """Run complete episode sequences for recurrent distillation.
+
+        Args:
+            obs: [batch, time, frame_stack * OBS_SIZE]
+            hidden: [1, batch, gru_hidden] or None
+        """
+        batch, steps, input_size = obs.shape
         if hidden is None:
             hidden = self.init_hidden(batch, obs.device)
-
-        backbone_out = self._encode_features(obs)
-        gru_in = backbone_out.unsqueeze(1)
-        gru_out, hidden_out = self.gru(gru_in, hidden)
-        features = gru_out.squeeze(1)
-
-        m_mask, c_mask, t_mask = masks
-
-        m_logits = self.move_head(features)
-        m_logits = m_logits.masked_fill(~m_mask, -1e8)
-        m = m_logits.argmax(dim=-1)
-
-        m_emb = self.move_embed(m)
-        c_feat = F.gelu(self.combat_proj(
-            torch.cat([features, m_emb], dim=-1)))
-        c_logits = self.combat_head(c_feat)
-        c_logits = c_logits.masked_fill(~c_mask, -1e8)
-        c = c_logits.argmax(dim=-1)
-
-        c_emb = self.combat_embed(c)
-        t_feat = F.gelu(self.target_proj(
-            torch.cat([features, m_emb, c_emb], dim=-1)))
-        t_logits = self.target_head(t_feat)
-        t_logits = t_logits.masked_fill(~t_mask, -1e8)
-        t = t_logits.argmax(dim=-1)
-
+        encoded = self._encode_features(
+            obs.reshape(batch * steps, input_size))
+        encoded = encoded.reshape(batch, steps, self.backbone_hidden)
+        features, hidden_out = self.gru(encoded, hidden)
+        m, c, t = self._heads(features)
         return m, c, t, hidden_out
+
+    def select_actions(self, obs, masks, hidden=None):
+        """Select masked greedy actions from independent heads."""
+        m_logits, c_logits, t_logits, hidden_out = self(obs, hidden)
+        m_logits = m_logits.masked_fill(~masks[0], -1e8)
+        c_logits = c_logits.masked_fill(~masks[1], -1e8)
+        t_logits = t_logits.masked_fill(~masks[2], -1e8)
+        return (
+            m_logits.argmax(dim=-1),
+            c_logits.argmax(dim=-1),
+            t_logits.argmax(dim=-1),
+            hidden_out,
+        )
+
+    def sample_actions(self, obs, masks=None, hidden=None):
+        """Sample masked actions independently from one recurrent pass."""
+        m_logits, c_logits, t_logits, hidden_out = self(obs, hidden)
+        if masks is not None:
+            m_logits = m_logits.masked_fill(~masks[0], -1e8)
+            c_logits = c_logits.masked_fill(~masks[1], -1e8)
+            t_logits = t_logits.masked_fill(~masks[2], -1e8)
+        m_dist = torch.distributions.Categorical(logits=m_logits)
+        c_dist = torch.distributions.Categorical(logits=c_logits)
+        t_dist = torch.distributions.Categorical(logits=t_logits)
+        m, c, t = m_dist.sample(), c_dist.sample(), t_dist.sample()
+        log_prob = (
+            m_dist.log_prob(m) + c_dist.log_prob(c) + t_dist.log_prob(t)
+        )
+        return (m, c, t), log_prob, hidden_out
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -624,8 +737,9 @@ class CombatPolicy(nn.Module):
 
 def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPolicy:
     """Create a CombatPolicy for a specific tier."""
+    tier = resolve_tier(tier)
     cfg = TIER_CONFIGS[tier]
-    return CombatPolicy(
+    policy = CombatPolicy(
         frame_stack=frame_stack,
         entity_dim=cfg["entity_dim"],
         unique_dim=cfg["unique_dim"],
@@ -633,7 +747,9 @@ def make_policy(tier: str, frame_stack: int = DEFAULT_FRAME_STACK) -> CombatPoli
         backbone_layers=cfg["backbone_layers"],
         attention_heads=cfg["attention_heads"],
         gru_hidden=cfg["gru_hidden"],
+        tier=tier,
     )
+    return policy
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -660,14 +776,29 @@ def load_teacher_from_checkpoint(
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     frame_stack = ckpt.get("frame_stack", DEFAULT_FRAME_STACK)
-    tier = ckpt.get("tier", "large")
+    raw_tier = ckpt.get("tier", "large")
+    tier = resolve_tier(raw_tier)
 
     print(f"Loading teacher from: {checkpoint_path}")
-    print(f"  Tier: {tier}, Frame stack: {frame_stack}, "
+    print(f"  Tier: {raw_tier} -> {tier}, Frame stack: {frame_stack}, "
           f"Stage: {ckpt.get('stage', '?')}, Step: {ckpt.get('step', '?')}")
 
     teacher = make_policy(tier, frame_stack=frame_stack).to(device)
     source_dict = ckpt.get("full_state_dict", ckpt.get("model_state_dict", {}))
+    legacy_autoregressive = (
+        ckpt.get("policy_contract") != "independent_heads_v1"
+        and any(
+            key.startswith(("move_embed.", "combat_proj.",
+                            "combat_embed.", "target_proj."))
+            for key in source_dict
+        )
+    )
+    if legacy_autoregressive:
+        raise RuntimeError(
+            "Legacy autoregressive checkpoint cannot be used as a teacher "
+            "or exported under the independent_heads_v1 action contract. "
+            "Retrain an independent-head policy; legacy checkpoints may only "
+            "be used as an explicit encoder warm start during PPO training.")
 
     policy_state = teacher.state_dict()
     loaded = 0
@@ -684,20 +815,53 @@ def load_teacher_from_checkpoint(
         dst_key = src_key.replace("actor_encoder.", "encoder.")
         dst_key = dst_key.replace("actor_backbone.", "backbone.")
 
+        if dst_key in {
+                "feature_visibility", "movement_availability",
+                "combat_availability", "target_availability"}:
+            # Tier contracts are derived from current code, never checkpoint
+            # payloads (which may come from another or legacy tier).
+            skipped += 1
+            continue
+
+        if (legacy_autoregressive
+                and dst_key.startswith((
+                    "move_embed.", "combat_proj.", "combat_head.",
+                    "combat_embed.", "target_proj.", "target_head.",
+                ))):
+            skipped += 1
+            continue
+
         if dst_key in policy_state:
             if src_val.shape == policy_state[dst_key].shape:
                 policy_state[dst_key] = src_val
                 loaded += 1
+            elif (not legacy_autoregressive
+                    and dst_key in {
+                        "combat_head.weight", "combat_head.bias"}
+                    and src_val.shape[0] == COMBAT_ACTIONS - 1
+                    and src_val.shape[1:] == policy_state[dst_key].shape[1:]):
+                expanded = policy_state[dst_key].clone()
+                expanded[:COMBAT_ACTIONS - 1] = src_val
+                policy_state[dst_key] = expanded
+                loaded += 1
+                warnings.warn(
+                    "Expanded legacy 8-action combat head to 9 actions; "
+                    "Reposition starts from fresh initial weights.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             else:
                 print(f"  Shape mismatch: {src_key} {src_val.shape} "
                       f"vs {dst_key} {policy_state[dst_key].shape}")
+                skipped += 1
 
     teacher.load_state_dict(policy_state, strict=False)
+    teacher.checkpoint_obs_normalizer_state = ckpt.get("obs_normalizer")
     teacher.eval()
 
     total_policy_keys = len(policy_state)
     print(f"  Loaded {loaded}/{total_policy_keys} policy tensors "
-          f"(skipped {skipped} critic tensors)")
+          f"(skipped {skipped} incompatible/non-policy tensors)")
 
     return teacher
 
@@ -729,6 +893,8 @@ def save_checkpoint(model, optimizer, path, stage, archetype, step,
         "step": step,
         "frame_stack": frame_stack,
         "architecture": "structured",
+        "policy_contract": "independent_heads_v1",
+        "action_dims": (MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS),
     }
 
     if obs_normalizer:
@@ -782,16 +948,32 @@ def export_onnx(model: CombatPolicy, tier: str, output_dir: str,
 
     C++ feeds raw flat observations. Everything else is in the graph.
     """
+    tier = resolve_tier(tier)
     model.eval().cpu()
     input_size = OBS_SIZE * frame_stack
 
+    checkpoint_normalizer = getattr(
+        model, "checkpoint_obs_normalizer_state", None)
     if obs_normalizer is not None:
+        normalizer_mean = obs_normalizer.mean
+        normalizer_var = obs_normalizer.var
+        normalizer_clip = getattr(obs_normalizer, "clip", 5.0)
+        normalizer_epsilon = getattr(obs_normalizer, "epsilon", 1e-8)
+    elif checkpoint_normalizer is not None:
+        normalizer_mean = checkpoint_normalizer["mean"]
+        normalizer_var = checkpoint_normalizer["var"]
+        normalizer_clip = checkpoint_normalizer.get("clip", 5.0)
+        normalizer_epsilon = checkpoint_normalizer.get("epsilon", 1e-8)
+    else:
+        normalizer_mean = None
+
+    if normalizer_mean is not None:
         export_model = NormalizedPolicyWrapper(
             model,
-            mean=obs_normalizer.mean,
-            var=obs_normalizer.var,
-            clip=getattr(obs_normalizer, "clip", 5.0),
-            epsilon=getattr(obs_normalizer, "epsilon", 1e-8),
+            mean=normalizer_mean,
+            var=normalizer_var,
+            clip=normalizer_clip,
+            epsilon=normalizer_epsilon,
         ).eval().cpu()
         print(f"  Baking observation normalizer into ONNX graph")
     else:
@@ -843,43 +1025,93 @@ def verify_export(model: CombatPolicy, onnx_path: str,
     """Verify ONNX output matches PyTorch output."""
     try:
         import onnxruntime as ort
-    except ImportError:
-        print("  Skipping verification (onnxruntime not installed)")
-        return
+    except ImportError as exc:
+        raise RuntimeError(
+            "onnxruntime is required to verify production exports") from exc
 
     model.eval().cpu()
     input_size = OBS_SIZE * frame_stack
-    dummy = torch.randn(1, input_size)
-    dummy_hidden = torch.zeros(1, 1, model.gru_hidden)
 
+    checkpoint_normalizer = getattr(
+        model, "checkpoint_obs_normalizer_state", None)
     if obs_normalizer is not None:
+        normalizer_mean = obs_normalizer.mean
+        normalizer_var = obs_normalizer.var
+        normalizer_clip = getattr(obs_normalizer, "clip", 5.0)
+        normalizer_epsilon = getattr(obs_normalizer, "epsilon", 1e-8)
+    elif checkpoint_normalizer is not None:
+        normalizer_mean = checkpoint_normalizer["mean"]
+        normalizer_var = checkpoint_normalizer["var"]
+        normalizer_clip = checkpoint_normalizer.get("clip", 5.0)
+        normalizer_epsilon = checkpoint_normalizer.get("epsilon", 1e-8)
+    else:
+        normalizer_mean = None
+
+    if normalizer_mean is not None:
         pt_model = NormalizedPolicyWrapper(
             model,
-            mean=obs_normalizer.mean,
-            var=obs_normalizer.var,
-            clip=getattr(obs_normalizer, "clip", 5.0),
-            epsilon=getattr(obs_normalizer, "epsilon", 1e-8),
+            mean=normalizer_mean,
+            var=normalizer_var,
+            clip=normalizer_clip,
+            epsilon=normalizer_epsilon,
         ).eval().cpu()
     else:
         pt_model = model
 
-    with torch.no_grad():
-        pt_m, pt_c, pt_t, pt_h = pt_model(dummy, dummy_hidden)
-
     sess = ort.InferenceSession(onnx_path)
-    ort_out = sess.run(None, {
-        "observation": dummy.numpy(),
-        "hidden_in": dummy_hidden.numpy(),
-    })
+    generator = torch.Generator().manual_seed(12345)
+    pt_hidden = torch.randn(
+        1, 1, model.gru_hidden, generator=generator)
+    ort_hidden = pt_hidden.numpy().copy()
+    max_diffs = [0.0, 0.0, 0.0, 0.0]
+    expected_shapes = (
+        (1, MOVEMENT_ACTIONS),
+        (1, COMBAT_ACTIONS),
+        (1, TARGET_ACTIONS),
+        (1, 1, model.gru_hidden),
+    )
 
-    m_diff = abs(pt_m.numpy() - ort_out[0]).max()
-    c_diff = abs(pt_c.numpy() - ort_out[1]).max()
-    t_diff = abs(pt_t.numpy() - ort_out[2]).max()
-    max_diff = max(m_diff, c_diff, t_diff)
+    # Exercise non-zero hidden input and recurrent chaining, not only one
+    # stateless zero-hidden call.
+    for _ in range(4):
+        observation = torch.randn(
+            1, input_size, generator=generator)
+        with torch.no_grad():
+            pt_out = pt_model(observation, pt_hidden)
+        ort_out = sess.run(None, {
+            "observation": observation.numpy(),
+            "hidden_in": ort_hidden,
+        })
+
+        for index, expected_shape in enumerate(expected_shapes):
+            pt_array = pt_out[index].numpy()
+            ort_array = np.asarray(ort_out[index])
+            if (pt_array.shape != expected_shape
+                    or ort_array.shape != expected_shape):
+                raise RuntimeError(
+                    "ONNX output shape mismatch for output "
+                    f"{index}: PyTorch={pt_array.shape}, "
+                    f"ONNX={ort_array.shape}, expected={expected_shape}")
+            if (not np.isfinite(pt_array).all()
+                    or not np.isfinite(ort_array).all()):
+                raise RuntimeError(
+                    f"Non-finite values in export output {index}")
+            diff = float(np.max(np.abs(pt_array - ort_array)))
+            max_diffs[index] = max(max_diffs[index], diff)
+        pt_hidden = pt_out[3]
+        ort_hidden = ort_out[3]
+
+    m_diff, c_diff, t_diff, h_diff = max_diffs
+    max_diff = max(max_diffs)
 
     status = "PASS" if max_diff < 1e-4 else "FAIL"
     print(f"  Verify {status}: max diff = {max_diff:.6f} "
-          f"(m={m_diff:.6f}, c={c_diff:.6f}, t={t_diff:.6f})")
+          f"(m={m_diff:.6f}, c={c_diff:.6f}, t={t_diff:.6f}, "
+          f"h={h_diff:.6f})")
+    if status == "FAIL":
+        raise RuntimeError(
+            f"ONNX round-trip verification failed (max diff {max_diff:.6f})")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -893,7 +1125,7 @@ if __name__ == "__main__":
         description="Test structured policy and ONNX export")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--tier", type=str, default="large",
-                        choices=TIER_CONFIGS.keys())
+                        choices=ACTIVE_TIERS)
     parser.add_argument("--frame_stack", type=int, default=DEFAULT_FRAME_STACK)
     parser.add_argument("--output_dir", type=str, default="models/test")
     args = parser.parse_args()
@@ -924,8 +1156,10 @@ if __name__ == "__main__":
     if args.checkpoint:
         print(f"\nExtracting teacher from checkpoint...")
         teacher = load_teacher_from_checkpoint(args.checkpoint)
-        teacher_path = export_onnx(teacher, "large_teacher", args.output_dir,
-                                    frame_stack=args.frame_stack)
-        verify_export(teacher, teacher_path, frame_stack=args.frame_stack)
+        teacher_path = export_onnx(
+            teacher, teacher.tier, args.output_dir,
+            frame_stack=teacher.frame_stack)
+        verify_export(
+            teacher, teacher_path, frame_stack=teacher.frame_stack)
 
     print("\nDone.")

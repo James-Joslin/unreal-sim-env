@@ -15,7 +15,7 @@ WHAT IT REPLICATES
     - Line of sight via 2D raycasting against obstacles
     - Cover detection (low vs full height obstacles)
     - Multiple agents and targets
-    - The 215-float observation vector from NeuralCombatTypes.h
+    - The 249-float observation vector from NeuralCombatTypes.h
 
 WHAT IT SIMPLIFIES
     - No navmesh — uses simple AABB collision
@@ -55,16 +55,10 @@ from reward import CombatRewardFunction, CombatState, get_reward_function_for_st
 # ─────────────────────────────────────────────────────────────────
 
 OBS_SIZE = 249
-                # [198-200] 2nd projectile (dist,dirX,dirY)
-                # [201-203] 3rd projectile (dist,dirX,dirY)
-                # [204]     incoming threat count
-                # [205-208] can_hit_target per weapon slot (4)
-                # [209]     total ammo fraction
-                # [210]     targets killed fraction
-                # [211-214] arc clearance per weapon slot (MaxArcableObstacleHeight / 3000)
 MOVEMENT_ACTIONS = 9
-COMBAT_ACTIONS = 8  # Added Dodge (action 7)
+COMBAT_ACTIONS = 9
 TARGET_ACTIONS = 5
+TARGET_SNAPSHOT_INTERVAL = 2.0
 
 DEFENCE_CONSTANT = 100.0
 MIN_DAMAGE = 1.0
@@ -162,6 +156,7 @@ class Archetype(IntEnum):
 class CombatAction(IntEnum):
     NONE = 0; FIRE = 1; RELOAD = 2
     SWITCH_0 = 3; SWITCH_1 = 4; MELEE = 5; BLOCK = 6; DODGE = 7
+    REPOSITION = 8
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -217,7 +212,7 @@ class WeaponSlot:
                 self.is_reloading = False
                 self.reload_remaining = 0.0
         if self.cooldown_remaining > 0:
-            self.cooldown_remaining -= dt
+            self.cooldown_remaining = max(0.0, self.cooldown_remaining - dt)
 
 
 @dataclass
@@ -229,7 +224,7 @@ class MeleeConfig:
 
     def tick(self, dt: float):
         if self.cooldown_remaining > 0:
-            self.cooldown_remaining -= dt
+            self.cooldown_remaining = max(0.0, self.cooldown_remaining - dt)
 
 
 @dataclass
@@ -360,7 +355,8 @@ class SimProjectile:
     hit_actor: object = None          # Set on hit for rendering flash.
     did_hit: bool = False
 
-    def tick(self, dt: float, targets, agent, obstacles, arena_half: float):
+    def tick(self, dt: float, targets, agent, obstacles, arena_half: float,
+             rng=None):
         """Advance projectile one tick. Returns list of (actor, damage, crit) hits."""
         if not self.alive:
             return []
@@ -368,11 +364,14 @@ class SimProjectile:
         self.age += dt
 
         if self.is_arc:
-            return self._tick_arc(dt, targets, agent, obstacles, arena_half)
+            return self._tick_arc(
+                dt, targets, agent, obstacles, arena_half, rng)
         else:
-            return self._tick_straight(dt, targets, agent, obstacles, arena_half)
+            return self._tick_straight(
+                dt, targets, agent, obstacles, arena_half, rng)
 
-    def _tick_straight(self, dt, targets, agent, obstacles, arena_half):
+    def _tick_straight(self, dt, targets, agent, obstacles, arena_half,
+                       rng=None):
         """Physics/beam projectile — straight line travel with swept collision."""
         hits = []
 
@@ -442,12 +441,13 @@ class SimProjectile:
                     dmg, actor.barrier, was_crit = compute_damage(
                         self.damage, self.attack_stat,
                         actor.defence, actor.barrier,
-                        self.crit_chance, self.crit_multiplier)
+                        self.crit_chance, self.crit_multiplier, rng=rng)
                 else:
                     dmg, actor.barrier, was_crit = compute_damage(
                         self.damage, self.attack_stat,
                         actor.defence, actor.barrier,
-                        self.crit_chance, self.crit_multiplier)  # [Audit §5.4]
+                        self.crit_chance, self.crit_multiplier,
+                        rng=rng)  # [Audit §5.4]
 
                 actor.hp -= dmg
                 if actor.hp <= 0:
@@ -462,7 +462,7 @@ class SimProjectile:
 
         return hits
 
-    def _tick_arc(self, dt, targets, agent, obstacles, arena_half):
+    def _tick_arc(self, dt, targets, agent, obstacles, arena_half, rng=None):
         """Arc projectile — follows bezier curve."""
         hits = []
 
@@ -505,7 +505,7 @@ class SimProjectile:
                         dmg, actor.barrier, was_crit = compute_damage(
                             self.damage * falloff, self.attack_stat,
                             actor.defence, actor.barrier,
-                            self.crit_chance, self.crit_multiplier)
+                            self.crit_chance, self.crit_multiplier, rng=rng)
                         actor.hp -= dmg
                         if actor.hp <= 0:
                             actor.hp = 0
@@ -522,7 +522,7 @@ class SimProjectile:
                         dmg, actor.barrier, was_crit = compute_damage(
                             self.damage, self.attack_stat,
                             actor.defence, actor.barrier,
-                            self.crit_chance, self.crit_multiplier)
+                            self.crit_chance, self.crit_multiplier, rng=rng)
                         actor.hp -= dmg
                         if actor.hp <= 0:
                             actor.hp = 0
@@ -561,6 +561,11 @@ class Agent:
     active_weapon: int = 0
     melee: MeleeConfig = field(default_factory=MeleeConfig)
 
+    # Block is a held combat stance until the next executed combat action.
+    is_blocking: bool = False
+    block_defence_bonus: float = 80.0
+    block_movement_multiplier: float = 0.3
+
     # For observation: tracking.
     combat_time: float = 0.0
     targets_hit: set = field(default_factory=set)
@@ -584,6 +589,15 @@ class Agent:
     dodge_cooldown: float = 2.0
     dodge_speed: float = 800.0
     dodge_direction: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
+
+    # Reposition state. Reposition is policy-controlled movement with no
+    # invulnerability and uses the normal CharacterMovement-style collision.
+    is_repositioning: bool = False
+    reposition_remaining: float = 0.0
+    reposition_cooldown_remaining: float = 0.0
+    reposition_duration: float = 0.6
+    reposition_cooldown: float = 3.0
+    reposition_speed_multiplier: float = 1.75
     facing: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0], dtype=np.float32))
 
     # Action lock system (matches C++ NeuralCombatComponent lock).
@@ -594,12 +608,8 @@ class Agent:
     action_lock_duration: float = 0.0   # Total duration of current lock (for progress calc)
     action_lock_reason: int = 0          # Matches C++ EActionLockReason:
                                          # 0=None, 1=Firing, 2=Reloading, 3=Dodging,
-                                         # 4=Melee, 5=Switching, 6=WindUp  [Audit §1.1]
-
-    # Auto-dodge config (matches C++ DodgeComponent autonomous threat detection).
-    auto_dodge_enabled: bool = True
-    auto_dodge_threat_range: float = 300.0   # React to projectiles this close
-    auto_dodge_threat_tta: float = 0.5       # React when TTA < this (seconds)
+                                         # 4=Melee, 5=Switching, 6=WindUp,
+                                         # 7=Repositioning
 
     def hp_fraction(self) -> float:
         return max(0, self.hp / self.max_hp)
@@ -611,6 +621,16 @@ class Agent:
 
     def any_ammo(self) -> bool:
         return any(w.has_ammo() for w in self.weapons)
+
+    def start_blocking(self):
+        if not self.is_blocking:
+            self.defence += self.block_defence_bonus
+            self.is_blocking = True
+
+    def stop_blocking(self):
+        if self.is_blocking:
+            self.defence -= self.block_defence_bonus
+            self.is_blocking = False
 
     def all_ranged_empty(self) -> bool:
         return all(not w.has_ammo() for w in self.weapons if w.is_ranged)
@@ -644,7 +664,19 @@ class Agent:
                 self.is_dodging = False
                 self.dodge_remaining = 0
         if self.dodge_cooldown_remaining > 0:
-            self.dodge_cooldown_remaining -= dt
+            self.dodge_cooldown_remaining = max(
+                0.0, self.dodge_cooldown_remaining - dt)
+
+        # Reposition countdown/cooldown. This is deliberately independent of
+        # dodge: it grants no invulnerability and only changes movement speed.
+        if self.is_repositioning:
+            self.reposition_remaining -= dt
+            if self.reposition_remaining <= 0:
+                self.is_repositioning = False
+                self.reposition_remaining = 0.0
+        if self.reposition_cooldown_remaining > 0:
+            self.reposition_cooldown_remaining = max(
+                0.0, self.reposition_cooldown_remaining - dt)
 
         # Action lock countdown.
         if self.action_lock_remaining > 0:
@@ -656,6 +688,11 @@ class Agent:
     @property
     def is_action_locked(self) -> bool:
         return self.action_lock_remaining > 0
+
+    @property
+    def reposition_ready(self) -> bool:
+        return (not self.is_repositioning
+                and self.reposition_cooldown_remaining <= 0)
 
     @property
     def action_lock_progress(self) -> float:
@@ -893,7 +930,7 @@ class Target:
                 self.velocity = perp * self.strafe_dir * self.max_speed * 0.5
 
         else:  # passive
-            self._random_walk(dt, arena_size)
+            self._random_walk(dt, arena_size, _rng)
             return
 
         self.pos += self.velocity * dt
@@ -1198,6 +1235,7 @@ class CombatEnvConfig:
     target_defence: float = 30.0
     target_speed_fraction: float = 0.6  # how actively targets move (0=stationary, 1=full speed)
     engagement_distance: float = 1500.0
+    squad_size_buckets: Optional[Tuple[int, ...]] = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1222,7 +1260,7 @@ class CombatEnv(gym.Env):
         self.cfg = config or CombatEnvConfig()
         self.render_mode = render_mode
 
-        # Action space: MultiDiscrete [movement(9), combat(7), target(5)].
+        # Action space: MultiDiscrete [movement(9), combat(9), target(5)].
         self.action_space = spaces.MultiDiscrete([
             MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS])
 
@@ -1255,6 +1293,18 @@ class CombatEnv(gym.Env):
         self.threat_table = ThreatTable()  # [Audit §1.3] Damage-based target priority
         self.rng = random.Random()  # [Audit §4.1] Per-env RNG isolation
         self._player_patterns = PlayerPatternTracker()
+        # Immutable action-slot identity published with the current observation.
+        # Observation, mask and the following action must all name the same actor.
+        self._target_action_slots = tuple()
+        self._target_slot_scores = {}
+        self._target_slot_hps = {}
+        self._target_slot_los = {}
+        self._target_snapshot_elapsed = 0.0
+        self._cached_movement_action = 0
+        self.episode_squad_size = 1
+        self._squad_bucket_cursor = 0
+        self._reward_target_hps = None
+        self._reward_targets_killed = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1262,10 +1312,15 @@ class CombatEnv(gym.Env):
             self.rng.seed(seed)  # [Audit §4.2] Propagate seed to per-env RNG
         self.step_count = 0
         self._prev_weapon_index = 0
+        self._cached_movement_action = 0
+        self._reward_target_hps = None
+        self._reward_targets_killed = None
         self.reward_fn.reset()
         self._projectiles = []
         self.threat_table.reset()  # [Audit §1.3]
         self._player_patterns = PlayerPatternTracker()
+
+        self._select_episode_matchup(seed)
 
         # Build arena.
         self._build_arena()
@@ -1278,6 +1333,7 @@ class CombatEnv(gym.Env):
         
         self._spawn_agent()
         self._spawn_targets()          # MOVED BEFORE _prev_target_hps
+        self._publish_target_action_slots()
 
         self._prev_target_hps = {
             t.target_id: t.hp_fraction() for t in self.targets
@@ -1286,7 +1342,11 @@ class CombatEnv(gym.Env):
             1 for ally in getattr(self, 'allies', []) if ally.alive)
 
         obs = self._build_observation()
-        info = {"action_mask": self.build_action_mask()}
+        action_mask = self.build_action_mask()
+        info = {
+            "action_mask": action_mask,
+            "skip_inference": action_mask["skip_inference"],
+        }
         return obs, info
 
     # ═════════════════════════════════════════════════════════════
@@ -1296,8 +1356,9 @@ class CombatEnv(gym.Env):
     def build_action_mask(self):
         """Build validity masks for each action head.
 
-        Returns dict with m_mask, c_mask, t_mask — boolean arrays where
-        True = valid action. Invalid actions get -inf logits in the model.
+        Returns the three boolean head masks plus skip_inference. The scalar
+        is true only when production skips inference/GRU advancement for an
+        action lock; ordinary masked states still run inference.
         Matches C++ NeuralCombatComponent::UpdateActionMask().
         """
         a = self.agent
@@ -1308,6 +1369,21 @@ class CombatEnv(gym.Env):
 
         # Combat action mask.
         c_mask[CombatAction.NONE] = True  # Always valid
+
+        if a and a.is_action_locked:
+            # Production holds the movement command that began the lock and
+            # suppresses both other heads until the lock ends.
+            m_mask[:] = False
+            cached_move = int(np.clip(
+                self._cached_movement_action, 0, MOVEMENT_ACTIONS - 1))
+            m_mask[cached_move] = True
+            t_mask[TARGET_ACTIONS - 1] = True
+            return {
+                "m_mask": m_mask,
+                "c_mask": c_mask,
+                "t_mask": t_mask,
+                "skip_inference": True,
+            }
 
         if a and a.alive and not a.is_action_locked:
             # [1] Fire — weapon ready + has ammo + not switching/dodging/winding
@@ -1341,33 +1417,90 @@ class CombatEnv(gym.Env):
                     and a.dodge_cooldown_remaining <= 0):
                 c_mask[CombatAction.DODGE] = True
 
+            # [8] Reposition readiness is independent of the movement-head
+            # sample, which is drawn from the same one-pass policy output.
+            if a.reposition_ready:
+                c_mask[CombatAction.REPOSITION] = True
+
         # Target mask — only valid if that slot has an alive target.
         # [Audit §1.3] Sort by priority score (not distance) to match
         # C++ ScoredTargets ordering.
         sorted_targets = self._get_sorted_targets()
         for i in range(TARGET_ACTIONS - 1):
-            t_mask[i] = (i < len(sorted_targets))
+            t_mask[i] = (i < len(sorted_targets) and sorted_targets[i].alive)
         t_mask[TARGET_ACTIONS - 1] = True  # Keep current — always valid
 
-        return {"m_mask": m_mask, "c_mask": c_mask, "t_mask": t_mask}
+        return {
+            "m_mask": m_mask,
+            "c_mask": c_mask,
+            "t_mask": t_mask,
+            "skip_inference": False,
+        }
 
     # ═════════════════════════════════════════════════════════════
     #  Step
     # ═════════════════════════════════════════════════════════════
 
     def step(self, action):
-        move_idx, combat_idx, target_idx = action
+        requested_action = tuple(int(value) for value in action)
+        requested_move, requested_combat, requested_target = requested_action
         dt = self.cfg.decision_interval
         self.step_count += 1
 
         # Snapshot pre-action state for reward.
         prev_state = self._build_combat_state()
 
-        # 1. Execute agent actions.
-        #    If action-locked (reload/dodge/wind-up/switch/melee), skip
-        #    combat actions but still allow movement (hold direction).
-        #    This matches C++ where the lock gates inference entirely,
-        #    but in training we still run the NN with combat masked to NONE.
+        # Gym callers can bypass the policy sampler, so enforce the exact mask
+        # consumed with the preceding observation before recording execution.
+        # A rejected head becomes its production-safe no-op.
+        action_mask = self.build_action_mask()
+        move_idx = (
+            requested_move
+            if (0 <= requested_move < MOVEMENT_ACTIONS
+                and action_mask["m_mask"][requested_move])
+            else 0
+        )
+        combat_idx = (
+            requested_combat
+            if (0 <= requested_combat < COMBAT_ACTIONS
+                and action_mask["c_mask"][requested_combat])
+            else int(CombatAction.NONE)
+        )
+        target_idx = (
+            requested_target
+            if (0 <= requested_target < TARGET_ACTIONS
+                and action_mask["t_mask"][requested_target])
+            else TARGET_ACTIONS - 1
+        )
+
+        # 1. Resolve the action that production would actually execute.
+        # During a lock, inference is represented by the cached movement,
+        # combat NONE and target Keep regardless of the newly sampled heads.
+        was_action_locked = self.agent.is_action_locked
+        if was_action_locked:
+            effective_action = (
+                self._cached_movement_action,
+                int(CombatAction.NONE),
+                TARGET_ACTIONS - 1,
+            )
+        else:
+            self._cached_movement_action = move_idx
+            effective_action = (move_idx, combat_idx, target_idx)
+            if combat_idx == CombatAction.BLOCK:
+                self.agent.start_blocking()
+            else:
+                self.agent.stop_blocking()
+            if combat_idx == CombatAction.REPOSITION:
+                if not self._begin_reposition(move_idx):
+                    # Stay-direction Reposition and unavailable attempts are
+                    # true no-ops: no cooldown, no lock, and log combat NONE.
+                    effective_action = (
+                        move_idx, int(CombatAction.NONE), target_idx)
+
+        effective_move, effective_combat, effective_target = effective_action
+
+        # Execute movement. Dodge owns displacement while active; every other
+        # lock holds the cached movement through normal collision.
         if self.agent.is_dodging:
             # During dodge, move in dodge direction (overrides player movement).
             # Sub-step to prevent tunneling through thin walls.
@@ -1389,16 +1522,13 @@ class CombatEnv(gym.Env):
             dodge_new_pos = np.clip(dodge_new_pos, -half + AGENT_BODY_RADIUS,
                                     half - AGENT_BODY_RADIUS)
             self.agent.pos = dodge_new_pos
-        elif self.agent.is_action_locked:
-            # Locked but not dodging — still allow movement and target selection.
-            self._execute_movement(move_idx, dt)
-            self._execute_target_selection(target_idx)
-            # Combat action is skipped (mask should have forced NONE).
         else:
-            # Normal — execute everything.
-            self._execute_movement(move_idx, dt)
-            self._execute_target_selection(target_idx)
-            self._execute_combat(combat_idx, dt)
+            self._execute_movement(effective_move, dt)
+
+        if not was_action_locked:
+            self._execute_target_selection(effective_target)
+            if effective_combat != CombatAction.REPOSITION:
+                self._execute_combat(effective_combat, dt)
 
         # 2. Tick weapon cooldowns/reloads/wind-up/switch/dodge.
         self.agent.tick_weapons(dt)
@@ -1445,24 +1575,32 @@ class CombatEnv(gym.Env):
         if self.render_mode is not None:
             self._projectile_snapshots.append(self._snapshot_projectiles())
 
-        # 4c. Auto-dodge: if an incoming projectile is about to hit and dodge
-        #     is available, trigger an autonomous dodge. Matches C++ DodgeComponent
-        #     which fires OnDodgeStarted → NeuralCombatComponent::SetActionLock.
-        if (self.agent.alive and self.agent.auto_dodge_enabled
-                and not self.agent.is_dodging
-                and self.agent.dodge_cooldown_remaining <= 0
-                and self.cfg.curriculum_stage >= 3):
-            self._try_auto_dodge()
-            
+        # Snapshot agent-caused damage/kills before extension systems (allies,
+        # statuses) mutate the encounter. The hook still runs before reward,
+        # terminal state, observation and mask are finalized.
+        self._reward_target_hps = {
+            target.target_id: target.hp_fraction()
+            for target in self.targets
+        }
+        self._reward_targets_killed = sum(
+            1 for target in self.targets if not target.alive)
+        self._before_transition_finalization(dt)
+
         # 5. Build post-action state.
         curr_state = self._build_combat_state()
+        self._reward_target_hps = None
+        self._reward_targets_killed = None
 
         # 6. Update weapon tracking for next step.
         self._prev_weapon_index = self.agent.active_weapon
 
         # 7. Compute reward.
         reward, info = self.reward_fn.compute(
-            prev_state, (move_idx, combat_idx, target_idx), curr_state)
+            prev_state, effective_action, curr_state)
+        info["executed_action"] = effective_action
+        info["executed_movement_action"] = effective_move
+        info["executed_combat_action"] = effective_combat
+        info["executed_target_action"] = effective_target
 
         # 8. Check done conditions.
         done = False
@@ -1471,7 +1609,7 @@ class CombatEnv(gym.Env):
         if all(not t.alive for t in self.targets):
             done = True
 
-        truncated = self.step_count >= self.cfg.max_steps
+        truncated = not done and self.step_count >= self.cfg.max_steps
 
         if done or truncated:
             end_bonus, end_info = self.reward_fn.compute_episode_end_bonus(
@@ -1496,11 +1634,14 @@ class CombatEnv(gym.Env):
         # Track alive allies for next step's ally_just_died detection.
         self._prev_alive_allies = sum(
             1 for ally in getattr(self, 'allies', []) if ally.alive)
-        
+
+        self._advance_target_action_snapshot(dt)
         obs = self._build_observation()
 
         # Include action mask for next step in info (used by PPO).
-        info["action_mask"] = self.build_action_mask()
+        next_action_mask = self.build_action_mask()
+        info["action_mask"] = next_action_mask
+        info["skip_inference"] = next_action_mask["skip_inference"]
 
         # Auxiliary prediction label: primary target's movement direction
         # discretised into 9 classes (0=stationary, 1-8=compass).
@@ -1523,6 +1664,31 @@ class CombatEnv(gym.Env):
     # ═════════════════════════════════════════════════════════════
     #  Arena Setup
     # ═════════════════════════════════════════════════════════════
+
+    def _select_episode_matchup(self, seed=None):
+        """Select one exactly stratified, deterministic stage-7 bucket."""
+        buckets = self.cfg.squad_size_buckets
+        if buckets:
+            if any(size < 1 for size in buckets):
+                raise ValueError("squad_size_buckets must contain positive sizes")
+            if seed is not None:
+                bucket_index = int(seed) % len(buckets)
+                self._squad_bucket_cursor = (
+                    bucket_index + 1) % len(buckets)
+            else:
+                bucket_index = self._squad_bucket_cursor
+                self._squad_bucket_cursor = (
+                    self._squad_bucket_cursor + 1) % len(buckets)
+            squad_size = int(buckets[bucket_index])
+            self.cfg.num_enemies = squad_size
+            self.cfg.num_targets = squad_size
+            self.episode_squad_size = squad_size
+        else:
+            self.episode_squad_size = (
+                self.cfg.num_enemies
+                if self.cfg.num_enemies == self.cfg.num_targets
+                else 0
+            )
 
     def _build_arena(self):
         """Build a randomised arena with varied obstacle types.
@@ -1634,10 +1800,9 @@ class CombatEnv(gym.Env):
         self.targets = []
         dist = self.cfg.engagement_distance
 
-        # Randomise target count for stages 3+.
+        # Matchup size was fixed or selected as one seeded stage-7 bucket
+        # before arena construction. Never independently randomize party size.
         num = self.cfg.num_targets
-        if self.cfg.curriculum_stage >= 3 and num > 1:
-            num = self.rng.randint(1, num)
 
         behaviours_ranged = ["aggressive", "kiting", "cover_user", "passive"]
 
@@ -1793,10 +1958,29 @@ class CombatEnv(gym.Env):
     #  Action Execution
     # ═════════════════════════════════════════════════════════════
 
+    def _begin_reposition(self, move_idx: int) -> bool:
+        """Start an explicit movement-head-directed Reposition."""
+        a = self.agent
+        if (not a or not a.alive or move_idx == 0
+                or a.is_action_locked or not a.reposition_ready):
+            return False
+
+        a.is_repositioning = True
+        a.reposition_remaining = a.reposition_duration
+        a.reposition_cooldown_remaining = a.reposition_cooldown
+        a.set_action_lock(a.reposition_duration, 7)
+        return True
+
     def _execute_movement(self, move_idx: int, dt: float):
         a = self.agent
         if not a.alive:
             return
+
+        movement_max_speed = a.max_speed
+        if a.is_blocking:
+            movement_max_speed *= a.block_movement_multiplier
+        if a.is_repositioning:
+            movement_max_speed *= a.reposition_speed_multiplier
 
         # Compute desired velocity from movement action.
         if move_idx == 0:
@@ -1818,7 +2002,7 @@ class CombatEnv(gym.Env):
             angle_deg = (move_idx - 1) * 45.0
             angle_rad = math.radians(angle_deg)
             direction = fwd * math.cos(angle_rad) + right * math.sin(angle_rad)
-            desired = direction * a.max_speed
+            desired = direction * movement_max_speed
 
         # ── Acceleration physics (matches UE CharacterMovementComponent) ──
         # Instead of snapping to desired velocity, accelerate toward it.
@@ -1857,10 +2041,10 @@ class CombatEnv(gym.Env):
             else:
                 a.velocity = a.velocity + (diff / diff_mag) * max_change
 
-        # Cap at max speed.
+        # Cap at the active movement mode''s max speed.
         speed = np.linalg.norm(a.velocity)
-        if speed > a.max_speed:
-            a.velocity = a.velocity / speed * a.max_speed
+        if speed > movement_max_speed:
+            a.velocity = a.velocity / speed * movement_max_speed
 
         # ── Position update (sub-stepped to prevent tunneling) ─────
         # With dt=0.2s and speed=400 UU/s, the agent moves 80 UU per
@@ -1913,8 +2097,15 @@ class CombatEnv(gym.Env):
     def _execute_target_selection(self, target_idx: int):
         if target_idx >= TARGET_ACTIONS - 1:
             return  # Keep current.
-        if target_idx < len(self.targets) and self.targets[target_idx].alive:
-            self.current_target_idx = target_idx
+        sorted_targets = self._get_sorted_targets()
+        if target_idx >= len(sorted_targets):
+            return
+
+        selected_id = sorted_targets[target_idx].target_id
+        for raw_idx, target in enumerate(self.targets):
+            if target.target_id == selected_id and target.alive:
+                self.current_target_idx = raw_idx
+                return
 
     def _execute_combat(self, combat_idx: int, dt: float):
         agent = self.agent
@@ -1930,6 +2121,10 @@ class CombatEnv(gym.Env):
             return
 
         action = CombatAction(combat_idx)
+        if action == CombatAction.BLOCK:
+            agent.start_blocking()
+        else:
+            agent.stop_blocking()
         slot = agent.active_slot()
         dist = np.linalg.norm(agent.pos - target.pos)
         has_los = check_los(agent.pos, target.pos, self.obstacles)
@@ -2013,8 +2208,9 @@ class CombatEnv(gym.Env):
                 agent.targets_hit.add(target.target_id)
 
         elif action == CombatAction.BLOCK:
-            # [Audit §1.2] No-op — matches C++ ENeuralCombatAction::Block.
-            pass
+            # The stance was applied before movement so its 0.3 movement scale
+            # and +80 defence both affect this transition.
+            agent.start_blocking()
 
         elif action == CombatAction.DODGE:
             # Model-controlled dodge. The agent chooses WHEN to dodge
@@ -2283,7 +2479,7 @@ class CombatEnv(gym.Env):
         """Advance all projectiles and apply damage on hit."""
         for proj in self._projectiles:
             hits = proj.tick(dt, self.targets, self.agent,
-                             self.obstacles, self._arena_half)
+                             self.obstacles, self._arena_half, rng=self.rng)
 
             # Track agent hits for targets_hit set.
             if proj.is_agent_projectile:
@@ -2300,108 +2496,128 @@ class CombatEnv(gym.Env):
         # Remove dead projectiles.
         self._projectiles = [p for p in self._projectiles if p.alive]
 
-    def _try_auto_dodge(self):
-        """Autonomous dodge triggered by incoming projectile threat.
-        
-        Matches C++ EnemyDodgeComponent::EvaluateThreat() which scans for
-        nearby projectiles and triggers a dodge if one is about to hit.
-        The dodge direction is perpendicular to the incoming projectile,
-        not directly away — this is more effective at avoiding linear shots.
-        """
-        a = self.agent
-        best_threat = None
-        best_tta = a.auto_dodge_threat_tta  # Only react if TTA < threshold
-
-        for p in self._projectiles:
-            if not p.alive or p.is_agent_projectile:
-                continue  # Only dodge enemy projectiles
-
-            # Time to arrival.
-            rel = a.pos - p.pos
-            dist = np.linalg.norm(rel)
-            speed = np.linalg.norm(p.velocity)
-            if speed < 10:
-                continue
-            
-            # Check if projectile is heading roughly toward agent.
-            proj_dir = p.velocity / speed
-            to_agent = rel / max(dist, 1.0)
-            heading_toward = float(np.dot(proj_dir, to_agent))
-            if heading_toward < 0.3:
-                continue  # Not heading our way
-
-            tta = dist / speed
-            if tta < best_tta and dist < a.auto_dodge_threat_range:
-                best_tta = tta
-                best_threat = p
-
-        if best_threat is None:
-            return
-
-        # Trigger dodge perpendicular to the incoming projectile.
-        proj_dir = best_threat.velocity / max(np.linalg.norm(best_threat.velocity), 1.0)
-        perp = np.array([proj_dir[1], -proj_dir[0]], dtype=np.float32)
-        # Randomly pick left or right perpendicular.
-        dodge_dir = perp * self.rng.choice([-1.0, 1.0])
-        # Slight backward component.
-        backward = (a.pos - best_threat.pos)
-        backward = backward / max(np.linalg.norm(backward), 1.0)
-        dodge_dir = dodge_dir * 0.8 + backward * 0.2
-        dodge_dir = dodge_dir / max(np.linalg.norm(dodge_dir), 0.01)
-
-        a.is_dodging = True
-        a.dodge_remaining = a.dodge_duration
-        a.dodge_cooldown_remaining = a.dodge_cooldown
-        a.dodge_direction = dodge_dir
-        a.velocity = np.zeros(2, dtype=np.float32)  # [Audit §3.6] Matches C++ StopMovement()
-        a.set_action_lock(a.dodge_duration + 0.1, 3)  # reason=3 Dodging  [Audit §1.1]
-
     # ═════════════════════════════════════════════════════════════
     #  Target Priority Scoring  [Audit §1.3]
     # ═════════════════════════════════════════════════════════════
 
-    def _score_target(self, t) -> float:
-        """Composite priority score matching C++ EvaluateTargetPriority.
-        
-        Weights mirror FTargetPriorityConfig defaults:
-          PlayerControlledWeight = 10
-          LowHealthWeight        = 20
-          DamageThreatWeight     = 25
-          DistanceWeight         = 30
-          LOSWeight              = 15
-          CurrentTargetBonus     = 5
-          RandomJitter           = 2
-        
-        NOTE: If C++ config is changed via blueprint/data asset, these
-        values must be updated to match. See EnemyPerceptionComponent.cpp
-        EvaluateTargetPriority() and FTargetPriorityConfig.
-        """
+    def _calculate_target_score(self, t) -> float:
+        """Calculate one priority score using the authoritative C++ defaults."""
         a = self.agent
         dist = np.linalg.norm(a.pos - t.pos)
-        max_range = 3000.0
+        max_range = 2000.0
         norm_dist = min(dist / max_range, 1.0)
 
-        pc       = 10.0 if t.is_player_controlled else 0.0
-        low_hp   = (1.0 - t.hp_fraction()) * 20.0
-        threat   = self.threat_table.get_normalised_threat(t.target_id) * 25.0
-        distance = (1.0 - norm_dist) * 30.0
-        los      = 15.0 if check_los(a.pos, t.pos, self.obstacles) else 0.0
-        sticky   = 5.0 if t.target_id == self.current_target_idx else 0.0
-        jitter   = self.rng.uniform(0.0, 2.0)
+        pc_weight = 30.0
+        low_hp_weight = 25.0
+        threat_weight = 20.0
+        distance_weight = 10.0
+        los_weight = 15.0
+
+        if a.archetype == Archetype.RANGED:
+            los_weight *= 1.3
+            distance_weight *= 0.8
+        elif a.archetype == Archetype.MELEE:
+            distance_weight *= 2.5
+            los_weight *= 0.5
+            low_hp_weight *= 1.5
+            pc_weight *= 1.2
+        elif a.archetype == Archetype.HEALER:
+            threat_weight *= 0.3
+            pc_weight *= 0.5
+            distance_weight *= 1.5
+            low_hp_weight *= 0.5
+        elif a.archetype == Archetype.TANK:
+            pc_weight *= 1.5
+            threat_weight *= 1.5
+            distance_weight *= 1.3
+            low_hp_weight *= 0.5
+
+        current = self._current_target()
+        pc = pc_weight if t.is_player_controlled else 0.0
+        low_hp = (1.0 - t.hp_fraction()) * low_hp_weight
+        threat = (
+            self.threat_table.get_normalised_threat(t.target_id)
+            * threat_weight
+        )
+        distance = (1.0 - norm_dist) * distance_weight
+        los = los_weight if check_los(a.pos, t.pos, self.obstacles) else 0.0
+        sticky = 8.0 if current and t.target_id == current.target_id else 0.0
+        jitter = self.rng.uniform(0.0, 10.0)
 
         return pc + low_hp + threat + distance + los + sticky + jitter
 
+    def _publish_target_action_slots(self):
+        """Publish one immutable target slot/value snapshot."""
+        scored = [
+            (self._calculate_target_score(t), t.target_id)
+            for t in self.targets if t.alive
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        scored = scored[:TARGET_ACTIONS - 1]
+        self._target_action_slots = tuple(target_id for _, target_id in scored)
+        self._target_slot_scores = {
+            target_id: score for score, target_id in scored
+        }
+        targets_by_id = {target.target_id: target for target in self.targets}
+        self._target_slot_hps = {
+            target_id: targets_by_id[target_id].hp_fraction()
+            for target_id in self._target_action_slots
+        }
+        self._target_slot_los = {
+            target_id: check_los(
+                self.agent.pos, targets_by_id[target_id].pos, self.obstacles)
+            for target_id in self._target_action_slots
+        }
+        self._target_snapshot_elapsed = 0.0
+
+    def _target_action_snapshot_is_valid(self) -> bool:
+        alive_ids = {
+            target.target_id for target in self.targets if target.alive
+        }
+        if not self._target_action_slots:
+            return not alive_ids
+        return all(
+            target_id in alive_ids for target_id in self._target_action_slots)
+
+    def _ensure_target_action_snapshot_valid(self):
+        """Immediately republish if a cached action slot became unsafe."""
+        if not self._target_action_snapshot_is_valid():
+            self._publish_target_action_slots()
+
+    def _advance_target_action_snapshot(self, dt: float):
+        """Advance the production 2-second target reevaluation cadence."""
+        self._target_snapshot_elapsed += dt
+        if (not self._target_action_snapshot_is_valid()
+                or self._target_snapshot_elapsed + 1e-9
+                >= TARGET_SNAPSHOT_INTERVAL):
+            self._publish_target_action_slots()
+
+    def _score_target(self, t) -> float:
+        """Return the score published with the current observation."""
+        return self._target_slot_scores.get(t.target_id, 0.0)
+
+    def _snapshot_target_hp(self, t) -> float:
+        return self._target_slot_hps.get(t.target_id, t.hp_fraction())
+
+    def _snapshot_target_los(self, t) -> bool:
+        return self._target_slot_los.get(
+            t.target_id, check_los(self.agent.pos, t.pos, self.obstacles))
+
     def _get_sorted_targets(self) -> list:
-        """Return alive targets sorted by priority (highest first).
-        
-        Replaces the old distance-only sort, matching C++ ScoredTargets
-        ordering from EvaluateTargetPriority.
-        """
-        alive = [t for t in self.targets if t.alive]
-        return sorted(alive, key=lambda t: -self._score_target(t))
+        """Resolve the stable target IDs published for this transition."""
+        self._ensure_target_action_snapshot_valid()
+        targets_by_id = {
+            target.target_id: target
+            for target in self.targets if target.alive
+        }
+        return [
+            targets_by_id[target_id]
+            for target_id in self._target_action_slots
+            if target_id in targets_by_id
+        ]
 
     # ═════════════════════════════════════════════════════════════
-    #  Observation Builder (198 floats, matches C++ exactly)
+    #  Observation Builder (249 floats, matches C++ exactly)
     # ═════════════════════════════════════════════════════════════
 
     def _build_observation(self) -> np.ndarray:
@@ -2429,11 +2645,10 @@ class CombatEnv(gym.Env):
         # Action lock state (matches C++ IsActionLocked / ActionLockProgress).
         obs[idx] = 1.0 if a.is_action_locked else 0.0; idx += 1  # 15
         obs[idx] = a.action_lock_progress; idx += 1               # 16
-        # [Audit §1.1] Lock reason: use C++ formula directly:
-        #   static_cast<float>(LockReason) / static_cast<float>(EActionLockReason::WindUp)
+        # Lock reason uses the production enum maximum (Repositioning=7).
         # With corrected enum: None=0, Firing=1, Reloading=2, Dodging=3,
-        #                       Melee=4, Switching=5, WindUp=6
-        obs[idx] = (a.action_lock_reason / 6.0) if a.is_action_locked else 0.0
+        # Melee=4, Switching=5, WindUp=6, Repositioning=7.
+        obs[idx] = (a.action_lock_reason / 7.0) if a.is_action_locked else 0.0
         idx += 1                                               # 17
 
         obs[idx] = 1.0 if a.is_dodging else 0.0; idx += 1     # 18 is dodging
@@ -2512,9 +2727,11 @@ class CombatEnv(gym.Env):
             obs[idx] = target.mana_fraction(); idx += 1
             obs[idx] = target.commitment; idx += 1
             obs[idx] = target.gap_closer_threat(a.pos); idx += 1
-            idx += 1  # [73] padding — C++ allocates 24 but writes 23
         else:
-            idx += 24
+            idx += 23
+        # [73] RepositionReady. Readiness describes the subsystem only; the
+        # combat mask independently suppresses all non-NONE actions while locked.
+        obs[idx] = 1.0 if a.reposition_ready else 0.0; idx += 1
 
         # ── Hostile Targets (68 = 4 × 17) ───────────────────────
         # [Audit §1.3] Sort by priority score, not distance, matching
@@ -2528,8 +2745,8 @@ class CombatEnv(gym.Env):
                 obs[idx] = np.clip(rel[0] / 5000, -1, 1); idx += 1
                 obs[idx] = np.clip(rel[1] / 5000, -1, 1); idx += 1
                 obs[idx] = min(dist / 5000, 1.0); idx += 1
-                obs[idx] = t.hp_fraction(); idx += 1
-                obs[idx] = 1.0 if check_los(a.pos, t.pos, self.obstacles) else 0; idx += 1
+                obs[idx] = self._snapshot_target_hp(t); idx += 1
+                obs[idx] = 1.0 if self._snapshot_target_los(t) else 0; idx += 1
                 obs[idx] = 1.0 if t.is_player_controlled else 0; idx += 1
                 # Facing: C++ ComputeRelativeFacing(Target, Owner), raw dot [-1,1].
                 to_agent = (a.pos - t.pos)
@@ -2585,10 +2802,14 @@ class CombatEnv(gym.Env):
                     ally_facing = ally.velocity / ally_speed
                 else:
                     # Stationary: face toward current target.
-                    if (hasattr(ally, 'target_idx')
-                            and ally.target_idx < len(sorted_targets)
-                            and sorted_targets[ally.target_idx].alive):
-                        to_tgt = sorted_targets[ally.target_idx].pos - ally.pos
+                    ally_target_id = getattr(ally, 'target_id', -1)
+                    ally_target = next(
+                        (candidate for candidate in sorted_targets
+                         if candidate.target_id == ally_target_id),
+                        None,
+                    )
+                    if ally_target is not None:
+                        to_tgt = ally_target.pos - ally.pos
                         to_tgt_d = np.linalg.norm(to_tgt)
                         ally_facing = to_tgt / max(to_tgt_d, 1.0)
                     else:
@@ -2606,7 +2827,11 @@ class CombatEnv(gym.Env):
                 obs[idx] = min(getattr(ally, 'active_weapon_fire_cooldown', 0) / 2.0, 1.0); idx += 1
                 # ── New coordination fields (Phase 1) ────────────
                 # Target index: which hostile is this ally engaging?
-                ally_tgt = getattr(ally, 'target_idx', -1)
+                ally_tgt = next(
+                    (slot_idx for slot_idx, candidate in enumerate(sorted_targets)
+                     if candidate.target_id == getattr(ally, 'target_id', -1)),
+                    -1,
+                )
                 obs[idx] = (ally_tgt + 1) / 5.0; idx += 1  # -1→0, 0→0.2, 3→0.8
                 # Combat action: what is this ally doing?
                 ally_action = getattr(ally, 'current_combat_action', 0)
@@ -2720,9 +2945,9 @@ class CombatEnv(gym.Env):
                 return incoming_threats[idx]
             return (1.0, 1.0, 0.0, 0.0)  # safe defaults
 
-        t1 = _get_threat(0)  # nearest (goes to existing indices 174-177)
-        t2 = _get_threat(1)  # 2nd nearest (goes to new indices 198-200)
-        t3 = _get_threat(2)  # 3rd nearest (goes to new indices 201-203)
+        t1 = _get_threat(0)  # nearest (indices 203-206)
+        t2 = _get_threat(1)  # 2nd nearest (indices 227-229)
+        t3 = _get_threat(2)  # 3rd nearest (indices 230-232)
 
         # Nearest melee threat.
         nearest_melee_dist_n = 1.0
@@ -2740,15 +2965,15 @@ class CombatEnv(gym.Env):
                 melee_d = np.linalg.norm(melee_rel)
                 nearest_melee_dir = melee_rel / max(melee_d, 1.0)
 
-        # Existing threat features (indices 174-181, unchanged).
-        obs[idx] = t1[0]; idx += 1              # 174 proj 1 dist
-        obs[idx] = t1[1]; idx += 1              # 175 proj 1 TTA
-        obs[idx] = t1[2]; idx += 1              # 176 proj 1 dir X
-        obs[idx] = t1[3]; idx += 1              # 177 proj 1 dir Y
-        obs[idx] = nearest_melee_dist_n; idx += 1  # 178 melee dist
-        obs[idx] = nearest_melee_dir[0]; idx += 1  # 179 melee dir X
-        obs[idx] = nearest_melee_dir[1]; idx += 1  # 180 melee dir Y
-        obs[idx] = 1.0 if a.dodge_cooldown_remaining <= 0 else 0; idx += 1  # 181 dodge avail
+        # Threat features (indices 203-210).
+        obs[idx] = t1[0]; idx += 1              # 203 proj 1 dist
+        obs[idx] = t1[1]; idx += 1              # 204 proj 1 TTA
+        obs[idx] = t1[2]; idx += 1              # 205 proj 1 dir X
+        obs[idx] = t1[3]; idx += 1              # 206 proj 1 dir Y
+        obs[idx] = nearest_melee_dist_n; idx += 1  # 207 melee dist
+        obs[idx] = nearest_melee_dir[0]; idx += 1  # 208 melee dir X
+        obs[idx] = nearest_melee_dir[1]; idx += 1  # 209 melee dir Y
+        obs[idx] = 1.0 if a.dodge_cooldown_remaining <= 0 else 0; idx += 1  # 210 dodge avail
 
         # ── Navmesh Viability (9) ────────────────────────────────
         # [Audit §2.2] C++ FVector(1,1,0).GetSafeNormal() = 1/√2, not 0.7.
@@ -2788,17 +3013,17 @@ class CombatEnv(gym.Env):
         obs[idx] = float(np.clip(spawn_dist / leash_norm, 0.0, 1.0)); idx += 1
 
         # ══════════════════════════════════════════════════════════
-        #  NEW FEATURES (indices 198-210, appended after SpawnLeash)
+        #  Extended features (indices 227-239, after SpawnLeash)
         # ══════════════════════════════════════════════════════════
 
         # ── Extended Threat (7) ─────────────────────────────────
-        obs[idx] = t2[0]; idx += 1                             # 198 proj 2 dist
-        obs[idx] = t2[2]; idx += 1                             # 199 proj 2 dir X
-        obs[idx] = t2[3]; idx += 1                             # 200 proj 2 dir Y
-        obs[idx] = t3[0]; idx += 1                             # 201 proj 3 dist
-        obs[idx] = t3[2]; idx += 1                             # 202 proj 3 dir X
-        obs[idx] = t3[3]; idx += 1                             # 203 proj 3 dir Y
-        obs[idx] = min(threat_count / 5.0, 1.0); idx += 1     # 204 threat count
+        obs[idx] = t2[0]; idx += 1                             # 227 proj 2 dist
+        obs[idx] = t2[2]; idx += 1                             # 228 proj 2 dir X
+        obs[idx] = t2[3]; idx += 1                             # 229 proj 2 dir Y
+        obs[idx] = t3[0]; idx += 1                             # 230 proj 3 dist
+        obs[idx] = t3[2]; idx += 1                             # 231 proj 3 dir X
+        obs[idx] = t3[3]; idx += 1                             # 232 proj 3 dir Y
+        obs[idx] = min(threat_count / 5.0, 1.0); idx += 1     # 233 threat count
 
         # ── Weapon Can-Hit-Target (4) ───────────────────────────
         # Per weapon slot: 1.0 if weapon has ammo, target in range,
@@ -2816,14 +3041,14 @@ class CombatEnv(gym.Env):
                 has_path = target_has_los if not w.can_arc else (target_has_los or target_behind_cover)
                 can_hit = w.has_ammo() and in_range and has_path and not w.is_reloading
                 obs[idx] = 1.0 if can_hit else 0.0
-            idx += 1                                           # 205-208
+            idx += 1                                           # 234-237
 
         # ── Total Ammo Fraction (1) ─────────────────────────────
         if len(a.weapons) > 0:
             total_ammo = sum(w.ammo_fraction() for w in a.weapons) / len(a.weapons)
         else:
             total_ammo = 0.0
-        obs[idx] = total_ammo; idx += 1                        # 209
+        obs[idx] = total_ammo; idx += 1                        # 238
 
         # ── Targets Killed Fraction (1) ─────────────────────────
         # Fraction of hostile targets killed in this encounter.
@@ -2838,13 +3063,13 @@ class CombatEnv(gym.Env):
         #     encounter via weak pointers. Targets that leave without dying
         #     (actor destroyed) reduce the total; targets that die increase
         #     the killed count. StopObserving() ends the encounter.
-        total_hostiles = len([t for t in self.targets if not t.is_player_controlled])
-        killed_hostiles = len([t for t in self.targets if not t.is_player_controlled and not t.alive])
-        obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 210
+        total_hostiles = len(self.targets)
+        killed_hostiles = len([t for t in self.targets if not t.alive])
+        obs[idx] = (killed_hostiles / max(total_hostiles, 1)); idx += 1  # 239
 
         # ── Arc Clearance per Weapon (4) ─────────────────────────
         # MaxArcableObstacleHeight per weapon slot, normalised by 3000 UU.
-        # The model compares these against CoverHeight per direction [166-173]
+        # The model compares these against CoverHeight per direction [195-202]
         # to decide which weapons can fire over which cover.
         #   0.0 = weapon cannot arc (or slot empty)
         #   1.0 = unlimited clearance (max_arc_height <= 0 means no limit)
@@ -2957,8 +3182,24 @@ class CombatEnv(gym.Env):
         total_damage_all_targets = 0.0
         for t in self.targets:
             prev_hp = self._prev_target_hps.get(t.target_id, t.hp_fraction())
-            delta = max(0.0, prev_hp - t.hp_fraction())
+            reward_hp = (
+                self._reward_target_hps.get(t.target_id, t.hp_fraction())
+                if self._reward_target_hps is not None
+                else t.hp_fraction()
+            )
+            delta = max(0.0, prev_hp - reward_hp)
             total_damage_all_targets += delta
+
+        reward_target_hp = target.hp_fraction() if target else 0.0
+        selected_target_damage = 0.0
+        if target:
+            if self._reward_target_hps is not None:
+                reward_target_hp = self._reward_target_hps.get(
+                    target.target_id, reward_target_hp)
+            previous_target_hp = self._prev_target_hps.get(
+                target.target_id, reward_target_hp)
+            selected_target_damage = max(
+                0.0, previous_target_hp - reward_target_hp)
 
         return CombatState(
             self_hp=a.hp_fraction(),
@@ -2985,8 +3226,11 @@ class CombatEnv(gym.Env):
             active_optimal_max=slot.optimal_max if slot else 0,
             weapon_switched=(a.active_weapon != self._prev_weapon_index),
             prev_weapon_index=self._prev_weapon_index,
+            target_id=target.target_id if target else -1,
             target_hp=target.hp_fraction() if target else 0,
             target_alive=target.alive if target else False,
+            reward_target_hp=reward_target_hp,
+            selected_target_damage=selected_target_damage,
             target_distance=dist,
             has_los=has_los,
             target_in_range=(dist <= slot.weapon_range) if slot and target else False,
@@ -3018,8 +3262,8 @@ class CombatEnv(gym.Env):
                 sum(1 for ally in getattr(self, 'allies', []) if ally.alive)
                 < self._prev_alive_allies),
             self_between_threat_and_ally=self._check_between_threat_and_ally(),
-            ally_target_index=next(
-                (getattr(ally, 'target_idx', -1)
+            ally_target_id=next(
+                (getattr(ally, 'target_id', -1)
                  for ally in getattr(self, 'allies', []) if ally.alive),
                 -1),
             lowest_ally_hp=min(
@@ -3028,7 +3272,11 @@ class CombatEnv(gym.Env):
                 default=1.0),
             step_count=self.step_count,
             episode_damage_dealt=self.reward_fn._episode_damage_dealt,
-            # Add to the CombatState constructor call:
+            targets_killed=(
+                self._reward_targets_killed
+                if self._reward_targets_killed is not None
+                else sum(1 for t in self.targets if not t.alive)
+            ),
             total_damage_all_targets=total_damage_all_targets,
             targets_attacked=a.targets_hit,
         )
@@ -3041,6 +3289,10 @@ class CombatEnv(gym.Env):
         if 0 <= self.current_target_idx < len(self.targets):
             return self.targets[self.current_target_idx]
         return None
+
+    def _before_transition_finalization(self, dt: float):
+        """Extension hook before reward/done/observation/mask finalization."""
+        return
 
     def _check_between_threat_and_ally(self) -> bool:
         """Check if the agent is positioned between any threat and any low-HP ally.
@@ -3492,10 +3744,10 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
             enemy_hp=100, enemy_defence=20,
             target_hp=150, target_defence=15),
 
-        # Stage 3: Moving targets. Learn tracking, kiting, cover.
+        # Stage 3: Moving target. Learn tracking, kiting, cover.
         # Reduced target HP so scout laser can kill before agent dies.
         3: CombatEnvConfig(
-            num_enemies=1, num_targets=2, num_obstacles=3,
+            num_enemies=1, num_targets=1, num_obstacles=3,
             arena_size=2500.0,
             curriculum_stage=3, archetype=archetype,
             weapon_preset="scout", target_speed_fraction=0.6,
@@ -3510,7 +3762,7 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
         # arc-vs-direct fire, and reload timing against targets it can
         # already kill — before S4 doubles the target HP.
         4: CombatEnvConfig(
-            num_enemies=1, num_targets=2, num_obstacles=8,
+            num_enemies=1, num_targets=1, num_obstacles=8,
             arena_size=3000.0,
             curriculum_stage=4, archetype=archetype,
             weapon_preset="heavy", target_speed_fraction=0.8,
@@ -3533,9 +3785,9 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
         #     enemy_hp=130, enemy_defence=25,
         #     target_hp=100, target_defence=25),
 
-        # Stage 5: Archetype-specific. Full weapon kit, varied targets. Introducing alliess
+        # Stage 5: Archetype-specific 1v1. Full weapon kit, varied target.
         5: CombatEnvConfig(
-            num_enemies=2, num_targets=3, num_obstacles=8,
+            num_enemies=1, num_targets=1, num_obstacles=8,
             arena_size=3000.0,
             curriculum_stage=5, archetype=archetype,
             weapon_preset="heavy",
@@ -3546,9 +3798,9 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
             target_hp=100, target_defence=25),          # 3 targets × ~100 steps each = ~300 steps
                                                         # to kill. 600 = 2× expected completion.
 
-        # Stage 6: Multi-target coordination. More agent HP to survive.
+        # Stage 6: exactly two enemies versus one player.
         6: CombatEnvConfig(
-            num_enemies=2, num_targets=3, num_obstacles=12,
+            num_enemies=2, num_targets=1, num_obstacles=12,
             arena_size=3000.0,
             curriculum_stage=6, archetype=archetype,
             weapon_preset="heavy",
@@ -3558,13 +3810,14 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
             enemy_hp=180, enemy_defence=30,             # time than 1v3 but ally helps with DPS.
             target_hp=150, target_defence=25),          # 3 targets × 150 HP + navigation ≈ 350 steps.
 
-        # Stage 7: Full squad. Agent is tanky to survive 4 targets.
+        # Stage 7: one seeded equal-probability equal-team bucket per episode.
         7: CombatEnvConfig(
-            num_enemies=2, num_targets=4, num_obstacles=16,
+            num_enemies=4, num_targets=4, num_obstacles=16,
             arena_size=4000.0,
             curriculum_stage=7, archetype=archetype,
             weapon_preset="heavy",
             weapon_pool=["heavy", "scout", "sniper", "tank"],
+            squad_size_buckets=(1, 2, 3, 4),
             target_speed_fraction=1.0,
             engagement_distance=2000, max_steps=800,   # [Fix] Was 1200. Biggest arena (4000) but
             enemy_hp=500, enemy_defence=35,             # 4 targets × ~120 steps each ≈ 480 steps.

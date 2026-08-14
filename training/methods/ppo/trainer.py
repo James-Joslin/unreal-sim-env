@@ -17,6 +17,7 @@ The base trainer handles env creation, evaluation, curriculum, and checkpointing
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from typing import Dict, Optional
 
 import numpy as np
@@ -46,8 +47,13 @@ class PPOTrainer(BaseTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.cfg = get_stage_config(self.stage)
-        self.total_timesteps = self.cfg.total_timesteps
+        stage_cfg = get_stage_config(self.stage)
+        if self.total_timesteps is None:
+            self.total_timesteps = stage_cfg.total_timesteps
+        self.cfg = replace(
+            stage_cfg,
+            total_timesteps=self.total_timesteps,
+        )
         self.stage_steps_done = 0
 
     # ═════════════════════════════════════════════════════════════
@@ -61,8 +67,8 @@ class PPOTrainer(BaseTrainer):
         ).to(self.device)
         
         # Group parameters: encoder, backbone, and GRU are representation
-        # layers that need a lower LR for stability. Heads and embeddings
-        # get the full LR since they sit on top.
+        # layers that need a lower LR for stability. Policy/value heads get
+        # the full LR since they sit on top.
         repr_params = []
         head_params = []
         
@@ -199,8 +205,12 @@ class PPOTrainer(BaseTrainer):
 
     def train(self):
         """Full PPO training loop."""
-        self.cfg = get_stage_config(self.stage)
-        self.total_timesteps = self.cfg.total_timesteps
+        # Keep the explicit CLI budget (or the curriculum runner's budget)
+        # while taking all other hyperparameters from the stage config.
+        self.cfg = replace(
+            get_stage_config(self.stage),
+            total_timesteps=self.total_timesteps,
+        )
         cfg = self.cfg
 
         self.build_model()
@@ -302,11 +312,16 @@ class PPOTrainer(BaseTrainer):
         # ── Training state ───────────────────────────────────────
         obs, initial_infos = vec_env.reset()
         current_masks = self.extract_masks(initial_infos)
+        current_skip_inference = self.extract_skip_inference(initial_infos)
         global_step = 0
         episode_count = 0
         scheduler_step = 0
         consecutive_regressions = 0
         self.stage_steps_done = 0
+        self._rollout_hidden = (
+            self.model.init_hidden(self.num_envs, self.device)
+            if gru_hidden > 0 else None
+        )
 
         ep_rewards = np.zeros(self.num_envs, dtype=np.float32)
         ep_lengths = np.zeros(self.num_envs, dtype=np.int32)
@@ -325,10 +340,7 @@ class PPOTrainer(BaseTrainer):
             rollout_episodes = 0
 
             # GRU hidden state per env (persists across steps, resets on done).
-            if gru_hidden > 0 and not hasattr(self, '_rollout_hidden'):
-                self._rollout_hidden = self.model.init_hidden(
-                    self.num_envs, self.device)
-            hidden = getattr(self, '_rollout_hidden', None)
+            hidden = self._rollout_hidden
 
             for step in range(cfg.num_steps):
                 if self.obs_normalizer:
@@ -406,6 +418,13 @@ class PPOTrainer(BaseTrainer):
 
                 # Advance hidden state and reset for done envs.
                 if new_hidden is not None:
+                    # Production skips ONNX while an action lock owns the
+                    # decision. Keep those envs' recurrent state unchanged
+                    # even though the vectorized Python batch was evaluated.
+                    if current_skip_inference.any():
+                        new_hidden = new_hidden.clone()
+                        new_hidden[:, current_skip_inference, :] = \
+                            hidden[:, current_skip_inference, :]
                     hidden = new_hidden
                     for i in range(self.num_envs):
                         if dones[i] or truncateds[i]:
@@ -413,6 +432,7 @@ class PPOTrainer(BaseTrainer):
 
                 # Update masks for NEXT step from env infos.
                 current_masks = self.extract_masks(infos)
+                current_skip_inference = self.extract_skip_inference(infos)
 
                 ep_rewards += rewards
                 ep_lengths += 1
@@ -420,7 +440,11 @@ class PPOTrainer(BaseTrainer):
                 for i in range(self.num_envs):
                     for key, val in infos[i].items():
                         if isinstance(val, (int, float)) and \
-                                key != "terminal_observation":
+                                key not in {
+                                    "terminal_observation",
+                                    "is_win",
+                                    "target_move_label",
+                                }:
                             ep_components[i][key] = \
                                 ep_components[i].get(key, 0.0) + val
 
@@ -668,14 +692,14 @@ class PPOTrainer(BaseTrainer):
                     batch_total=batch_total,
                 )
 
-                if self.check_best_model(eval_stats, global_step):
+                current_wr = eval_stats["win_rate"]
+                has_collapsed = (self.best_eval_win_rate - current_wr) > cfg.revert_min_drop
+                is_new_best = self.check_best_model(eval_stats, global_step)
+                if is_new_best or not has_collapsed:
                     consecutive_regressions = 0
                 else:
                     consecutive_regressions += 1
 
-                current_wr = eval_stats["win_rate"]
-                has_collapsed = (self.best_eval_win_rate - current_wr) > cfg.revert_min_drop
-                
                 if (cfg.revert_on_regression
                         and consecutive_regressions >= cfg.revert_patience
                         and has_collapsed
@@ -695,6 +719,10 @@ class PPOTrainer(BaseTrainer):
                                 if "obs_normalizer" in ckpt:
                                     self.obs_normalizer.load_state_dict(
                                         ckpt["obs_normalizer"])
+                        self._rollout_hidden = (
+                            self.model.init_hidden(self.num_envs, self.device)
+                            if gru_hidden > 0 else None
+                        )
                         consecutive_regressions = 0
 
             # ── Periodic save ────────────────────────────────────
