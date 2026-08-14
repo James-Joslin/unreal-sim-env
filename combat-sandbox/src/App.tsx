@@ -73,6 +73,7 @@ export interface Weapon {
   projSpeed: number;
   optMin?: number;
   optMax?: number;
+  maxArcHeight?: number;
   canArc: boolean;
   ammo: number;
   cdRemain: number;
@@ -1344,6 +1345,9 @@ function buildObservation(
   // explicit unsupported zeroes rather than fabricated approximations.
   idx += 5;
 
+  if (idx !== OBS_SIZE) {
+    throw new Error(`Observation builder wrote ${idx} fields; expected ${OBS_SIZE}.`);
+  }
   return obs;
 }
 
@@ -1430,8 +1434,13 @@ async function loadOnnxModel(file: File) {
 
   // A real dry run validates all independent-head widths before accepting the
   // upload; incompatible legacy models fail here instead of sampling nonsense.
-  await runInference(model, new Float32Array(expectedInput), model.hidden);
-  return model;
+  try {
+    await runInference(model, new Float32Array(expectedInput), model.hidden);
+    return model;
+  } catch (error) {
+    await session.release();
+    throw error;
+  }
 }
 
 async function runInference(model: LoadedModel, obsBuffer: Float32Array, hidden = model.hidden) {
@@ -2089,7 +2098,8 @@ export default function CombatSandbox() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // Support Model upload with automatic C++ Model Tier profile detection
+  // Load only the current named recurrent ONNX contract. Behavioural tier is
+  // selected explicitly because all four tiers share the same tensor shapes.
   const handleModelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
     setStatus("Loading ONNX Model...");
