@@ -2,10 +2,11 @@
 
 ## Dependencies
 
-Core:
+Core development/training environment (Python 3.13):
 
 ```bash
-pip install numpy gymnasium torch tensorboard pandas matplotlib
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 Optional visualisation/export:
@@ -72,28 +73,27 @@ models/v1/Combat_Micro.onnx
 models/v1/Combat_Small.onnx
 models/v1/Combat_Medium.onnx
 models/v1/Combat_Large.onnx
-models/v1/Combat_Xl.onnx
 ```
 
 ## Visual Debugging
 
 ```bash
 # Random/actions-only sim check
-python combat_sim.py --stage 3 --render human
-python combat_sim.py --stage 7 --weapon sniper --render human
-python combat_sim.py --stage 5 --render video --steps 800
+python simulation/combat_sim.py --stage 3 --render human
+python simulation/combat_sim.py --stage 7 --weapon sniper --render human
+python simulation/combat_sim.py --stage 5 --render video --steps 800
 
 # View a checkpoint or ONNX model
-python view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
-python view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
-python view_sim.py --stage 3 --arena_size 4000 --render video
+python simulation/view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
+python simulation/view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
+python simulation/view_sim.py --stage 3 --arena_size 4000 --render video
 ```
 
 Useful `view_sim.py` flags:
 
 ```text
 --stage            Curriculum stage, 1-7
---archetype        ranged, melee, healer, tank
+--archetype        ranged, melee, tank
 --model            .pt checkpoint or .onnx model path
 --render           human, video, none
 --arena_size       Override arena size
@@ -108,10 +108,10 @@ Useful `view_sim.py` flags:
 
 ```bash
 # Export/test a blank tier model
-python combat_policy.py --tier large --frame_stack 3 --output_dir models/test
+python simulation/combat_policy.py --tier large --frame_stack 3 --output_dir models/test
 
 # Extract/export from checkpoint
-python combat_policy.py \
+python simulation/combat_policy.py \
     --checkpoint checkpoints/ppo_stage7_best.pt \
     --output_dir models/test
 ```

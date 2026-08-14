@@ -2,19 +2,19 @@
 
 Training uses seven progressive stages. The best checkpoint from stage N is used to initialise stage N+1.
 
-All stages include per-episode randomisation such as arena size, obstacle layout, target stats, target roles, spawn positions and target behaviours.
+All stages include per-episode randomisation such as arena size, obstacle layout, target stats, target roles, spawn positions and target behaviours. Team composition itself is fixed or stratified as shown below; it is never sampled uniformly from `1..N`.
 
 ## Stage Overview
 
-| Stage | Focus | Summary |
-|---:|---|---|
-| 1 | Melee basics | Close distance and melee a passive target. |
-| 2 | Ranged fire/reload | Learn range positioning, firing and reload cycles. |
-| 3 | Moving targets/cover/flanking | Track moving targets, use cover, kite, flank and avoid degenerate behaviour. |
-| 4 | Multi-weapon management | Switch weapons, manage ammo and use arc fire over cover. |
-| 5 | Archetype behaviours/allies | Learn role-specific behaviour with one allied robot. |
-| 6 | Multi-target coordination | Learn focus fire, target prioritisation and ally protection. |
-| 7 | Full squad combat | Fight a full mixed party using all learned behaviours. |
+| Stage | Composition | Focus | Summary |
+|---:|---|---|---|
+| 1 | 1v1 | Melee basics | Close distance and melee a passive target. |
+| 2 | 1v1 | Ranged fire/reload | Learn range positioning, firing and reload cycles. |
+| 3 | 1v1 | Moving targets/cover/flanking | Track a moving target, use cover, kite, flank and avoid degenerate behaviour. |
+| 4 | 1v1 | Multi-weapon management | Switch weapons, manage ammo and use arc fire over cover. |
+| 5 | 1v1 | Archetype behaviours | Learn role-specific combat without team-size variance. |
+| 6 | 2 enemies vs 1 player | Basic coordination | Introduce one allied robot, focus fire and ally protection. |
+| 7 | Equal teams, 1v1 through 4v4 | Stratified squad combat | Sample the four team-size buckets equally and use all learned behaviours. |
 
 ## Training Budgets
 
@@ -55,14 +55,20 @@ Adds moving targets, obstacles, cover, flanking, aggression shaping and anti-deg
 
 Adds weapon switching and arc-vs-direct fire decisions. The agent must choose between loaded weapons, reloads, range bands and arcing over cover.
 
-### Stage 5 — Archetype Behaviours and Allies
+### Stage 5 — Archetype Behaviours
 
-Introduces role-specific shaping and allied robots. The agent observes allies but does not directly control them.
+Introduces role-specific shaping in a fixed 1v1 encounter. Healer behaviour is
+reserved for a later stage because the current action contract has no heal or
+buff action.
 
 ### Stage 6 — Multi-Target Coordination
 
-Focuses on target prioritisation, ally protection, focus fire and fighting while outnumbered.
+Introduces one allied robot: two allied enemies fight one player. This isolates
+basic focus fire and ally-protection behaviour before larger squads.
 
-### Stage 7 — Full Squad Combat
+### Stage 7 — Stratified Squad Combat
 
-Final deployment-like stage. The agent fights mixed groups with multiple targets, weapons, cover, allies and player-pattern observations.
+Final deployment-like stage. Episodes are split equally across seeded 1v1,
+2v2, 3v3 and 4v4 buckets instead of letting smaller random encounters dominate
+the training distribution. Evaluation should report each bucket separately as
+well as the aggregate.

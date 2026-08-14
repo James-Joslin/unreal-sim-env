@@ -10,7 +10,7 @@ Raw observation [747]
   -> cross-attention over hostiles, allies and threats
   -> MLP backbone
   -> GRU memory
-  -> autoregressive action heads
+  -> independent action heads
   -> ONNX logits for movement, combat and target selection
 ```
 
@@ -53,17 +53,19 @@ Both the PPO actor and exported policy include a GRU on the actor path. This giv
 
 The critic path in PPO does not use the GRU. It estimates value from the current encoded observation, simplifying hidden-state management during PPO updates.
 
-## Autoregressive Action Heads
+## Independent Action Heads
 
-Action logits are produced sequentially:
+Action logits are projected separately from the same recurrent policy features:
 
 ```text
-features -> movement logits -> movement action
-features + movement embedding -> combat logits -> combat action
-features + movement embedding + combat embedding -> target logits
+features -> movement logits [9]
+features -> combat logits [9]
+features -> target logits [5]
 ```
 
-This lets the model learn correlated decisions, such as pairing a strafe direction with a firing action and a matching target.
+All three outputs are produced by one inference call and masked independently.
+This avoids a multi-pass deployment contract; PPO still learns correlations from
+the joint reward and shared policy features.
 
 ## Tier Configurations
 
@@ -73,7 +75,6 @@ This lets the model learn correlated decisions, such as pairing a strafe directi
 | Small | 12 | 24 | 48 | 1 | 2 | 48 |
 | Medium | 16 | 32 | 48 | 2 | 4 | 48 |
 | Large | 16 | 32 | 64 | 2 | 4 | 64 |
-| XL | 16 | 32 | 64 | 3 | 4 | 64 |
 
 ## PPO Actor-Critic
 
@@ -81,7 +82,7 @@ This lets the model learn correlated decisions, such as pairing a strafe directi
 
 - separate actor and critic encoders/backbones
 - actor GRU memory
-- autoregressive action heads
+- independent action heads
 - value head
 - auxiliary target-movement prediction head
 
@@ -93,7 +94,7 @@ Exports produce four outputs:
 
 ```text
 movement_logits  [batch, 9]
-combat_logits    [batch, 8]
+combat_logits    [batch, 9]
 target_logits    [batch, 5]
 hidden_out       [1, batch, gru_hidden]
 ```
@@ -114,4 +115,4 @@ Two modes are supported:
 - **Standard** — teacher rollouts produce observations and logits; students match teacher logits with KL + hard-label losses.
 - **Amplified** — multiple rollouts are run per scenario, the best trajectories are retained, and the policy is trained on reward-weighted winning actions.
 
-The default distillation chain generates Micro, Small, Medium, Large and XL deployment tiers.
+The default distillation chain generates Micro, Small, Medium and Large deployment tiers.
