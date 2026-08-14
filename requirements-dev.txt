@@ -1,0 +1,8 @@
+# Python 3.13-compatible development and training dependencies.
+numpy>=2.1,<3
+gymnasium>=1.0,<2
+torch>=2.6,<3
+pandas>=2.2,<3
+matplotlib>=3.9,<4
+tensorboard>=2.18,<3
+pytest>=8.3,<9

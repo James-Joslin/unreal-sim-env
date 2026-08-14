@@ -1,5 +1,5 @@
 """
-actor_critic.py — PPO ActorCritic with GRU memory + autoregressive heads.
+actor_critic.py — PPO ActorCritic with GRU memory + independent heads.
 
 Architecture:
     obs → DeltaEncoder → StructuredEncoder → backbone → GRU → heads
@@ -12,16 +12,14 @@ actor's hidden state needs to be tracked per agent.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+import warnings
 
 from combat_sim import OBS_SIZE, MOVEMENT_ACTIONS, COMBAT_ACTIONS, TARGET_ACTIONS
 from combat_policy import (
-    TIER_CONFIGS, layer_init,
-    StructuredEncoder, DeltaEncoder,
+    TIER_CONFIGS, BEHAVIOR_TIER_DEFINITIONS, layer_init, resolve_tier,
+    build_feature_visibility, StructuredEncoder, DeltaEncoder,
 )
 
-ACTION_EMBED_DIM = 16
 TARGET_MOVE_CLASSES = 9  # stationary + 8 compass directions
 
 
@@ -38,7 +36,7 @@ def _build_backbone(input_size: int, hidden: int, num_layers: int) -> nn.Sequent
 
 
 class ActorCritic(nn.Module):
-    """PPO actor-critic with GRU memory and autoregressive action heads.
+    """PPO actor-critic with GRU memory and independent action heads.
     
     The actor path: encoder → backbone → GRU → heads.
     The critic path: encoder → backbone → value_head (no GRU).
@@ -46,7 +44,8 @@ class ActorCritic(nn.Module):
 
     def __init__(self, obs_size=OBS_SIZE, hidden=128, tier="large"):
         super().__init__()
-        cfg = TIER_CONFIGS.get(tier, TIER_CONFIGS["large"])
+        tier = resolve_tier(tier)
+        cfg = TIER_CONFIGS[tier]
         entity_dim = cfg["entity_dim"]
         unique_dim = cfg["unique_dim"]
         backbone_hidden = cfg["backbone_hidden"]
@@ -59,6 +58,17 @@ class ActorCritic(nn.Module):
         self.tier = tier
         self.backbone_hidden = backbone_hidden
         self.gru_hidden = gru_hidden
+        self.register_buffer(
+            "feature_visibility", build_feature_visibility(tier))
+        behavior = BEHAVIOR_TIER_DEFINITIONS[tier]
+        for name, size in (
+            ("movement", MOVEMENT_ACTIONS),
+            ("combat", COMBAT_ACTIONS),
+            ("target", TARGET_ACTIONS),
+        ):
+            available = torch.zeros(size, dtype=torch.bool)
+            available[list(behavior[f"{name}_actions"])] = True
+            self.register_buffer(f"{name}_availability", available)
 
         # Delta encoding (no learnable params, shared).
         self.delta = DeltaEncoder(self.frame_stack)
@@ -80,19 +90,11 @@ class ActorCritic(nn.Module):
         self.gru = nn.GRU(backbone_hidden, gru_hidden, num_layers=1,
                           batch_first=True)
 
-        # ── Autoregressive policy heads (on GRU output) ─────────
+        # Independent one-pass heads on the shared recurrent features.
         self.move_head = layer_init(
             nn.Linear(gru_hidden, MOVEMENT_ACTIONS), std=0.01)
-        self.move_embed = nn.Embedding(MOVEMENT_ACTIONS, ACTION_EMBED_DIM)
-
-        self.combat_proj = layer_init(
-            nn.Linear(gru_hidden + ACTION_EMBED_DIM, gru_hidden))
         self.combat_head = layer_init(
             nn.Linear(gru_hidden, COMBAT_ACTIONS), std=0.01)
-        self.combat_embed = nn.Embedding(COMBAT_ACTIONS, ACTION_EMBED_DIM)
-
-        self.target_proj = layer_init(
-            nn.Linear(gru_hidden + 2 * ACTION_EMBED_DIM, gru_hidden))
         self.target_head = layer_init(
             nn.Linear(gru_hidden, TARGET_ACTIONS), std=0.01)
 
@@ -112,7 +114,9 @@ class ActorCritic(nn.Module):
         return torch.zeros(1, batch_size, self.gru_hidden, device=device)
 
     def _encode(self, obs, encoder):
-        deltas = self.delta(obs)
+        frames = obs.reshape(-1, self.frame_stack, OBS_SIZE)
+        frames = frames * self.feature_visibility.to(obs.dtype).view(1, 1, -1)
+        deltas = self.delta(frames.reshape_as(obs))
         batch = deltas.shape[0]
         channels_flat = deltas.view(batch * 3, OBS_SIZE)
         emb_flat = encoder(channels_flat)
@@ -126,17 +130,14 @@ class ActorCritic(nn.Module):
         gru_out, hidden_out = self.gru(gru_in, hidden)
         return gru_out.squeeze(1), hidden_out
 
-    def _autoregressive_logits(self, features, m_action, c_action):
-        m_logits = self.move_head(features)
-        m_emb = self.move_embed(m_action)
-        c_features = F.gelu(self.combat_proj(
-            torch.cat([features, m_emb], dim=-1)))
-        c_logits = self.combat_head(c_features)
-        c_emb = self.combat_embed(c_action)
-        t_features = F.gelu(self.target_proj(
-            torch.cat([features, m_emb, c_emb], dim=-1)))
-        t_logits = self.target_head(t_features)
-        return m_logits, c_logits, t_logits
+    def _policy_logits(self, features):
+        movement = self.move_head(features).masked_fill(
+            ~self.movement_availability, -1e8)
+        combat = self.combat_head(features).masked_fill(
+            ~self.combat_availability, -1e8)
+        target = self.target_head(features).masked_fill(
+            ~self.target_availability, -1e8)
+        return movement, combat, target
 
     # ─── get_action_and_value (training rollout) ─────────────────
 
@@ -149,32 +150,16 @@ class ActorCritic(nn.Module):
         critic_feat = self.critic_backbone(
             self._encode(obs, self.critic_encoder))
 
-        # Head 1: movement.
-        m_logits = self.move_head(actor_feat)
+        m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
         if masks is not None:
             m_logits = m_logits.masked_fill(~masks[0], -1e8)
-        m_dist = torch.distributions.Categorical(logits=m_logits)
-        m_act = m_dist.sample()
-
-        # Head 2: combat conditioned on movement.
-        m_emb = self.move_embed(m_act)
-        c_features = F.gelu(self.combat_proj(
-            torch.cat([actor_feat, m_emb], dim=-1)))
-        c_logits = self.combat_head(c_features)
-        if masks is not None:
             c_logits = c_logits.masked_fill(~masks[1], -1e8)
-        c_dist = torch.distributions.Categorical(logits=c_logits)
-        c_act = c_dist.sample()
-
-        # Head 3: target conditioned on movement + combat.
-        c_emb = self.combat_embed(c_act)
-        t_features = F.gelu(self.target_proj(
-            torch.cat([actor_feat, m_emb, c_emb], dim=-1)))
-        t_logits = self.target_head(t_features)
-        if masks is not None:
             t_logits = t_logits.masked_fill(~masks[2], -1e8)
+        m_dist = torch.distributions.Categorical(logits=m_logits)
+        c_dist = torch.distributions.Categorical(logits=c_logits)
         t_dist = torch.distributions.Categorical(logits=t_logits)
-        t_act = t_dist.sample()
+        m_act, c_act, t_act = (
+            m_dist.sample(), c_dist.sample(), t_dist.sample())
 
         log_prob = (m_dist.log_prob(m_act) + c_dist.log_prob(c_act)
                     + t_dist.log_prob(t_act))
@@ -195,8 +180,7 @@ class ActorCritic(nn.Module):
         critic_feat = self.critic_backbone(
             self._encode(obs, self.critic_encoder))
 
-        m_logits, c_logits, t_logits = self._autoregressive_logits(
-            actor_feat, m_act, c_act)
+        m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
 
         if masks is not None:
             m_logits = m_logits.masked_fill(~masks[0], -1e8)
@@ -215,7 +199,7 @@ class ActorCritic(nn.Module):
 
         return log_prob, entropy, value, pred_logits
 
-    # ─── select_actions (eval — masked autoregressive argmax) ────
+    # ─── select_actions (eval — masked independent argmax) ───────
 
     def select_actions(self, obs, masks, hidden=None):
         batch = obs.shape[0]
@@ -225,25 +209,16 @@ class ActorCritic(nn.Module):
         actor_feat, hidden_out = self._actor_features(obs, hidden)
         m_mask, c_mask, t_mask = masks
 
-        m_logits = self.move_head(actor_feat)
+        m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
         m_logits = m_logits.masked_fill(~m_mask, -1e8)
-        m = m_logits.argmax(dim=-1)
-
-        m_emb = self.move_embed(m)
-        c_features = F.gelu(self.combat_proj(
-            torch.cat([actor_feat, m_emb], dim=-1)))
-        c_logits = self.combat_head(c_features)
         c_logits = c_logits.masked_fill(~c_mask, -1e8)
-        c = c_logits.argmax(dim=-1)
-
-        c_emb = self.combat_embed(c)
-        t_features = F.gelu(self.target_proj(
-            torch.cat([actor_feat, m_emb, c_emb], dim=-1)))
-        t_logits = self.target_head(t_features)
         t_logits = t_logits.masked_fill(~t_mask, -1e8)
-        t = t_logits.argmax(dim=-1)
-
-        return m, c, t, hidden_out
+        return (
+            m_logits.argmax(dim=-1),
+            c_logits.argmax(dim=-1),
+            t_logits.argmax(dim=-1),
+            hidden_out,
+        )
 
     def get_value(self, obs):
         critic_feat = self.critic_backbone(
@@ -257,6 +232,22 @@ class ActorCritic(nn.Module):
 
         if "full_state_dict" in ckpt:
             state = ckpt["full_state_dict"]
+            legacy_autoregressive = (
+                ckpt.get("policy_contract") != "independent_heads_v1"
+                and any(
+                    key.startswith(("move_embed.", "combat_proj.",
+                                    "combat_embed.", "target_proj."))
+                    for key in state
+                )
+            )
+            if legacy_autoregressive:
+                warnings.warn(
+                    "Legacy autoregressive PPO checkpoint detected. Shared "
+                    "representations and movement head are retained; combat "
+                    "and target heads are reinitialised for independent heads.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
             critic_keys = [
                 "critic_encoder", "critic_backbone", "value_head"]
@@ -271,10 +262,38 @@ class ActorCritic(nn.Module):
             loaded = 0
             skipped = 0
             for key in state:
+                if key in {
+                        "feature_visibility", "movement_availability",
+                        "combat_availability", "target_availability"}:
+                    # Keep the destination tier's current deploy contract.
+                    skipped += 1
+                    continue
+                if (legacy_autoregressive
+                        and key.startswith((
+                            "move_embed.", "combat_proj.", "combat_head.",
+                            "combat_embed.", "target_proj.", "target_head.",
+                        ))):
+                    skipped += 1
+                    continue
                 if (key in own_state
                         and state[key].shape == own_state[key].shape):
                     own_state[key] = state[key]
                     loaded += 1
+                elif (not legacy_autoregressive
+                        and key in {
+                            "combat_head.weight", "combat_head.bias"}
+                        and state[key].shape[0] == COMBAT_ACTIONS - 1
+                        and state[key].shape[1:] == own_state[key].shape[1:]):
+                    expanded = own_state[key].clone()
+                    expanded[:COMBAT_ACTIONS - 1] = state[key]
+                    own_state[key] = expanded
+                    loaded += 1
+                    warnings.warn(
+                        "Expanded legacy 8-action combat head to 9 actions; "
+                        "Reposition starts from fresh initial weights.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 else:
                     skipped += 1
             self.load_state_dict(own_state, strict=False)

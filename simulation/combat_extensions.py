@@ -177,7 +177,7 @@ class AlliedRobot:
     attack_damage: float = 12.0
     attack_cooldown: float = 1.0
     attack_cooldown_remaining: float = 0.0
-    target_idx: int = 0  # Which hostile this ally is targeting.
+    target_id: int = -1  # Stable ID of the hostile this ally is targeting.
     current_combat_action: int = 0  # What the ally is doing (for obs encoding).
 
     # ── Properties read by base CombatEnv._build_observation() ──
@@ -205,7 +205,7 @@ class AlliedRobot:
         return max(0, self.hp / self.max_hp)
 
     def tick(self, dt: float, targets: List[Target], obstacles: List[Obstacle],
-             arena_half: float):
+             arena_half: float, rng=None):
         """Simple ally AI: approach nearest alive target and attack."""
         if not self.alive:
             return
@@ -214,16 +214,16 @@ class AlliedRobot:
 
         # Pick nearest alive target.
         best_dist = 99999
-        best_idx = 0
-        for i, t in enumerate(targets):
+        best_target = None
+        for t in targets:
             if t.alive:
                 d = np.linalg.norm(self.pos - t.pos)
                 if d < best_dist:
                     best_dist = d
-                    best_idx = i
+                    best_target = t
 
-        self.target_idx = best_idx
-        target = targets[best_idx] if best_idx < len(targets) and targets[best_idx].alive else None
+        self.target_id = best_target.target_id if best_target else -1
+        target = best_target
 
         if not target:
             self.velocity = np.zeros(2, dtype=np.float32)
@@ -265,7 +265,8 @@ class AlliedRobot:
                 # Track combat action: melee archetype = 5 (Melee), others = 1 (Fire).
                 self.current_combat_action = 5 if self.archetype == 1 else 1
                 dmg, target.barrier, _ = compute_damage(
-                    self.attack_damage, 5.0, target.defence, target.barrier)
+                    self.attack_damage, 5.0, target.defence, target.barrier,
+                    rng=rng)
                 target.hp -= dmg
                 if target.hp <= 0:
                     target.hp = 0
@@ -356,10 +357,29 @@ class CombatEnvExtended(CombatEnv):
 
         # Spawn allies for stages 6+.
         self._spawn_allies()
+        self._prev_alive_allies = sum(
+            1 for ally in self.allies if ally.alive)
 
         # Rebuild observation with extended features.
         obs = self._build_observation()
+        action_mask = self.build_action_mask()
+        info["action_mask"] = action_mask
+        info["skip_inference"] = action_mask["skip_inference"]
         return obs, info
+
+    def build_action_mask(self):
+        """Expose only the action that will actually execute while stunned."""
+        masks = super().build_action_mask()
+        if hasattr(self, "status_effects") and self.status_effects.is_stunned:
+            # Runtime stun masks execution but does not pause neural inference
+            # or recurrent-state advancement unless an action lock also exists.
+            masks["m_mask"][:] = False
+            masks["m_mask"][0] = True
+            masks["c_mask"][:] = False
+            masks["c_mask"][0] = True
+            masks["t_mask"][:] = False
+            masks["t_mask"][4] = True
+        return masks
 
     def step(self, action):
         dt = self.cfg.decision_interval
@@ -377,12 +397,15 @@ class CombatEnvExtended(CombatEnv):
             if t.alive:
                 self.prev_target_velocities[t.target_id] = t.velocity.copy()
 
-        # Run the base step.
-        obs, reward, done, truncated, info = super().step(action)
+        try:
+            return super().step(action)
+        finally:
+            # The returned observation is already materialized; restore the
+            # persistent stat even if transition finalization raises.
+            self.agent.max_speed = original_speed
 
-        # Restore agent speed.
-        self.agent.max_speed = original_speed
-
+    def _before_transition_finalization(self, dt: float):
+        """Apply extended systems before reward/done/obs/mask are finalized."""
         # Tick status effects.
         self.status_effects.tick(dt)
 
@@ -395,28 +418,15 @@ class CombatEnvExtended(CombatEnv):
 
         # Tick allies.
         for ally in self.allies:
-            ally.tick(dt, self.targets, self.obstacles, self._arena_half)
-
-        # [Fix Bug 3] Update _prev_target_hps AFTER allies act. Previously,
-        # the base step set _prev_target_hps before allies ticked, so ally
-        # damage between steps was attributed to the agent's damage_dealt
-        # reward on the next step. This inflated damage_dealt in the 20% of
-        # stage 4 episodes with allies, producing impossible episode_total_damage
-        # values (e.g. 225.70 on a 2-target/200% HP-pool arena).
-        self._prev_target_hps = {
-            t.target_id: t.hp_fraction() for t in self.targets if t.alive
-        }
+            ally.tick(
+                dt, self.targets, self.obstacles, self._arena_half,
+                rng=self.rng)
 
         # Targets may attack allies too.
         self._targets_attack_allies(dt)
 
         # Tick tracked projectiles (observation-only, separate from base SimProjectiles).
         self._tick_tracked_projectiles(dt)
-
-        # Rebuild observation with extended features filled in.
-        obs = self._build_observation()
-
-        return obs, reward, done, truncated, info
 
     # ═════════════════════════════════════════════════════════════
     #  Ally Spawning
@@ -430,18 +440,14 @@ class CombatEnvExtended(CombatEnv):
         # num_enemies includes the agent, so allies = num_enemies - 1.
         num_allies = max(0, self.cfg.num_enemies - 1)
 
-        if stage < 6 and num_allies == 0:
-            # [Fix 5] Removed the 20% random ally spawn for stages 1-5.
-            # Allies created reward noise via the damage attribution bug
-            # (Bug 3), and even after that fix, ally damage in stages
-            # without group rewards (stages < 6) confuses the agent's
-            # credit assignment — it can't distinguish its own damage
-            # from ally damage in the reward signal. Allies are only
-            # meaningful once group coordination rewards activate at stage 6.
+        if stage < 6:
             return
 
         for _ in range(num_allies):
-            arch = self.rng.choices([0, 1, 2, 3], weights=[40, 30, 15, 15], k=1)[0]
+            # Healer remains a compatible enum value but is not part of the
+            # current production spawn pool.
+            arch = self.rng.choices(
+                [0, 1, 3], weights=[40, 30, 15], k=1)[0]
             self.allies.append(self._make_ally(arch))
 
     def _make_ally(self, archetype: int) -> AlliedRobot:
@@ -634,7 +640,9 @@ class CombatEnvExtended(CombatEnv):
                         if check_los(t.pos, target_ally.pos, self.obstacles):
                             dmg, target_ally.barrier, _ = compute_damage(
                                 t.attack_damage, t.attack_stat,
-                                target_ally.defence, 0.0)
+                                target_ally.defence, 0.0,
+                                t.crit_chance, t.crit_multiplier,
+                                rng=self.rng)
                             target_ally.hp -= dmg
                             if target_ally.hp <= 0:
                                 target_ally.hp = 0
@@ -689,17 +697,8 @@ class CombatEnvExtended(CombatEnv):
             obs[61] = np.clip(accel[0] / 2000, -1, 1)
             obs[62] = np.clip(accel[1] / 2000, -1, 1)
 
-        # ── Hostile Targets: priority and threat scores ──────────
-        # Hostile targets start at offset 74, stride 17 per slot.
-        # Priority = +8, Threat = +9 within each slot.
-        sorted_targets = self._get_sorted_targets()
-
-        for si in range(4):
-            base = 74 + si * 17
-            if si < len(sorted_targets):
-                t = sorted_targets[si]
-                obs[base + 8] = self._compute_priority_score(t)  # priority
-                obs[base + 9] = self._compute_threat_level(t)    # threat
+        # Hostile priority/threat values are already written by the base
+        # builder from the same published slots used by the action mask.
 
         # ── Allied Robots ────────────────────────────────────────
         # The base class handles ally observation slots [142..186]
@@ -731,6 +730,7 @@ class CombatEnvExtended(CombatEnv):
         # Does NOT count the agent itself — only other allied robots.
         total = alive_ally_count + alive_hostiles
         obs[224] = (alive_ally_count / total) if total > 0 else 0.5  # [+4] numerical advantage
+        obs[225] = 1.0 if alive_hostiles > alive_ally_count else 0.0  # [+5] outnumbered
 
         return obs
 

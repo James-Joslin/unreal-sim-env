@@ -73,7 +73,9 @@ Rewards arcing over cover when direct LOS is blocked, while preferring direct we
 
 ### Archetype-Specific Behaviour
 
-Adds role-specific nudges for ranged, melee, healer and tank behaviours.
+Adds role-specific nudges for ranged, melee and tank behaviours. Healer rewards
+are intentionally deferred until healing and buff actions have a real runtime
+contract.
 
 ### Ally Coordination
 

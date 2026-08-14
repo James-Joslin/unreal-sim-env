@@ -1,8 +1,8 @@
 import React from "react";
 
 const MOVE_LABELS = ["Hold", "Fwd", "FwdR", "Right", "BackR", "Back", "BackL", "Left", "FwdL"];
-const COMBAT_LABELS = ["None", "Fire", "Reload", "Sw0", "Sw1", "Melee", "Block"];
-const TARGET_LABELS = ["T0", "T1", "T2", "T3", "None"];
+const COMBAT_LABELS = ["None", "Fire", "Reload", "Sw0", "Sw1", "Melee", "Block", "Dodge", "Repos"];
+const TARGET_LABELS = ["T0", "T1", "T2", "T3", "Keep"];
 
 interface Props {
   logits: { m: number[]; c: number[]; t: number[] } | null;

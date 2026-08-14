@@ -100,9 +100,9 @@ class PPOStageConfig:
     entropy_coef_final: float = 0.002
     # Per-head entropy ratios.  The cosine-scheduled entropy_coef sets
     # the overall scale; these ratios control relative weighting across
-    # the three autoregressive heads.  Movement needs the most
+    # the three independent heads. Movement needs the most
     # exploration (9 actions, spatial); target needs the least
-    # (4 actions, focus fire demands commitment).
+    # (5 actions, focus fire demands commitment).
     entropy_move_ratio: float = 1.5
     entropy_combat_ratio: float = 1.0
     entropy_target_ratio: float = 0.5
@@ -179,6 +179,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         update_epochs=5,
         target_kl=0.020,
         total_timesteps=1_500_000,
+        eval_interval=100_000,
         num_eval_episodes=50,
     ),
 
@@ -191,6 +192,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         update_epochs=5,
         target_kl=0.018,
         total_timesteps=6_000_000,
+        eval_interval=100_000,
         num_eval_episodes=80,
         revert_patience=5,
     ),
@@ -204,6 +206,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         update_epochs=5,
         target_kl=0.015,
         total_timesteps=20_000_000,
+        eval_interval=250_000,
         num_eval_episodes=100,
         revert_patience=5,
     ),
@@ -217,6 +220,7 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         update_epochs=6,
         target_kl=0.012,
         total_timesteps=20_000_000,
+        eval_interval=250_000,
         num_eval_episodes=120,
         revert_patience=6,
         revert_min_drop=0.12,
@@ -232,13 +236,14 @@ STAGE_CONFIGS: Dict[int, PPOStageConfig] = {
         update_epochs=6,
         target_kl=0.015,
         total_timesteps=30_000_000,
-        eval_interval=15_000,
+        eval_interval=250_000,
         num_eval_episodes=150,
-        revert_patience=15,
+        revert_patience=4,
         revert_min_drop=0.10,
         entropy_target_ratio=1.5,   # needs MORE target exploration, not less
         entropy_combat_ratio=1.0,
         entropy_move_ratio=1.5,
+        aux_pred_coef=0.0
     ),
 
 }

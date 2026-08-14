@@ -42,6 +42,7 @@ from combat_extensions import make_extended_curriculum_env
 from combat_policy import (
     CombatPolicy, make_policy, save_checkpoint,
     load_teacher_from_checkpoint, TIER_CONFIGS,
+    BEHAVIOR_TIER_DEFINITIONS, TRAINABLE_ARCHETYPES, resolve_tier,
 )
 from frame_stack import (
     FrameStackEnvWrapper, VecFrameStackEnv,
@@ -75,11 +76,15 @@ class BaseTrainer(ABC):
         num_envs: int = DEFAULT_NUM_ENVS,
         bc_checkpoint: Optional[str] = None,
         output_dir: str = "checkpoints",
-        total_timesteps: int = 6_000_000,
+        total_timesteps: Optional[int] = None,
     ):
         self.stage = stage
-        self.archetype = archetype
-        self.tier = tier
+        self.archetype = str(archetype).lower()
+        if self.archetype not in TRAINABLE_ARCHETYPES:
+            raise ValueError(
+                f"Archetype '{archetype}' is not trainable. Active "
+                f"archetypes: {', '.join(TRAINABLE_ARCHETYPES)}")
+        self.tier = resolve_tier(tier)
         self.frame_stack = frame_stack
         self.num_envs = num_envs
         self.bc_checkpoint = bc_checkpoint
@@ -189,6 +194,16 @@ class BaseTrainer(ABC):
             torch.from_numpy(c).to(self.device),
             torch.from_numpy(t).to(self.device),
         )
+
+    def extract_skip_inference(self, infos_list):
+        """Return per-env flags for production-equivalent policy skipping."""
+        skip = np.array([
+            bool(info.get(
+                "skip_inference",
+                info.get("action_mask", {}).get("skip_inference", False)))
+            for info in infos_list
+        ], dtype=bool)
+        return torch.from_numpy(skip).to(self.device)
 
     def run_eval(self, global_step: int, eval_episodes: int = 50,
                  eval_base_seed: int = 42, batch_total: int = 0) -> Dict:
@@ -301,6 +316,7 @@ class BaseTrainer(ABC):
     def print_setup(self):
         """Print training configuration summary."""
         tier_cfg = TIER_CONFIGS[self.tier]
+        behavior = BEHAVIOR_TIER_DEFINITIONS[self.tier]
         print(f"\n{'='*60}")
         print(f"{self.method_name.upper()} Training — Stage {self.stage}, "
               f"Archetype {self.archetype}")
@@ -310,7 +326,16 @@ class BaseTrainer(ABC):
               f"(entity={tier_cfg['entity_dim']}, "
               f"unique={tier_cfg['unique_dim']}, "
               f"backbone={tier_cfg['backbone_hidden']}"
-              f"×{tier_cfg['backbone_layers']})")
+               f"×{tier_cfg['backbone_layers']})")
+        print(f"Behavior: {behavior['label']} — {behavior['description']}")
+        print(f"Available actions (movement/combat/target): "
+              f"{len(behavior['movement_actions'])}/"
+              f"{len(behavior['combat_actions'])}/"
+              f"{len(behavior['target_actions'])}; "
+              f"curriculum stages "
+              f"{behavior['curriculum_stages'][0]}-"
+              f"{behavior['curriculum_stages'][-1]}")
+        print(f"Training focus: {behavior['training_focus']}")
         print(f"Frame stack: {self.frame_stack}, "
               f"input size: {self.input_size}")
         print(f"Envs: {self.num_envs}")
@@ -322,12 +347,12 @@ class BaseTrainer(ABC):
         if self.writer is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_dir = (f"runs/{self.method_name}_s{self.stage}"
-                            f"_{self.archetype}_{timestamp}")
+                            f"_{self.archetype}_{self.tier}_{timestamp}")
             self.writer = SummaryWriter(self.log_dir)
 
     # ─── Curriculum Runner ───────────────────────────────────────
     def run_curriculum(self):
-        """Run all 7 curriculum stages sequentially.
+        """Run this tier's supported curriculum stages sequentially.
 
         Each stage trains from the previous stage's best checkpoint.
         The curriculum timesteps come from default_curriculum_timesteps()
@@ -335,10 +360,13 @@ class BaseTrainer(ABC):
         """
         stage_timesteps = self.default_curriculum_timesteps()
         current_checkpoint = self.bc_checkpoint
+        curriculum_stages = BEHAVIOR_TIER_DEFINITIONS[
+            self.tier]["curriculum_stages"]
 
-        for stage in range(1, 8):
+        for stage in curriculum_stages:
             print(f"\n{'='*60}")
-            print(f"CURRICULUM STAGE {stage}/7 ({self.method_name.upper()})")
+            print(f"CURRICULUM STAGE {stage}/{curriculum_stages[-1]} "
+                  f"({self.method_name.upper()} {self.tier.upper()})")
             print(f"{'='*60}")
 
             # Reconfigure for this stage.
@@ -356,7 +384,7 @@ class BaseTrainer(ABC):
                 self.writer.close()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_dir = (f"runs/{self.method_name}_s{stage}_"
-                            f"{self.archetype}_{timestamp}")
+                            f"{self.archetype}_{self.tier}_{timestamp}")
             self.writer = SummaryWriter(self.log_dir)
 
             self.train()
@@ -391,18 +419,29 @@ class BaseTrainer(ABC):
         winrates = [h[2] for h in hist]
         progress = np.linspace(0, 1, len(hist))
 
+        r = np.array(rewards)
+        w = np.array(winrates)
+        if np.std(r) > 1e-12 and np.std(w) > 1e-12:
+            corr = float(np.corrcoef(r, w)[0, 1])
+        else:
+            corr = 0.0
+        self.writer.add_scalar("eval/reward_winrate_corr", corr, global_step)
+
+        # Scalars carry the useful signal. Render the expensive diagnostic
+        # figure initially and then every tenth evaluation.
+        if len(hist) != 3 and len(hist) % 10 != 0:
+            return
+
         fig, ax = plt.subplots(1, 1, figsize=(6, 1.75), dpi=250)
         ax.scatter(rewards, winrates, c=progress, cmap="viridis",
                    s=20, edgecolors="white", linewidths=0.5, zorder=3)
 
         # Regression line.
-        r = np.array(rewards)
-        w = np.array(winrates)
-        coeffs = np.polyfit(r, w, 1)
-        r_sorted = np.sort(r)
-        ax.plot(r_sorted, np.poly1d(coeffs)(r_sorted),
-                "--", color="red", alpha=0.6, linewidth=1.5)
-        corr = np.corrcoef(r, w)[0, 1]
+        if np.std(r) > 1e-12:
+            coeffs = np.polyfit(r, w, 1)
+            r_sorted = np.sort(r)
+            ax.plot(r_sorted, np.poly1d(coeffs)(r_sorted),
+                    "--", color="red", alpha=0.6, linewidth=1.5)
 
         ax.set_xlabel("Reward", fontsize=10, fontweight="bold")
         ax.set_ylabel("Win Rate", fontsize=10, fontweight="bold")
@@ -414,4 +453,3 @@ class BaseTrainer(ABC):
 
         self.writer.add_figure(
             "eval/reward_vs_winrate", fig, global_step, close=True)
-        self.writer.add_scalar("eval/reward_winrate_corr", corr, global_step)

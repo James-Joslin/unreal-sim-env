@@ -16,34 +16,36 @@ const OBS_GROUPS = [
   { name: "Archetype", start: 43, end: 50, color: "#f0883e", labels: [
     "Arch0", "Arch1", "Arch2", "Arch3", "OptRange", "AnyAmmo", "MeleeReady",
   ]},
-  { name: "Primary Target", start: 50, end: 70, color: "#f85149", labels: [
+  { name: "Primary Target", start: 50, end: 74, color: "#f85149", labels: [
     "RelX", "RelY", "Dist", "HP%", "InRange", "HasLOS", "InSightCone", "SelfFacing",
     "TargetFacingMe", "VelX", "VelY", "AccelX", "AccelY",
-    "AngSize", "IsPlayer", "BehindLowCover", "CoverHeight", "InMelee", "ClosingRate", "Pad",
+    "AngSize", "IsPlayer", "BehindLowCover", "CoverHeight", "InMelee", "ClosingRate",
+    "CharacterType", "Mana", "Commitment", "GapCloser", "RepositionReady",
   ]},
-  { name: "Hostile 0", start: 70, end: 83, color: "#da3633" },
-  { name: "Hostile 1", start: 83, end: 96, color: "#da3633" },
-  { name: "Hostile 2", start: 96, end: 109, color: "#da3633" },
-  { name: "Hostile 3", start: 109, end: 122, color: "#da3633" },
-  { name: "Ally 0", start: 122, end: 134, color: "#3fb950" },
-  { name: "Ally 1", start: 134, end: 146, color: "#3fb950" },
-  { name: "Ally 2", start: 146, end: 158, color: "#3fb950" },
-  { name: "Spatial Ring", start: 158, end: 166, color: "#79c0ff" },
-  { name: "Cover Height", start: 166, end: 174, color: "#a5d6ff" },
-  { name: "Threat Sense", start: 174, end: 182, color: "#ff7b72" },
-  { name: "Navmesh", start: 182, end: 191, color: "#d2a8ff" },
-  { name: "Group Summary", start: 191, end: 197, color: "#8b949e" },
-  { name: "Spawn/Leash", start: 197, end: 198, color: "#8b949e" },
-  { name: "Ext Threat", start: 198, end: 205, color: "#ff7b72", labels: [
+  { name: "Hostile 0", start: 74, end: 91, color: "#da3633" },
+  { name: "Hostile 1", start: 91, end: 108, color: "#da3633" },
+  { name: "Hostile 2", start: 108, end: 125, color: "#da3633" },
+  { name: "Hostile 3", start: 125, end: 142, color: "#da3633" },
+  { name: "Ally 0", start: 142, end: 157, color: "#3fb950" },
+  { name: "Ally 1", start: 157, end: 172, color: "#3fb950" },
+  { name: "Ally 2", start: 172, end: 187, color: "#3fb950" },
+  { name: "Spatial Ring", start: 187, end: 195, color: "#79c0ff" },
+  { name: "Cover Height", start: 195, end: 203, color: "#a5d6ff" },
+  { name: "Threat Sense", start: 203, end: 211, color: "#ff7b72" },
+  { name: "Navmesh", start: 211, end: 220, color: "#d2a8ff" },
+  { name: "Group Summary", start: 220, end: 226, color: "#8b949e" },
+  { name: "Spawn/Leash", start: 226, end: 227, color: "#8b949e" },
+  { name: "Ext Threat", start: 227, end: 234, color: "#ff7b72", labels: [
     "Proj2Dist", "Proj2DirX", "Proj2DirY", "Proj3Dist", "Proj3DirX", "Proj3DirY", "ThreatCount",
   ]},
-  { name: "Can Hit", start: 205, end: 209, color: "#ffa657", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
-  { name: "Ammo/Kills", start: 209, end: 211, color: "#8b949e", labels: ["TotalAmmo", "KillFrac"] },
-  { name: "Arc Clearance", start: 211, end: 215, color: "#d2a8ff", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
+  { name: "Can Hit", start: 234, end: 238, color: "#ffa657", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
+  { name: "Ammo/Kills", start: 238, end: 240, color: "#8b949e", labels: ["TotalAmmo", "KillFrac"] },
+  { name: "Arc Clearance", start: 240, end: 244, color: "#d2a8ff", labels: ["Slot0", "Slot1", "Slot2", "Slot3"] },
+  { name: "Player Patterns", start: 244, end: 249, color: "#bc8cff", labels: ["Aggression", "Evasion", "Predictability", "PreferredRange", "ManaBurn"] },
 ];
 
-const HOSTILE_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "HasLOS", "IsPlayer", "FacingMe", "Score", "Threat", "VelX", "VelY", "FacingDot"];
-const ALLY_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "Ammo", "InCombat", "Dodging", "Archetype", "VelX", "VelY", "TgtSlot"];
+const HOSTILE_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "HasLOS", "IsPlayer", "FacingMe", "Score", "Threat", "VelX", "VelY", "TargetingMe", "CharacterType", "Mana", "Commitment", "GapCloser"];
+const ALLY_LABELS = ["Alive", "RelX", "RelY", "Dist", "HP%", "HasLOS", "VelX", "VelY", "FacingMe", "Ammo", "Reloading", "FireCd", "TgtSlot", "CombatAction", "FlankAngle"];
 
 interface Props {
   obs: Float32Array | null;
@@ -91,7 +93,7 @@ function ObsValue({ value, prevValue, label, idx }: { value: number; prevValue: 
 
 export function ObservationGroupInspector({ obs }: Props) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const prevObsRef = useRef<Float32Array>(new Float32Array(215));
+  const prevObsRef = useRef<Float32Array>(new Float32Array(249));
 
   useEffect(() => {
     if (obs) {
@@ -125,7 +127,7 @@ export function ObservationGroupInspector({ obs }: Props) {
   return (
     <div style={{ background: "#161b22", borderRadius: 6, border: "1px solid #21262d", padding: 10 }}>
       <div style={{ fontSize: 11, fontWeight: 700, color: "#79c0ff", marginBottom: 6 }}>
-        🔬 Observation Inspector <span style={{ fontWeight: 400, fontSize: 9, color: "#8b949e" }}>(215 features)</span>
+        🔬 Observation Inspector <span style={{ fontWeight: 400, fontSize: 9, color: "#8b949e" }}>(249 features)</span>
       </div>
       {OBS_GROUPS.map((group) => {
         const expanded = expandedGroups.has(group.name);

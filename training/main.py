@@ -33,7 +33,9 @@ import argparse
 import os
 import sys
 
-from combat_policy import TIER_CONFIGS
+from combat_policy import (
+    ACTIVE_TIERS, BEHAVIOR_TIER_DEFINITIONS, TRAINABLE_ARCHETYPES,
+)
 
 from training.methods import METHOD_REGISTRY, get_trainer_class
 
@@ -64,19 +66,22 @@ Examples:
         "--stage", type=int, default=3,
         help="Curriculum stage (1-7)")
     parser.add_argument(
-        "--archetype", type=str, default="ranged")
+        "--archetype", type=str, default="ranged",
+        choices=TRAINABLE_ARCHETYPES,
+        help="Trainable combat archetype")
     parser.add_argument(
         "--tier", type=str, default="large",
-        choices=list(TIER_CONFIGS.keys()),
-        help="Model tier (architecture size)")
+        choices=ACTIVE_TIERS,
+        help="Behavior/model tier")
     parser.add_argument(
         "--bc_checkpoint", type=str, default=None,
         help="Path to checkpoint for warm-start")
     parser.add_argument(
         "--output_dir", type=str, default="checkpoints")
     parser.add_argument(
-        "--timesteps", type=int, default=6_000_000,
-        help="Total training timesteps (ignored with --curriculum)")
+        "--timesteps", type=int, default=None,
+        help="Override the stage's configured training budget "
+             "(ignored with --curriculum)")
     parser.add_argument(
         "--frame_stack", type=int, default=3)
     parser.add_argument(
@@ -86,7 +91,7 @@ Examples:
     # ── Curriculum mode ──────────────────────────────────────────
     parser.add_argument(
         "--curriculum", action="store_true",
-        help="Run all 7 curriculum stages sequentially")
+        help="Run the selected tier's supported curriculum stages")
 
     # ── Distillation ─────────────────────────────────────────────
     parser.add_argument(
@@ -152,13 +157,15 @@ Examples:
     if args.distill:
         # Find the best checkpoint from training.
         if args.curriculum:
+            final_stage = BEHAVIOR_TIER_DEFINITIONS[
+                args.tier]["curriculum_stages"][-1]
             teacher_path = os.path.join(
                 args.output_dir,
-                f"{args.method}_stage7_best.pt")
+                f"{args.method}_stage{final_stage}_best.pt")
             if not os.path.exists(teacher_path):
                 teacher_path = os.path.join(
                     args.output_dir,
-                    f"{args.method}_stage7_final.pt")
+                    f"{args.method}_stage{final_stage}_final.pt")
         else:
             teacher_path = os.path.join(
                 args.output_dir,

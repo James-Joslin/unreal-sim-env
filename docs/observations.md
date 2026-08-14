@@ -29,6 +29,10 @@ Python and C++ must remain field-for-field compatible. Treat the C++ `NeuralComb
 [244..248] Player Patterns               ( 5)
 ```
 
+Primary-target index `73`, previously reserved padding, is
+`RepositionReady`. Reusing it preserves the 249-float observation and all four
+hostile slots.
+
 ## Encoder Groups
 
 The policy network splits each frame into these model-facing groups:
@@ -42,13 +46,17 @@ Threats:         projectile threat triples from indices 203/205/206, 227-229, 23
 
 ## Action Space
 
-The policy uses three autoregressive action heads:
+The policy uses three independent one-pass action heads:
 
 ```text
 Movement: 9 actions  = hold + 8 compass directions
-Combat:   8 actions  = none, fire, reload, switch0, switch1, melee, block, dodge
-Target:   5 actions  = primary + 4 hostile slots
+Combat:   9 actions  = none, fire, reload, switch0, switch1, melee, block, dodge, reposition
+Target:   5 actions  = hostile slots 0..3 + keep current target
 ```
+
+Reposition uses the selected movement direction for 0.6 seconds at 1.75x
+movement speed, has a 3.0-second cooldown, and grants no invulnerability.
+Dodge is also explicit; neural agents never trigger it automatically.
 
 ## Player Patterns
 

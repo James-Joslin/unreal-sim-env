@@ -42,9 +42,10 @@ def get_trainer_class(name: str) -> Type[BaseTrainer]:
 from .ppo import PPOTrainer
 register_method("ppo", PPOTrainer)
 
-# In development
-from .sac import SACTrainer
-register_method("sac", SACTrainer)
+# SAC remains in-tree for development, but is not advertised by the production
+# CLI until it satisfies the BaseTrainer/evaluation/export contract.
+# from .sac import SACTrainer
+# register_method("sac", SACTrainer)
 
 # Future methods
 # from .impala import IMPALATrainer
