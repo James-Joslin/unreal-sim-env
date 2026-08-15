@@ -37,7 +37,7 @@ python simulation/view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render
 python simulation/view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
 ```
 
-See [`docs/quickstart.md`](docs/quickstart.md) for dependencies, CLI notes and common commands.
+See [`UPDATED_quickstart.md`](docs/quickstart.md) for dependencies, CLI notes and common commands.
 
 ## Observation and Action Model
 
@@ -111,7 +111,7 @@ Training progresses through seven stages:
 6. **Basic coordination** — two allied enemies against one player
 7. **Stratified squad combat** — equally sampled 1v1, 2v2, 3v3 and 4v4 encounters
 
-See [`docs/curriculum.md`](docs/curriculum.md) for per-stage details.
+See [`UPDATED_curriculum.md`](docs/curriculum.md) for per-stage details.
 
 ## ONNX Deployment Tiers
 
@@ -124,13 +124,13 @@ See [`docs/curriculum.md`](docs/curriculum.md) for per-stage details.
 
 ## Documentation
 
-- [`docs/quickstart.md`](docs/quickstart.md) — setup, commands and scripts
-- [`docs/architecture.md`](docs/architecture.md) — policy network, PPO model and ONNX export
-- [`docs/observations.md`](docs/observations.md) — 249-float observation layout
-- [`docs/curriculum.md`](docs/curriculum.md) — stage design and progression
-- [`docs/rewards.md`](docs/rewards.md) — reward philosophy and component activation
-- [`docs/weapons.md`](docs/weapons.md) — weapon presets and arc-fire mechanics
-- [`docs/web-tool.md`](docs/web-tool.md) — browser debugging/testing tool
+- [`UPDATED_quickstart.md`](docs/quickstart.md) — setup, commands and scripts
+- [`UPDATED_architecture.md`](docs/architecture.md) — policy network, PPO model and ONNX export
+- [`UPDATED_observations.md`](docs/observations.md) — 249-float observation layout
+- [`UPDATED_curriculum.md`](docs/curriculum.md) — stage design and progression
+- [`UPDATED_rewards.md`](docs/rewards.md) — reward philosophy and component activation
+- [`UPDATED_weapons.md`](docs/weapons.md) — weapon presets and arc-fire mechanics
+- [`UPDATED_web-tool.md`](docs/web-tool.md) — browser debugging/testing tool
 
 ## Generated Outputs
 
