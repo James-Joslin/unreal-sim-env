@@ -938,9 +938,13 @@ class NormalizedPolicyWrapper(nn.Module):
 #  ONNX Export
 # ─────────────────────────────────────────────────────────────────
 
-def export_onnx(model: CombatPolicy, tier: str, output_dir: str,
-                frame_stack: int = DEFAULT_FRAME_STACK,
-                obs_normalizer=None) -> str:
+def export_onnx(
+    model: CombatPolicy,
+    tier: str,
+    output_dir: str,
+    frame_stack: int = DEFAULT_FRAME_STACK,
+    obs_normalizer=None,
+) -> str:
     """Export a CombatPolicy to ONNX.
 
     The exported graph includes: normalisation → reshape → delta encode
@@ -950,20 +954,41 @@ def export_onnx(model: CombatPolicy, tier: str, output_dir: str,
     """
     tier = resolve_tier(tier)
     model.eval().cpu()
+
     input_size = OBS_SIZE * frame_stack
 
     checkpoint_normalizer = getattr(
-        model, "checkpoint_obs_normalizer_state", None)
+        model,
+        "checkpoint_obs_normalizer_state",
+        None,
+    )
+
     if obs_normalizer is not None:
         normalizer_mean = obs_normalizer.mean
         normalizer_var = obs_normalizer.var
-        normalizer_clip = getattr(obs_normalizer, "clip", 5.0)
-        normalizer_epsilon = getattr(obs_normalizer, "epsilon", 1e-8)
+        normalizer_clip = getattr(
+            obs_normalizer,
+            "clip",
+            5.0,
+        )
+        normalizer_epsilon = getattr(
+            obs_normalizer,
+            "epsilon",
+            1e-8,
+        )
+
     elif checkpoint_normalizer is not None:
         normalizer_mean = checkpoint_normalizer["mean"]
         normalizer_var = checkpoint_normalizer["var"]
-        normalizer_clip = checkpoint_normalizer.get("clip", 5.0)
-        normalizer_epsilon = checkpoint_normalizer.get("epsilon", 1e-8)
+        normalizer_clip = checkpoint_normalizer.get(
+            "clip",
+            5.0,
+        )
+        normalizer_epsilon = checkpoint_normalizer.get(
+            "epsilon",
+            1e-8,
+        )
+
     else:
         normalizer_mean = None
 
@@ -975,43 +1000,119 @@ def export_onnx(model: CombatPolicy, tier: str, output_dir: str,
             clip=normalizer_clip,
             epsilon=normalizer_epsilon,
         ).eval().cpu()
-        print(f"  Baking observation normalizer into ONNX graph")
+
+        print("  Baking observation normalizer into ONNX graph")
+
     else:
         export_model = model
 
-    dummy = torch.randn(1, input_size)
-    dummy_hidden = torch.zeros(1, 1, model.gru_hidden)
+    dummy = torch.randn(
+        1,
+        input_size,
+        dtype=torch.float32,
+    )
 
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"Combat_{tier.capitalize()}.onnx")
+    dummy_hidden = torch.zeros(
+        1,
+        1,
+        model.gru_hidden,
+        dtype=torch.float32,
+    )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True,
+    )
+
+    path = os.path.join(
+        output_dir,
+        f"Combat_{tier.capitalize()}.onnx",
+    )
 
     torch.onnx.export(
-        export_model, (dummy, dummy_hidden), path,
-        input_names=["observation", "hidden_in"],
-        output_names=["movement_logits", "combat_logits",
-                       "target_logits", "hidden_out"],
+        export_model,
+        (dummy, dummy_hidden),
+        path,
+
+        input_names=[
+            "observation",
+            "hidden_in",
+        ],
+
+        output_names=[
+            "movement_logits",
+            "combat_logits",
+            "target_logits",
+            "hidden_out",
+        ],
+
         dynamic_axes={
-            "observation": {0: "batch_size"},
-            "hidden_in": {1: "batch_size"},
-            "hidden_out": {1: "batch_size"},
+            "observation": {
+                0: "batch_size",
+            },
+            "hidden_in": {
+                1: "batch_size",
+            },
+            "movement_logits": {
+                0: "batch_size",
+            },
+            "combat_logits": {
+                0: "batch_size",
+            },
+            "target_logits": {
+                0: "batch_size",
+            },
+            "hidden_out": {
+                1: "batch_size",
+            },
         },
+
         opset_version=17,
+
+        # Use TorchScript exporter.
+        # Important for GRU compatibility/parity test.
+        dynamo=False,
     )
 
     # Consolidate to single file.
     try:
         import onnx
-        onnx_model = onnx.load(path, load_external_data=True)
-        onnx.save(onnx_model, path, save_as_external_data=False)
+
+        onnx_model = onnx.load(
+            path,
+            load_external_data=True,
+        )
+
+        onnx.save(
+            onnx_model,
+            path,
+            save_as_external_data=False,
+        )
+
         data_path = path + ".data"
+
         if os.path.exists(data_path):
             os.remove(data_path)
+
     except ImportError:
-        print("  Warning: onnx package not installed — cannot consolidate.")
+        print(
+            "  Warning: onnx package not installed "
+            "— cannot consolidate."
+        )
 
     size_kb = os.path.getsize(path) / 1024
-    param_count = sum(p.numel() for p in model.parameters())
-    print(f"  Exported: {path} ({size_kb:.1f} KB, {param_count:,} params)")
+
+    param_count = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    print(
+        f"  Exported: {path} "
+        f"({size_kb:.1f} KB, "
+        f"{param_count:,} params)"
+    )
+
     return path
 
 
