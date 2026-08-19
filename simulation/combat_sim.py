@@ -1476,6 +1476,8 @@ class CombatEnv(gym.Env):
         # 1. Resolve the action that production would actually execute.
         # During a lock, inference is represented by the cached movement,
         # combat NONE and target Keep regardless of the newly sampled heads.
+        # The public action tuple remains [movement, combat, target]; only the
+        # execution order below is target -> combat -> movement.
         was_action_locked = self.agent.is_action_locked
         if was_action_locked:
             effective_action = (
@@ -1486,21 +1488,27 @@ class CombatEnv(gym.Env):
         else:
             self._cached_movement_action = move_idx
             effective_action = (move_idx, combat_idx, target_idx)
-            if combat_idx == CombatAction.BLOCK:
-                self.agent.start_blocking()
-            else:
-                self.agent.stop_blocking()
-            if combat_idx == CombatAction.REPOSITION:
-                if not self._begin_reposition(move_idx):
-                    # Stay-direction Reposition and unavailable attempts are
-                    # true no-ops: no cooldown, no lock, and log combat NONE.
-                    effective_action = (
-                        move_idx, int(CombatAction.NONE), target_idx)
 
         effective_move, effective_combat, effective_target = effective_action
 
-        # Execute movement. Dodge owns displacement while active; every other
-        # lock holds the cached movement through normal collision.
+        # Execute in production order: target -> combat -> movement. Target
+        # selection must happen first so both combat and target-relative
+        # movement use the newly selected target on this same decision tick.
+        if not was_action_locked:
+            self._execute_target_selection(effective_target)
+
+            if effective_combat == CombatAction.REPOSITION:
+                if not self._begin_reposition(effective_move):
+                    # Stay-direction Reposition and unavailable attempts are
+                    # true no-ops: no cooldown, no lock, and log combat NONE.
+                    effective_combat = int(CombatAction.NONE)
+                    effective_action = (
+                        effective_move, effective_combat, effective_target)
+            else:
+                self._execute_combat(effective_combat, dt)
+
+        # Movement executes last. Dodge owns displacement while active; every
+        # other action lock holds the cached movement through normal collision.
         if self.agent.is_dodging:
             # During dodge, move in dodge direction (overrides player movement).
             # Sub-step to prevent tunneling through thin walls.
@@ -1524,11 +1532,6 @@ class CombatEnv(gym.Env):
             self.agent.pos = dodge_new_pos
         else:
             self._execute_movement(effective_move, dt)
-
-        if not was_action_locked:
-            self._execute_target_selection(effective_target)
-            if effective_combat != CombatAction.REPOSITION:
-                self._execute_combat(effective_combat, dt)
 
         # 2. Tick weapon cooldowns/reloads/wind-up/switch/dodge.
         self.agent.tick_weapons(dt)
@@ -2208,8 +2211,8 @@ class CombatEnv(gym.Env):
                 agent.targets_hit.add(target.target_id)
 
         elif action == CombatAction.BLOCK:
-            # The stance was applied before movement so its 0.3 movement scale
-            # and +80 defence both affect this transition.
+            # Combat executes before movement, so the stance's 0.3 movement
+            # scale and +80 defence both affect this transition.
             agent.start_blocking()
 
         elif action == CombatAction.DODGE:
@@ -2835,7 +2838,7 @@ class CombatEnv(gym.Env):
                 obs[idx] = (ally_tgt + 1) / 5.0; idx += 1  # -1→0, 0→0.2, 3→0.8
                 # Combat action: what is this ally doing?
                 ally_action = getattr(ally, 'current_combat_action', 0)
-                obs[idx] = ally_action / 7.0; idx += 1  # normalise to [0,1]
+                obs[idx] = ally_action / 8.0; idx += 1  # 9 combat actions: 0..8 -> [0,1]
                 # Flanking angle: cos between my→target and ally→target.
                 flanking = 0.0
                 if (ally_tgt >= 0
