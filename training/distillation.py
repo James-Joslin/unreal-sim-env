@@ -756,6 +756,26 @@ def run_distillation(
                 obs_normalizer=obs_normalizer,
             )
             train_fn = distill_amplified
+
+            # Self-improve the teacher tier before distilling smaller tiers.
+            # The dataset above contains the current policy's best-of-N
+            # trajectories.  Training a same-tier copy on those retained
+            # actions is the policy-improvement step; without it, iterated
+            # amplification would regenerate data from an unchanged teacher.
+            improved_policy = make_policy(
+                teacher_tier, frame_stack=fs).to(device)
+            improved_policy.load_state_dict(
+                current_policy.state_dict(), strict=True)
+            if hasattr(current_policy, "checkpoint_obs_normalizer_state"):
+                improved_policy.checkpoint_obs_normalizer_state = getattr(
+                    current_policy, "checkpoint_obs_normalizer_state")
+
+            teacher_epochs = max(1, epochs)
+            print(f"\nTeacher self-improvement: {teacher_tier} tier, "
+                  f"{teacher_epochs} epochs on best-of-N trajectories")
+            current_policy = train_fn(
+                improved_policy, dataset, epochs=teacher_epochs,
+                device=device, tier_name=f"{teacher_tier}-teacher")
         else:
             print(f"\nStandard dataset ({num_episodes} episodes)...")
             dataset = generate_teacher_dataset(
@@ -835,9 +855,10 @@ def run_distillation(
                 "behavior": BEHAVIOR_TIER_DEFINITIONS[tier]["label"],
             }
 
-        # For iterated amplification, the improved teacher-tier model
-        # becomes the policy for the next iteration.
-        if teacher_tier in models and iterations > 1:
+        # In amplified mode current_policy was already replaced by the
+        # same-tier self-improved teacher before this cascade.  Preserve the
+        # model registered for the teacher tier as the next iteration source.
+        if mode == "amplified" and teacher_tier in models:
             current_policy = models[teacher_tier]
 
     # ── Summary ──────────────────────────────────────────────────
