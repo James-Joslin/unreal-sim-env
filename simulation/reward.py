@@ -155,6 +155,9 @@ class CombatState:
     # Multi-target: total HP fraction lost across ALL targets this step.
     # Used to reward damage even when the selected target isn't the one hit.
     total_damage_all_targets: float = 0.0
+    # Authoritative event-ledger damage received by the trained agent during
+    # this decision step, expressed as a fraction of max HP.
+    damage_taken_this_step: float = 0.0
     targets_attacked: set = field(default_factory=set)  # unique target IDs hit
 
 
@@ -331,8 +334,9 @@ class RewardWeights:
     # from damage success (hit vs miss), not a per-step drip.
     in_optimal_range: float = 0.01
 
-    # Range closing: reward for approaching when out of range.
-    # NOT gated by engagement — this IS the approach signal.
+    # Range closing: reward for approaching only when beyond the weapon's
+    # actual range. Being outside the *optimal* band but still able to shoot
+    # is a valid engagement state and should not be punished.
     range_closing: float = 0.04
 
     # Out of range penalty: continuous per-step cost for being beyond
@@ -375,7 +379,15 @@ class RewardWeights:
     # Fine as-is. Per-event, small, directional.
 
     fire_in_optimal_band: float = 0.06
-    fire_outside_optimal: float = -0.02
+    # Deprecated penalty retained for checkpoint/config compatibility.
+    # Firing inside real weapon range is not bad merely because it is outside
+    # the sweet spot; hit success, ammo economy and weapon choice decide that.
+    fire_outside_optimal: float = 0.0
+    # Small immediate trigger-pull signal for a genuinely valid shot. This is
+    # important for slow projectiles/wind-up weapons because their damage can
+    # arrive several decisions after the FIRE action.
+    fire_valid_opportunity: float = 0.03
+    heavy_fire_intent_bonus: float = 0.02
     swap_to_better_range: float = 0.08
     swap_to_worse_range: float = -0.1
     swap_reload_smart: float = 0.1
@@ -403,7 +415,11 @@ class RewardWeights:
     camping_penalty: float = -0.03    # Was -0.03. HALVED. Standing still
                                       # to aim is valid combat behaviour!
     wall_hugging_penalty: float = -0.02  # Was -0.05
-    corner_penalty: float = -0.04       # Was -0.2
+    corner_penalty: float = -0.06
+    # Escalates only when the agent remains in a corner for several decisions;
+    # avoids making a brief collision/navigation correction excessively costly.
+    corner_streak_penalty: float = -0.012
+    corner_exit_bonus: float = 0.12
 
     # [Fix v2] Damage-scaled wall/corner penalty. When taking damage near
     # a wall, the base penalty is multiplied by (1 + damage_pct * scale),
@@ -528,6 +544,7 @@ class CombatRewardFunction:
         # Tracking for multi-step rewards.
         self._consecutive_idle = 0
         self._consecutive_camping = 0
+        self._consecutive_corner = 0
         self._recent_move_dirs: list = []  # last 5 movement directions
         self._last_position = np.zeros(2)
         self._episode_targets_hit: set = set()
@@ -555,6 +572,7 @@ class CombatRewardFunction:
         """Call at episode start."""
         self._consecutive_idle = 0
         self._consecutive_camping = 0
+        self._consecutive_corner = 0
         self._recent_move_dirs = []
         self._last_position = np.zeros(2)
         self._episode_targets_hit = set()
@@ -646,8 +664,9 @@ class CombatRewardFunction:
             self._targets_seen_low_hp.add(curr.target_id)
             info["target_low_hp"] = r_low_hp
 
-        # Damage taken.
-        damage_taken_frac = max(0.0, prev.self_hp - curr.self_hp)
+        # Damage taken — authoritative event-ledger attribution. This avoids
+        # reconstructing asynchronous projectile damage from HP differences.
+        damage_taken_frac = max(0.0, curr.damage_taken_this_step)
         r_taken = damage_taken_frac * self.w.take_damage * 100
         info["damage_taken"] = r_taken
 
@@ -670,24 +689,23 @@ class CombatRewardFunction:
         r_range = self.w.in_optimal_range * engagement if curr.in_optimal_range else 0.0
         info["optimal_range"] = r_range
         
-        # Range closing: reward approaching the optimal band when too far.
-        # This gives a gradient toward engagement instead of relying on the
-        # tiny in_optimal_range tick. Matches C++ BTTask_ScriptedCombat's
-        # "distance > OptimalMax → MoveToActor" behaviour.
+        # Range closing: reward approaching only when outside ACTUAL weapon
+        # range. The optimal band remains a mild preference, not a rule that
+        # teaches the policy to withhold useful long-range fire.
         #
         # NOT gated by engagement — this is how the agent GETS into engagement.
         # If gated, the agent can't hit → engagement drops → approach signal
         # dies → agent orbits aimlessly at max range.
         r_closing = 0.0
         r_out_of_range = 0.0
-        if curr.target_alive and curr.target_distance > curr.active_optimal_max:
+        if curr.target_alive and curr.target_distance > curr.active_weapon_range:
             # Reward closing distance (proportional to distance closed).
             # Stronger pull from far away — approaching from 3000 UU is more
             # valuable than fine-tuning at 1300 UU.
-            if prev.target_distance > curr.active_optimal_max:
+            if prev.target_distance > curr.active_weapon_range:
                 dist_closed = prev.target_distance - curr.target_distance
                 if dist_closed > 0:
-                    overshoot = curr.target_distance - curr.active_optimal_max
+                    overshoot = curr.target_distance - curr.active_weapon_range
                     far_bonus = 1.0 + min(overshoot / 800.0, 2.0)  # up to 3× at long range
                     r_closing = self.w.range_closing * min(dist_closed / 80.0, 1.0) * far_bonus
                     info["range_closing"] = r_closing
@@ -696,7 +714,7 @@ class CombatRewardFunction:
             # WITHOUT a cap — being 3000 UU away must feel much worse than 1500.
             # In a 4000 UU arena, the old 1000 UU cap made half the arena
             # feel identically "far", killing the gradient.
-            overshoot = (curr.target_distance - curr.active_optimal_max)
+            overshoot = (curr.target_distance - curr.active_weapon_range)
             overshoot_frac = overshoot / 800.0  # no cap — scales indefinitely
             r_out_of_range = self.w.out_of_range_penalty * (0.3 + 0.7 * overshoot_frac)
             info["out_of_range"] = r_out_of_range
@@ -716,18 +734,43 @@ class CombatRewardFunction:
             r_invalid = self.w.invalid_action
         info["invalid_action"] = r_invalid
 
-        # ── Passive-in-Range Penalty ─────────────────────────────
-        # The agent is in range, has LOS, has ammo, can fire — but
-        # chose to do nothing. Every step of hesitation is wasted DPS.
-        # Doesn't fire during reload (combat_action would be Reload)
-        # or when action-locked (can_fire is False).
+        # ── Valid-fire intent / Passive-in-Range ─────────────────
+        # A FIRE action receives a small immediate reward when the shot is
+        # genuinely viable. This bridges the temporal credit gap for slow
+        # heavy/arc projectiles whose impact reward arrives later.
+        line_viable = (
+            prev.has_los
+            or (prev.active_weapon_can_arc and prev.can_arc_over_target_cover)
+        )
+        valid_fire_opportunity = (
+            prev.target_alive
+            and prev.can_fire
+            and prev.target_in_range
+            and prev.active_ammo_fraction > 0.0
+            and line_viable
+        )
+
+        r_fire_intent = 0.0
+        if self.stage >= 2 and combat_action == CombatAction.FIRE and valid_fire_opportunity:
+            r_fire_intent = self.w.fire_valid_opportunity
+            # Slow/wind-up weapons need a slightly stronger immediate bridge
+            # because the action and hit can be separated by many decisions.
+            if (prev.active_weapon_wind_up_time >= 0.3
+                    or prev.active_weapon_fire_cooldown >= 0.8):
+                r_fire_intent += self.w.heavy_fire_intent_bonus
+                info["heavy_fire_intent"] = self.w.heavy_fire_intent_bonus
+            info["fire_valid_opportunity"] = r_fire_intent
+
+        # None and gratuitous Block both count as hesitation when a clean shot
+        # is available. A Block that actually absorbs incoming damage remains
+        # tactically legitimate and is exempt from this specific penalty.
         r_passive = 0.0
-        if (combat_action == CombatAction.NONE
-                and curr.target_alive
-                and prev.can_fire
-                and prev.has_los
-                and prev.target_in_range
-                and prev.active_ammo_fraction > 0.0):
+        passive_action = combat_action in (CombatAction.NONE, CombatAction.BLOCK)
+        useful_block = (
+            combat_action == CombatAction.BLOCK
+            and curr.damage_taken_this_step > 0.0
+        )
+        if passive_action and not useful_block and valid_fire_opportunity:
             r_passive = self.w.passive_in_range
             info["passive_in_range"] = r_passive
 
@@ -849,7 +892,7 @@ class CombatRewardFunction:
             r_range + r_ammo + r_invalid + r_degen + r_weapon +
             r_flank + r_archetype + r_group + r_episode + r_inactivity +
             r_closing + r_out_of_range + r_retarget + r_low_hp +
-            r_passive
+            r_passive + r_fire_intent
         )
 
         info["total"] = total
@@ -924,9 +967,10 @@ class CombatRewardFunction:
             if in_band and damage_this_step > 0:
                 r += self.w.fire_in_optimal_band
                 info["fire_in_band"] = self.w.fire_in_optimal_band
-            elif not in_band:
-                # Fired outside optimal. Not as bad as wasted shot (that's
-                # already penalised in ammo rewards), but suboptimal.
+            elif not in_band and self.w.fire_outside_optimal != 0.0:
+                # Compatibility hook only. Default is now zero: a shot inside
+                # actual weapon range is not wrong merely because it is
+                # outside the preferred band.
                 r += self.w.fire_outside_optimal
                 info["fire_out_of_band"] = self.w.fire_outside_optimal
 
@@ -1083,10 +1127,16 @@ class CombatRewardFunction:
     ) -> float:
         r = 0.0
 
-        # Idle penalty: no combat action for 3+ consecutive steps.
-        # Suppressed during post-kill grace — the agent can't fire at
-        # a target it hasn't found yet.
-        if combat_action == CombatAction.NONE:
+        # Idle penalty: NONE and non-productive BLOCK both count as idle.
+        # Previously Block reset this counter every tick, creating a trivial
+        # exploit where the policy could avoid inactivity pressure by holding
+        # Block forever. Blocking while actually taking damage is legitimate.
+        useful_block = (
+            combat_action == CombatAction.BLOCK
+            and curr.damage_taken_this_step > 0.0
+        )
+        if combat_action == CombatAction.NONE or (
+                combat_action == CombatAction.BLOCK and not useful_block):
             self._consecutive_idle += 1
         else:
             self._consecutive_idle = 0
@@ -1143,6 +1193,22 @@ class CombatRewardFunction:
             corner_pen = self.w.corner_penalty * damage_mult
             r += corner_pen
             info["corner_penalty"] = corner_pen
+
+            self._consecutive_corner += 1
+            if self._consecutive_corner >= 5:
+                # Escalate gradually every five decisions, capped at 4× the
+                # streak weight. This targets persistent corner occupation,
+                # not momentary collision/navigation corrections.
+                streak_scale = min(
+                    1 + (self._consecutive_corner - 5) // 5, 4)
+                streak_pen = self.w.corner_streak_penalty * streak_scale
+                r += streak_pen
+                info["corner_streak"] = streak_pen
+        else:
+            if prev.in_corner:
+                r += self.w.corner_exit_bonus
+                info["corner_exit"] = self.w.corner_exit_bonus
+            self._consecutive_corner = 0
 
         # ── Wall escape gradient ─────────────────────────────────
         # [Fix v2] Escape bonus is NOT scaled by damage_mult. The v1
@@ -1299,15 +1365,9 @@ class CombatRewardFunction:
             r += self.w.ranged_too_close
             info["ranged_too_close"] = self.w.ranged_too_close
 
-        # Too far — but only in the "could hit but staying back" zone.
-        # This covers the band between optimal_max and weapon_range.
-        # Beyond weapon_range, the general out_of_range_penalty already
-        # applies (and is not gated by archetype/stage), so we don't
-        # stack them.
-        if (curr.target_distance > curr.active_optimal_max
-                and curr.target_distance <= curr.active_weapon_range):
-            r += self.w.ranged_too_far
-            info["ranged_too_far"] = self.w.ranged_too_far
+        # Do not penalise the band between optimal_max and weapon_range.
+        # That band is deliberately valid firing space, especially for heavy
+        # cannon/missile loadouts where long-range pressure is desirable.
 
         # Strafe success: dealt damage while moving laterally in the optimal
         # band. Uses total_damage_all_targets to avoid phantom damage.
@@ -1356,13 +1416,20 @@ class CombatRewardFunction:
             r += self.w.tank_protect_low_hp
             info["tank_protect_low_hp"] = self.w.tank_protect_low_hp
 
-        # Suppression fire.
-        if combat_action == CombatAction.FIRE and curr.can_fire:
+        # Suppression fire. Use PRE-action readiness: after a valid FIRE the
+        # current state is normally on cooldown, so curr.can_fire made this
+        # reward almost impossible to trigger.
+        if (combat_action == CombatAction.FIRE
+                and prev.can_fire
+                and prev.target_in_range
+                and (prev.has_los
+                     or (prev.active_weapon_can_arc
+                         and prev.can_arc_over_target_cover))):
             r += self.w.tank_suppression
             info["tank_suppression"] = self.w.tank_suppression
 
         # Absorbing damage (self HP decreased, which means threats are hitting us not allies).
-        damage_taken = max(0.0, prev.self_hp - curr.self_hp)
+        damage_taken = max(0.0, curr.damage_taken_this_step)
         if damage_taken > 0 and curr.alive_allies > 0:
             r += damage_taken * self.w.tank_absorb_damage * 100
             info["tank_absorb"] = damage_taken * self.w.tank_absorb_damage * 100
