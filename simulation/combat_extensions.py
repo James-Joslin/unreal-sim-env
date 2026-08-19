@@ -178,6 +178,7 @@ class AlliedRobot:
     attack_cooldown: float = 1.0
     attack_cooldown_remaining: float = 0.0
     target_id: int = -1  # Stable ID of the hostile this ally is targeting.
+    ally_id: int = -1
     current_combat_action: int = 0  # What the ally is doing (for obs encoding).
 
     # ── Properties read by base CombatEnv._build_observation() ──
@@ -207,8 +208,9 @@ class AlliedRobot:
     def tick(self, dt: float, targets: List[Target], obstacles: List[Obstacle],
              arena_half: float, rng=None):
         """Simple ally AI: approach nearest alive target and attack."""
+        hits = []
         if not self.alive:
-            return
+            return hits
 
         self.attack_cooldown_remaining -= dt
 
@@ -227,7 +229,7 @@ class AlliedRobot:
 
         if not target:
             self.velocity = np.zeros(2, dtype=np.float32)
-            return
+            return hits
 
         to_target = target.pos - self.pos
         dist = np.linalg.norm(to_target)
@@ -264,17 +266,22 @@ class AlliedRobot:
                 self.attack_cooldown_remaining = self.attack_cooldown
                 # Track combat action: melee archetype = 5 (Melee), others = 1 (Fire).
                 self.current_combat_action = 5 if self.archetype == 1 else 1
-                dmg, target.barrier, _ = compute_damage(
+                hp_before = max(0.0, float(target.hp))
+                dmg, target.barrier, was_crit = compute_damage(
                     self.attack_damage, 5.0, target.defence, target.barrier,
                     rng=rng)
-                target.hp -= dmg
-                if target.hp <= 0:
-                    target.hp = 0
+                target.hp = max(0.0, target.hp - dmg)
+                hp_lost = max(0.0, hp_before - target.hp)
+                killed = hp_before > 0.0 and target.hp <= 0.0
+                if killed:
                     target.alive = False
+                hits.append((target, hp_lost, was_crit, killed))
             else:
                 self.current_combat_action = 0  # No LOS — can't attack.
         else:
             self.current_combat_action = 0  # Not attacking this tick.
+
+        return hits
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -418,9 +425,18 @@ class CombatEnvExtended(CombatEnv):
 
         # Tick allies.
         for ally in self.allies:
-            ally.tick(
+            hits = ally.tick(
                 dt, self.targets, self.obstacles, self._arena_half,
                 rng=self.rng)
+            for target, hp_lost, was_crit, killed in hits:
+                self._record_damage_event(
+                    "ally", ally.ally_id, target, hp_lost,
+                    source_name="AllyAttack",
+                    delivery="scripted_ally",
+                    was_crit=was_crit,
+                    killed=killed,
+                    intended_target_id=target.target_id,
+                )
 
         # Targets may attack allies too.
         self._targets_attack_allies(dt)
@@ -448,7 +464,9 @@ class CombatEnvExtended(CombatEnv):
             # current production spawn pool.
             arch = self.rng.choices(
                 [0, 1, 3], weights=[40, 30, 15], k=1)[0]
-            self.allies.append(self._make_ally(arch))
+            ally = self._make_ally(arch)
+            ally.ally_id = len(self.allies)
+            self.allies.append(ally)
 
     def _make_ally(self, archetype: int) -> AlliedRobot:
         """Create an allied robot near the agent."""
@@ -499,6 +517,9 @@ class CombatEnvExtended(CombatEnv):
             if t.combat_role == "melee" and dist < t.melee_range * 1.5:
                 if t.melee_cooldown_remaining <= 0 and self.rng.random() < 0.08:
                     self.status_effects.apply_stun(0.4 + self.rng.uniform(0, 0.3))
+                    self._record_status_event(
+                        "target", t.target_id, self.agent, "stun",
+                        source_name="TargetStatus")
 
             # Ranged targets can slow.
             if t.combat_role in ("ranged", "mixed"):
@@ -506,39 +527,35 @@ class CombatEnvExtended(CombatEnv):
                     self.status_effects.apply_slow(
                         1.0 + self.rng.uniform(0, 1.0),
                         strength=self.rng.uniform(0.2, 0.5))
+                    self._record_status_event(
+                        "target", t.target_id, self.agent, "slow",
+                        source_name="TargetStatus")
 
             # Any target can apply a generic debuff (simulates poison, scold, etc.)
             if self.rng.random() < 0.02 * dt:
                 debuff_names = ["poison", "scold", "weaken", "blind", "mark", "burn"]
+                debuff_name = self.rng.choice(debuff_names)
                 self.status_effects.apply_debuff(
-                    self.rng.choice(debuff_names),
+                    debuff_name,
                     duration=self.rng.uniform(2.0, 5.0),
                     strength=self.rng.uniform(0.1, 0.4))
+                self._record_status_event(
+                    "target", t.target_id, self.agent, debuff_name,
+                    source_name="TargetStatus")
 
     # ═════════════════════════════════════════════════════════════
     #  Threat Tracking
     # ═════════════════════════════════════════════════════════════
 
     def _update_threat_from_targets(self, dt: float):
-        """Track which targets have dealt damage to the agent."""
-        # Simplified: attribute damage proportionally to targets in range with LOS.
-        damage_this_tick = max(0, self.agent.max_hp * (
-            self.reward_fn._episode_damage_dealt -
-            getattr(self, '_prev_episode_damage', 0)))
+        """Compatibility no-op: threat now consumes the damage-event ledger.
 
-        in_range_targets = []
-        for t in self.targets:
-            if t.alive:
-                dist = np.linalg.norm(self.agent.pos - t.pos)
-                if dist < t.attack_range and check_los(t.pos, self.agent.pos, self.obstacles):
-                    in_range_targets.append(t)
-
-        if in_range_targets and damage_this_tick > 0:
-            per_target = damage_this_tick / len(in_range_targets)
-            for t in in_range_targets:
-                self.threat_table.record_damage(t.target_id, per_target)
-
-        self._prev_episode_damage = self.reward_fn._episode_damage_dealt
+        Base ``CombatEnv._consume_damage_events`` attributes each real
+        target→agent hit to its actual source ID. The previous implementation
+        guessed attackers from HP/reward deltas and nearby targets, which was
+        both ambiguous and wrong for asynchronous projectiles.
+        """
+        return None
 
     # ═════════════════════════════════════════════════════════════
     #  Priority Scoring (matches EnemyPerceptionComponent)
@@ -638,15 +655,25 @@ class CombatEnvExtended(CombatEnv):
                     dist = np.linalg.norm(t.pos - target_ally.pos)
                     if dist < t.attack_range and t.attack_cooldown_remaining <= 0:
                         if check_los(t.pos, target_ally.pos, self.obstacles):
-                            dmg, target_ally.barrier, _ = compute_damage(
+                            hp_before = max(0.0, float(target_ally.hp))
+                            dmg, _, was_crit = compute_damage(
                                 t.attack_damage, t.attack_stat,
                                 target_ally.defence, 0.0,
                                 t.crit_chance, t.crit_multiplier,
                                 rng=self.rng)
-                            target_ally.hp -= dmg
-                            if target_ally.hp <= 0:
-                                target_ally.hp = 0
+                            target_ally.hp = max(0.0, target_ally.hp - dmg)
+                            hp_lost = max(0.0, hp_before - target_ally.hp)
+                            killed = hp_before > 0.0 and target_ally.hp <= 0.0
+                            if killed:
                                 target_ally.alive = False
+                            self._record_damage_event(
+                                "target", t.target_id, target_ally, hp_lost,
+                                source_name="TargetAllyAttack",
+                                delivery="direct",
+                                was_crit=was_crit,
+                                killed=killed,
+                                intended_target_id=target_ally.ally_id,
+                            )
 
     # ═════════════════════════════════════════════════════════════
     #  Observation Builder (fills ALL 249 features)

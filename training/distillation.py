@@ -589,46 +589,65 @@ def distill_amplified(student, dataset, epochs=50, batch_size=256,
 #  ONNX Benchmark
 # ─────────────────────────────────────────────────────────────────
 
-def benchmark_onnx(onnx_path, input_size, gru_hidden=0,
-                   n_iters=500):
-    """Returns mean ms per forward pass, or None."""
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("  Benchmark skipped (onnxruntime not installed)")
-        return None
+def benchmark_onnx(
+    onnx_path,
+    input_size,
+    gru_hidden=0,
+    n_iters=10_000,
+    batch_size=1,
+):
+    import time
+    import numpy as np
+    import onnxruntime as ort
 
-    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    dummy = np.random.randn(1, input_size).astype(np.float32)
+    opts = ort.SessionOptions()
 
-    # Build feed dict — include hidden_in if model has GRU.
-    feed = {"observation": dummy}
-    input_names = [inp.name for inp in sess.get_inputs()]
+    sess = ort.InferenceSession(
+        onnx_path,
+        sess_options=opts,
+        providers=["CPUExecutionProvider"],
+    )
+
+    dummy = np.random.randn(
+        batch_size,
+        input_size,
+    ).astype(np.float32)
+
+    feed = {
+        "observation": dummy,
+    }
+
+    input_names = {
+        inp.name
+        for inp in sess.get_inputs()
+    }
+
     if "hidden_in" in input_names:
-        h_size = gru_hidden if gru_hidden > 0 else 96  # fallback (Large tier default)
-        # Try to get exact shape from the model's input spec.
-        for inp in sess.get_inputs():
-            if inp.name == "hidden_in":
-                shape = inp.shape
-                # shape is [1, 'batch_size', gru_hidden] or [1, 1, N]
-                if len(shape) == 3 and isinstance(shape[2], int):
-                    h_size = shape[2]
-                break
-        feed["hidden_in"] = np.zeros((1, 1, h_size), dtype=np.float32)
+        feed["hidden_in"] = np.zeros(
+            (1, batch_size, gru_hidden),
+            dtype=np.float32,
+        )
 
-    for _ in range(50):
+    # More warmup
+    for _ in range(500):
         sess.run(None, feed)
 
-    start = _time.perf_counter()
+    start = time.perf_counter_ns()
+
     for _ in range(n_iters):
         sess.run(None, feed)
-    elapsed = _time.perf_counter() - start
 
-    ms = (elapsed / n_iters) * 1000
-    print(f"  Inference: {ms:.3f} ms/forward "
-          f"({n_iters/elapsed:.0f} FPS)")
+    elapsed_ns = time.perf_counter_ns() - start
+
+    ms = elapsed_ns / n_iters / 1_000_000
+
+    print(
+        f"batch={batch_size:3d}: "
+        f"{ms:.4f} ms/batch, "
+        f"{ms / batch_size:.5f} ms/agent"
+    )
+
     return ms
-
 
 # ─────────────────────────────────────────────────────────────────
 #  Full Pipeline
@@ -737,6 +756,26 @@ def run_distillation(
                 obs_normalizer=obs_normalizer,
             )
             train_fn = distill_amplified
+
+            # Self-improve the teacher tier before distilling smaller tiers.
+            # The dataset above contains the current policy's best-of-N
+            # trajectories.  Training a same-tier copy on those retained
+            # actions is the policy-improvement step; without it, iterated
+            # amplification would regenerate data from an unchanged teacher.
+            improved_policy = make_policy(
+                teacher_tier, frame_stack=fs).to(device)
+            improved_policy.load_state_dict(
+                current_policy.state_dict(), strict=True)
+            if hasattr(current_policy, "checkpoint_obs_normalizer_state"):
+                improved_policy.checkpoint_obs_normalizer_state = getattr(
+                    current_policy, "checkpoint_obs_normalizer_state")
+
+            teacher_epochs = max(1, epochs)
+            print(f"\nTeacher self-improvement: {teacher_tier} tier, "
+                  f"{teacher_epochs} epochs on best-of-N trajectories")
+            current_policy = train_fn(
+                improved_policy, dataset, epochs=teacher_epochs,
+                device=device, tier_name=f"{teacher_tier}-teacher")
         else:
             print(f"\nStandard dataset ({num_episodes} episodes)...")
             dataset = generate_teacher_dataset(
@@ -816,9 +855,10 @@ def run_distillation(
                 "behavior": BEHAVIOR_TIER_DEFINITIONS[tier]["label"],
             }
 
-        # For iterated amplification, the improved teacher-tier model
-        # becomes the policy for the next iteration.
-        if teacher_tier in models and iterations > 1:
+        # In amplified mode current_policy was already replaced by the
+        # same-tier self-improved teacher before this cascade.  Preserve the
+        # model registered for the teacher tier as the next iteration source.
+        if mode == "amplified" and teacher_tier in models:
             current_policy = models[teacher_tier]
 
     # ── Summary ──────────────────────────────────────────────────
