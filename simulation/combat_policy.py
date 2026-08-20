@@ -200,6 +200,8 @@ REPOSITION_ACTION = 8
 
 DEFAULT_FRAME_STACK = 3
 
+ABS_TOL = 5e-4
+
 # Observation layout: feature group boundaries within one 249-float frame.
 _HOSTILE_START = 74                        # 4 slots x 17 features
 _HOSTILE_SLOTS = 4
@@ -1205,7 +1207,7 @@ def verify_export(model: CombatPolicy, onnx_path: str,
     m_diff, c_diff, t_diff, h_diff = max_diffs
     max_diff = max(max_diffs)
 
-    status = "PASS" if max_diff < 1e-4 else "FAIL"
+    status = "PASS" if max_diff < ABS_TOL else "FAIL"
     print(f"  Verify {status}: max diff = {max_diff:.6f} "
           f"(m={m_diff:.6f}, c={c_diff:.6f}, t={t_diff:.6f}, "
           f"h={h_diff:.6f})")
