@@ -550,10 +550,11 @@ class CombatEnvExtended(CombatEnv):
     def _update_threat_from_targets(self, dt: float):
         """Compatibility no-op: threat now consumes the damage-event ledger.
 
-        Base ``CombatEnv._consume_damage_events`` attributes each real
-        target→agent hit to its actual source ID. The previous implementation
-        guessed attackers from HP/reward deltas and nearby targets, which was
-        both ambiguous and wrong for asynchronous projectiles.
+        Base ``CombatEnv._record_damage_event`` attributes each real
+        target→agent hit to its actual source ID and updates threat from the
+        same event ledger. The previous implementation guessed attackers from
+        HP/reward deltas and nearby targets, which was ambiguous and wrong for
+        asynchronous projectiles.
         """
         return None
 
