@@ -159,6 +159,75 @@ class CombatAction(IntEnum):
     REPOSITION = 8
 
 
+@dataclass
+class DamageEvent:
+    """Authoritative combat event used for reward/threat attribution.
+
+    Damage and status application can be asynchronous (projectile travel,
+    delayed wind-up, extension systems).  Keeping causal metadata at the
+    moment the event happens avoids reconstructing responsibility from HP
+    deltas later.
+    """
+    event_id: int
+    step: int
+    timestamp: float
+    attacker_kind: str
+    attacker_id: int
+    victim_kind: str
+    victim_id: int
+    damage: float = 0.0
+    damage_fraction: float = 0.0
+    source_name: str = ""
+    delivery: str = "direct"
+    projectile_id: int = -1
+    intended_target_id: int = -1
+    status_effect: str = ""
+    was_crit: bool = False
+    killed: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "step": self.step,
+            "timestamp": self.timestamp,
+            "attacker_kind": self.attacker_kind,
+            "attacker_id": self.attacker_id,
+            "victim_kind": self.victim_kind,
+            "victim_id": self.victim_id,
+            "damage": self.damage,
+            "damage_fraction": self.damage_fraction,
+            "source_name": self.source_name,
+            "delivery": self.delivery,
+            "projectile_id": self.projectile_id,
+            "intended_target_id": self.intended_target_id,
+            "status_effect": self.status_effect,
+            "was_crit": self.was_crit,
+            "killed": self.killed,
+        }
+
+
+class DamageEventLedger:
+    """Episode-persistent event history plus monotonic event IDs."""
+
+    def __init__(self):
+        self.events: List[DamageEvent] = []
+        self._next_event_id = 1
+
+    def clear(self):
+        self.events.clear()
+        self._next_event_id = 1
+
+    def append(self, event: DamageEvent) -> DamageEvent:
+        self.events.append(event)
+        self._next_event_id = max(self._next_event_id, event.event_id + 1)
+        return event
+
+    def next_id(self) -> int:
+        event_id = self._next_event_id
+        self._next_event_id += 1
+        return event_id
+
+
 # ─────────────────────────────────────────────────────────────────
 #  Data Structures
 # ─────────────────────────────────────────────────────────────────
@@ -339,6 +408,9 @@ class SimProjectile:
     is_agent_projectile: bool = True  # True = agent fired, False = target fired
     source_id: int = -1               # target_id of source (for target projectiles)
     target_pos: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))  # aim point at fire time
+    projectile_id: int = -1
+    source_name: str = "Projectile"
+    intended_target_id: int = -1
 
     # Arc projectile fields.
     is_arc: bool = False
@@ -372,94 +444,84 @@ class SimProjectile:
 
     def _tick_straight(self, dt, targets, agent, obstacles, arena_half,
                        rng=None):
-        """Physics/beam projectile — straight line travel with swept collision."""
+        """Physics/beam projectile — resolve the earliest swept hit.
+
+        World and actor candidates are compared by parametric distance along
+        the same movement segment.  This prevents a wall later in the segment
+        from incorrectly blocking an actor that was struck first.
+        """
         hits = []
 
         old_pos = self.pos.copy()
-        self.pos = self.pos + self.velocity * dt
+        end_pos = self.pos + self.velocity * dt
 
-        # Check out of bounds.
-        if (abs(self.pos[0]) > arena_half * 1.1
-                or abs(self.pos[1]) > arena_half * 1.1):
+        # Check out of bounds/lifetime using the proposed end position.
+        if (abs(end_pos[0]) > arena_half * 1.1
+                or abs(end_pos[1]) > arena_half * 1.1):
+            self.pos = end_pos
             self.alive = False
             return hits
-
-        # Check lifetime.
         if self.age > self.max_lifetime:
+            self.pos = end_pos
             self.alive = False
             return hits
 
-        # Swept obstacle collision (use existing ray-AABB, matches UE sweep).
-        for obs in obstacles:
-            if _ray_aabb_intersect(old_pos, self.pos, obs):
-                # Arc weapons can clear obstacles up to their max_arc_height.
-                # Matches C++ CanArcOverHeight: checks bCanArcOverCover AND
-                # MaxArcableObstacleHeight. Straight weapons always blocked.
-                if self.is_arc:
-                    can_clear = (self.max_arc_height <= 0
-                                 or obs.height <= self.max_arc_height)
-                    if not can_clear:
-                        self.alive = False
-                        return hits
-                    # Arc weapon clears this obstacle — continue flying.
-                else:
-                    self.alive = False
-                    return hits
-
-        # Swept target collision — closest point on segment to target centre.
-        # This matches UE's UProjectileMovementComponent swept sphere check.
-        seg = self.pos - old_pos
+        seg = end_pos - old_pos
+        seg_len = float(np.linalg.norm(seg))
         seg_len_sq = float(np.dot(seg, seg))
+        if seg_len_sq <= 1e-8:
+            self.pos = end_pos
+            return hits
 
-        if self.is_agent_projectile:
-            check_list = targets
-        else:
-            check_list = [agent]
+        # Candidate tuple: (t, kind, object).  t is in [0, 1].
+        candidates = []
+        for obstacle in obstacles:
+            t_hit = _ray_aabb_intersect_t(old_pos, end_pos, obstacle)
+            if t_hit is not None:
+                candidates.append((float(t_hit), "obstacle", obstacle))
 
+        check_list = targets if self.is_agent_projectile else [agent]
+        direction = seg / max(seg_len, 1e-8)
         for actor in check_list:
-            if hasattr(actor, 'alive') and not actor.alive:
+            if hasattr(actor, "alive") and not actor.alive:
                 continue
-            if hasattr(actor, 'is_dodging') and actor.is_dodging:
-                # Dodge invulnerability (agent only).
+            if hasattr(actor, "is_dodging") and actor.is_dodging:
                 continue
+            t_hit = _ray_circle_intersect_t(
+                old_pos, direction, actor.pos, self.hit_radius, seg_len)
+            if t_hit is not None:
+                candidates.append((float(t_hit), "actor", actor))
 
-            if seg_len_sq > 0.01:
-                to_target = actor.pos - old_pos
-                t_param = np.clip(
-                    float(np.dot(to_target, seg)) / seg_len_sq, 0.0, 1.0)
-                closest = old_pos + seg * t_param
-            else:
-                closest = self.pos
+        if not candidates:
+            self.pos = end_pos
+            return hits
 
-            dist = np.linalg.norm(closest - actor.pos)
-            if dist < self.hit_radius:
-                # Place projectile at hit point (for rendering).
-                self.pos = closest
+        # Stable tie-break: world geometry wins an exact tie, matching the
+        # conservative blocking behavior of the previous implementation.
+        candidates.sort(key=lambda item: (item[0], 0 if item[1] == "obstacle" else 1))
+        t_hit, hit_kind, hit_obj = candidates[0]
+        self.pos = old_pos + seg * np.clip(t_hit, 0.0, 1.0)
 
-                # Apply damage.
-                if self.is_agent_projectile:
-                    dmg, actor.barrier, was_crit = compute_damage(
-                        self.damage, self.attack_stat,
-                        actor.defence, actor.barrier,
-                        self.crit_chance, self.crit_multiplier, rng=rng)
-                else:
-                    dmg, actor.barrier, was_crit = compute_damage(
-                        self.damage, self.attack_stat,
-                        actor.defence, actor.barrier,
-                        self.crit_chance, self.crit_multiplier,
-                        rng=rng)  # [Audit §5.4]
+        if hit_kind == "obstacle":
+            self.alive = False
+            return hits
 
-                actor.hp -= dmg
-                if actor.hp <= 0:
-                    actor.hp = 0
-                    actor.alive = False
+        actor = hit_obj
+        hp_before = max(0.0, float(actor.hp))
+        dmg, actor.barrier, was_crit = compute_damage(
+            self.damage, self.attack_stat,
+            actor.defence, actor.barrier,
+            self.crit_chance, self.crit_multiplier, rng=rng)
+        actor.hp = max(0.0, actor.hp - dmg)
+        hp_lost = max(0.0, hp_before - actor.hp)
+        killed = hp_before > 0.0 and actor.hp <= 0.0
+        if killed:
+            actor.alive = False
 
-                hits.append((actor, dmg, was_crit))
-                self.alive = False
-                self.did_hit = True
-                self.hit_actor = actor
-                return hits
-
+        hits.append((actor, hp_lost, was_crit, killed))
+        self.alive = False
+        self.did_hit = True
+        self.hit_actor = actor
         return hits
 
     def _tick_arc(self, dt, targets, agent, obstacles, arena_half, rng=None):
@@ -502,15 +564,17 @@ class SimProjectile:
                     dist = np.linalg.norm(self.pos - actor.pos)
                     if dist < self.arc_impact_radius:
                         falloff = 1.0 - (dist / self.arc_impact_radius) * 0.5
+                        hp_before = max(0.0, float(actor.hp))
                         dmg, actor.barrier, was_crit = compute_damage(
                             self.damage * falloff, self.attack_stat,
                             actor.defence, actor.barrier,
                             self.crit_chance, self.crit_multiplier, rng=rng)
-                        actor.hp -= dmg
-                        if actor.hp <= 0:
-                            actor.hp = 0
+                        actor.hp = max(0.0, actor.hp - dmg)
+                        hp_lost = max(0.0, hp_before - actor.hp)
+                        killed = hp_before > 0.0 and actor.hp <= 0.0
+                        if killed:
                             actor.alive = False
-                        hits.append((actor, dmg, was_crit))
+                        hits.append((actor, hp_lost, was_crit, killed))
             else:
                 # Point damage — check nearest valid target.
                 check_targets = targets if self.is_agent_projectile else [agent]
@@ -519,15 +583,17 @@ class SimProjectile:
                         continue
                     dist = np.linalg.norm(self.pos - actor.pos)
                     if dist < self.hit_radius * 1.5:  # Slightly generous for arc landing
+                        hp_before = max(0.0, float(actor.hp))
                         dmg, actor.barrier, was_crit = compute_damage(
                             self.damage, self.attack_stat,
                             actor.defence, actor.barrier,
                             self.crit_chance, self.crit_multiplier, rng=rng)
-                        actor.hp -= dmg
-                        if actor.hp <= 0:
-                            actor.hp = 0
+                        actor.hp = max(0.0, actor.hp - dmg)
+                        hp_lost = max(0.0, hp_before - actor.hp)
+                        killed = hp_before > 0.0 and actor.hp <= 0.0
+                        if killed:
                             actor.alive = False
-                        hits.append((actor, dmg, was_crit))
+                        hits.append((actor, hp_lost, was_crit, killed))
                         self.hit_actor = actor
                         break
 
@@ -1305,6 +1371,10 @@ class CombatEnv(gym.Env):
         self._squad_bucket_cursor = 0
         self._reward_target_hps = None
         self._reward_targets_killed = None
+        self.damage_ledger = DamageEventLedger()
+        self._step_damage_events: List[DamageEvent] = []
+        self._agent_kills = 0
+        self._next_projectile_id = 1
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -1315,6 +1385,10 @@ class CombatEnv(gym.Env):
         self._cached_movement_action = 0
         self._reward_target_hps = None
         self._reward_targets_killed = None
+        self.damage_ledger.clear()
+        self._step_damage_events = []
+        self._agent_kills = 0
+        self._next_projectile_id = 1
         self.reward_fn.reset()
         self._projectiles = []
         self.threat_table.reset()  # [Audit §1.3]
@@ -1446,8 +1520,10 @@ class CombatEnv(gym.Env):
         requested_move, requested_combat, requested_target = requested_action
         dt = self.cfg.decision_interval
         self.step_count += 1
+        self._step_damage_events = []
 
-        # Snapshot pre-action state for reward.
+        # Snapshot pre-action state for reward. Current-step ledger events are
+        # empty here and are populated by all damage/status paths below.
         prev_state = self._build_combat_state()
 
         # Gym callers can bypass the policy sampler, so enforce the exact mask
@@ -1578,21 +1654,12 @@ class CombatEnv(gym.Env):
         if self.render_mode is not None:
             self._projectile_snapshots.append(self._snapshot_projectiles())
 
-        # Snapshot agent-caused damage/kills before extension systems (allies,
-        # statuses) mutate the encounter. The hook still runs before reward,
-        # terminal state, observation and mask are finalized.
-        self._reward_target_hps = {
-            target.target_id: target.hp_fraction()
-            for target in self.targets
-        }
-        self._reward_targets_killed = sum(
-            1 for target in self.targets if not target.alive)
+        # Extension systems (allies/statuses) record into the same event ledger.
+        # Reward attribution below filters specifically for agent-caused events.
         self._before_transition_finalization(dt)
 
         # 5. Build post-action state.
         curr_state = self._build_combat_state()
-        self._reward_target_hps = None
-        self._reward_targets_killed = None
 
         # 6. Update weapon tracking for next step.
         self._prev_weapon_index = self.agent.active_weapon
@@ -1640,6 +1707,11 @@ class CombatEnv(gym.Env):
 
         self._advance_target_action_snapshot(dt)
         obs = self._build_observation()
+
+        # Expose authoritative causal events for debugging/logging.
+        info["damage_events"] = [
+            event.to_dict() for event in self._step_damage_events
+        ]
 
         # Include action mask for next step in info (used by PPO).
         next_action_mask = self.build_action_mask()
@@ -2155,6 +2227,7 @@ class CombatEnv(gym.Env):
                     agent._pending_fire = {
                         'target_pos': target.pos.copy(),
                         'target_vel': target.velocity.copy(),
+                        'target_id': target.target_id,
                         'slot_idx': agent.active_weapon,
                     }
                 else:
@@ -2199,13 +2272,21 @@ class CombatEnv(gym.Env):
 
         elif action == CombatAction.MELEE:
             if dist <= agent.melee.range and agent.melee.cooldown_remaining <= 0:
-                dmg, target.barrier, _ = compute_damage(
+                hp_before = max(0.0, float(target.hp))
+                dmg, target.barrier, was_crit = compute_damage(
                     agent.melee.damage, agent.attack_stat,
                     target.defence, target.barrier,
                     rng=self.rng)
-                target.hp -= dmg
-                if target.hp <= 0:
-                    target.hp = 0; target.alive = False
+                target.hp = max(0.0, target.hp - dmg)
+                hp_lost = max(0.0, hp_before - target.hp)
+                killed = hp_before > 0.0 and target.hp <= 0.0
+                if killed:
+                    target.alive = False
+                self._record_damage_event(
+                    "agent", 0, target, hp_lost,
+                    source_name="Melee", delivery="melee",
+                    was_crit=was_crit, killed=killed,
+                    intended_target_id=target.target_id)
                 agent.melee.cooldown_remaining = agent.melee.cooldown
                 agent.set_action_lock(agent.melee.cooldown, 4)  # reason=4 Melee  [Audit §1.1]
                 agent.targets_hit.add(target.target_id)
@@ -2240,12 +2321,18 @@ class CombatEnv(gym.Env):
                 agent.set_action_lock(
                     agent.dodge_duration + 0.1, 3)  # reason=3 Dodging
 
-    def _spawn_agent_projectile(self, slot: WeaponSlot, target, agent, dist: float):
+    def _spawn_agent_projectile(self, slot: WeaponSlot, target, agent, dist: float,
+                                intended_target_id: int = -1):
         """Spawn a projectile from the agent toward the target.
         
         Extracted from _execute_combat so it can be reused by
         _resolve_pending_fire for deferred wind-up shots.
         """
+        if intended_target_id < 0:
+            intended_target_id = int(getattr(target, "target_id", -1))
+        projectile_id = self._next_projectile_id
+        self._next_projectile_id += 1
+
         # Lead the target: aim at predicted position.
         flight_time = dist / max(slot.projectile_speed, 500.0)
         predicted_pos = target.pos + target.velocity * flight_time
@@ -2285,6 +2372,9 @@ class CombatEnv(gym.Env):
                 crit_multiplier=agent.crit_multiplier,
                 is_agent_projectile=True,
                 target_pos=predicted_pos.copy(),
+                projectile_id=projectile_id,
+                source_name=slot.name,
+                intended_target_id=intended_target_id,
                 is_arc=True,
                 max_arc_height=slot.max_arc_height,
                 arc_start=arc_start.copy(),
@@ -2306,6 +2396,9 @@ class CombatEnv(gym.Env):
                 crit_multiplier=agent.crit_multiplier,
                 is_agent_projectile=True,
                 target_pos=predicted_pos.copy(),
+                projectile_id=projectile_id,
+                source_name=slot.name,
+                intended_target_id=intended_target_id,
                 hit_radius=25.0,
             )
 
@@ -2346,7 +2439,9 @@ class CombatEnv(gym.Env):
         in_range = dist <= slot.weapon_range
         has_los = check_los(agent.pos, target.pos, self.obstacles)
         if in_range and (has_los or slot.can_arc):
-            self._spawn_agent_projectile(slot, target, agent, dist)
+            self._spawn_agent_projectile(
+                slot, target, agent, dist,
+                intended_target_id=int(pf.get('target_id', -1)))
 
     def _target_attacks_agent(self, dt: float):
         """Targets attack the agent with melee and/or ranged weapons.
@@ -2381,15 +2476,22 @@ class CombatEnv(gym.Env):
                         continue
 
                     # Melee can hit even when not facing (swing is wide).
-                    dmg, a.barrier, _ = compute_damage(
+                    hp_before = max(0.0, float(a.hp))
+                    dmg, a.barrier, was_crit = compute_damage(
                         t.melee_damage, t.melee_stat,
                         a.defence, a.barrier,
                         t.crit_chance, t.crit_multiplier,
                         rng=self.rng)  # [Audit §5.4, §4.1]
-                    a.hp -= dmg
-                    self.threat_table.record_damage(t.target_id, dmg)  # [Audit §1.3]
-                    if a.hp <= 0:
-                        a.hp = 0; a.alive = False
+                    a.hp = max(0.0, a.hp - dmg)
+                    hp_lost = max(0.0, hp_before - a.hp)
+                    killed = hp_before > 0.0 and a.hp <= 0.0
+                    if killed:
+                        a.alive = False
+                    self._record_damage_event(
+                        "target", t.target_id, a, hp_lost,
+                        source_name="TargetMelee", delivery="melee",
+                        was_crit=was_crit, killed=killed,
+                        intended_target_id=0)
                     continue
 
             # ── Facing check for ranged attacks ──────────────────
@@ -2466,8 +2568,12 @@ class CombatEnv(gym.Env):
                 is_agent_projectile=False,
                 source_id=t.target_id,
                 target_pos=predicted_agent_pos.copy(),
+                projectile_id=self._next_projectile_id,
+                source_name="TargetProjectile",
+                intended_target_id=0,
                 hit_radius=30.0,  # C++ is 15 UU; slightly larger for 2D approximation
             )
+            self._next_projectile_id += 1
             self._projectiles.append(proj)
 
             # # Hit.
@@ -2478,25 +2584,89 @@ class CombatEnv(gym.Env):
             # if a.hp <= 0:
             #     a.hp = 0; a.alive = False
             
+    def _actor_identity(self, actor):
+        if actor is self.agent:
+            return "agent", 0
+        if hasattr(actor, "target_id"):
+            return "target", int(actor.target_id)
+        if hasattr(actor, "ally_id"):
+            return "ally", int(actor.ally_id)
+        return actor.__class__.__name__.lower(), -1
+
+    def _record_damage_event(
+        self, attacker_kind: str, attacker_id: int, victim, damage: float,
+        *, source_name: str = "", delivery: str = "direct",
+        projectile_id: int = -1, intended_target_id: int = -1,
+        status_effect: str = "", was_crit: bool = False,
+        killed: bool = False,
+    ) -> DamageEvent:
+        """Append one authoritative causal event for this encounter."""
+        victim_kind, victim_id = self._actor_identity(victim)
+        max_hp = max(float(getattr(victim, "max_hp", 0.0)), 1e-8)
+        damage = max(0.0, float(damage))
+        event = DamageEvent(
+            event_id=self.damage_ledger.next_id(),
+            step=self.step_count,
+            timestamp=float(self.step_count * self.cfg.decision_interval),
+            attacker_kind=str(attacker_kind),
+            attacker_id=int(attacker_id),
+            victim_kind=victim_kind,
+            victim_id=victim_id,
+            damage=damage,
+            damage_fraction=damage / max_hp,
+            source_name=str(source_name),
+            delivery=str(delivery),
+            projectile_id=int(projectile_id),
+            intended_target_id=int(intended_target_id),
+            status_effect=str(status_effect),
+            was_crit=bool(was_crit),
+            killed=bool(killed),
+        )
+        self.damage_ledger.append(event)
+        self._step_damage_events.append(event)
+
+        # Threat and reward attribution consume the same source-of-truth event.
+        if (attacker_kind == "target" and victim_kind == "agent"
+                and damage > 0.0 and attacker_id >= 0):
+            self.threat_table.record_damage(attacker_id, damage)
+        if attacker_kind == "agent" and victim_kind == "target":
+            if damage > 0.0:
+                self.agent.targets_hit.add(victim_id)
+            if killed:
+                self._agent_kills += 1
+        return event
+
+    def _record_status_event(
+        self, attacker_kind: str, attacker_id: int, victim, status_effect: str,
+        *, source_name: str = "StatusEffect", delivery: str = "status",
+        intended_target_id: int = -1,
+    ) -> DamageEvent:
+        """Record a zero-damage status application in the same ledger."""
+        return self._record_damage_event(
+            attacker_kind, attacker_id, victim, 0.0,
+            source_name=source_name, delivery=delivery,
+            intended_target_id=intended_target_id,
+            status_effect=status_effect)
+
     def _tick_projectiles(self, dt: float):
-        """Advance all projectiles and apply damage on hit."""
+        """Advance projectiles and preserve asynchronous causal attribution."""
         for proj in self._projectiles:
             hits = proj.tick(dt, self.targets, self.agent,
                              self.obstacles, self._arena_half, rng=self.rng)
+            delivery = "arc_projectile" if proj.is_arc else "projectile"
 
-            # Track agent hits for targets_hit set.
-            if proj.is_agent_projectile:
-                for (actor, dmg, was_crit) in hits:
-                    if hasattr(actor, 'target_id'):
-                        self.agent.targets_hit.add(actor.target_id)
-            else:
-                # [Audit §1.3] Record damage from enemy projectiles for
-                # threat-based priority scoring.
-                for (actor, dmg, was_crit) in hits:
-                    if proj.source_id >= 0:
-                        self.threat_table.record_damage(proj.source_id, dmg)
+            for actor, hp_lost, was_crit, killed in hits:
+                if proj.is_agent_projectile:
+                    attacker_kind, attacker_id = "agent", 0
+                else:
+                    attacker_kind, attacker_id = "target", proj.source_id
+                self._record_damage_event(
+                    attacker_kind, attacker_id, actor, hp_lost,
+                    source_name=proj.source_name, delivery=delivery,
+                    projectile_id=proj.projectile_id,
+                    intended_target_id=proj.intended_target_id,
+                    was_crit=was_crit, killed=killed)
 
-        # Remove dead projectiles.
         self._projectiles = [p for p in self._projectiles if p.alive]
 
     # ═════════════════════════════════════════════════════════════
@@ -3181,28 +3351,24 @@ class CombatEnv(gym.Env):
                            and not a.is_dodging
                            and not a.is_winding_up)
 
-        # Total damage dealt across ALL targets this step (for multi-target reward).
-        total_damage_all_targets = 0.0
-        for t in self.targets:
-            prev_hp = self._prev_target_hps.get(t.target_id, t.hp_fraction())
-            reward_hp = (
-                self._reward_target_hps.get(t.target_id, t.hp_fraction())
-                if self._reward_target_hps is not None
-                else t.hp_fraction()
-            )
-            delta = max(0.0, prev_hp - reward_hp)
-            total_damage_all_targets += delta
-
-        reward_target_hp = target.hp_fraction() if target else 0.0
+        # Authoritative current-step reward attribution from the event ledger.
+        agent_target_events = [
+            event for event in self._step_damage_events
+            if (event.attacker_kind == "agent"
+                and event.victim_kind == "target"
+                and event.damage > 0.0)
+        ]
+        total_damage_all_targets = sum(
+            event.damage_fraction for event in agent_target_events)
         selected_target_damage = 0.0
-        if target:
-            if self._reward_target_hps is not None:
-                reward_target_hp = self._reward_target_hps.get(
-                    target.target_id, reward_target_hp)
-            previous_target_hp = self._prev_target_hps.get(
-                target.target_id, reward_target_hp)
-            selected_target_damage = max(
-                0.0, previous_target_hp - reward_target_hp)
+        if target is not None:
+            selected_target_damage = sum(
+                event.damage_fraction for event in agent_target_events
+                if event.victim_id == target.target_id)
+        damage_taken_this_step = sum(
+            event.damage_fraction for event in self._step_damage_events
+            if event.victim_kind == "agent" and event.damage > 0.0)
+        reward_target_hp = target.hp_fraction() if target else 0.0
 
         return CombatState(
             self_hp=a.hp_fraction(),
@@ -3275,12 +3441,9 @@ class CombatEnv(gym.Env):
                 default=1.0),
             step_count=self.step_count,
             episode_damage_dealt=self.reward_fn._episode_damage_dealt,
-            targets_killed=(
-                self._reward_targets_killed
-                if self._reward_targets_killed is not None
-                else sum(1 for t in self.targets if not t.alive)
-            ),
+            targets_killed=self._agent_kills,
             total_damage_all_targets=total_damage_all_targets,
+            damage_taken_this_step=damage_taken_this_step,
             targets_attacked=a.targets_hit,
         )
 
