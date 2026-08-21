@@ -3058,7 +3058,7 @@ class CombatEnv(gym.Env):
                 if abs(d) > 1e-6:
                     wall = effective_half if d > 0 else -effective_half
                     t_wall = (wall - a.pos[axis]) / d
-                    if 0 < t_wall < blocked_dist:
+                    if 0 <= t_wall < blocked_dist:
                         blocked_dist = t_wall
 
             obs[idx] = blocked_dist; idx += 1
