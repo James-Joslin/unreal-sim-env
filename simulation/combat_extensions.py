@@ -51,6 +51,10 @@ from combat_sim import (
 #  Status Effect System
 # ─────────────────────────────────────────────────────────────────
 
+DEBUFF_NAMES = (
+    "poison", "scold", "shock", "frostbite", "weakness", "curse",
+)
+
 @dataclass
 class StatusEffect:
     """A single active status effect on the agent."""
@@ -74,7 +78,9 @@ class StatusEffectState:
     stunned: StatusEffect = field(default_factory=StatusEffect)
     slowed: StatusEffect = field(default_factory=StatusEffect)
     debuff_slots: List[StatusEffect] = field(
-        default_factory=lambda: [StatusEffect() for _ in range(6)])
+        default_factory=lambda: [
+            StatusEffect(name=name) for name in DEBUFF_NAMES
+        ])
 
     def tick(self, dt: float):
         self.stunned.tick(dt)
@@ -89,18 +95,12 @@ class StatusEffectState:
         self.slowed = StatusEffect("slow", duration, strength)
 
     def apply_debuff(self, name: str, duration: float, strength: float = 0.5):
-        # Find empty slot or replace weakest.
-        for slot in self.debuff_slots:
-            if not slot.active:
-                slot.name = name
-                slot.duration_remaining = duration
-                slot.strength = strength
-                return
-        # All full — replace shortest remaining.
-        weakest = min(self.debuff_slots, key=lambda s: s.duration_remaining)
-        weakest.name = name
-        weakest.duration_remaining = duration
-        weakest.strength = strength
+        normalized = str(name).lower()
+        if normalized not in DEBUFF_NAMES:
+            raise ValueError(f"Unsupported production debuff: {name}")
+        slot = self.debuff_slots[DEBUFF_NAMES.index(normalized)]
+        slot.duration_remaining = max(slot.duration_remaining, duration)
+        slot.strength = strength
 
     @property
     def is_stunned(self) -> bool:
@@ -501,47 +501,56 @@ class CombatEnvExtended(CombatEnv):
     # ═════════════════════════════════════════════════════════════
 
     def _maybe_apply_status_effects(self, dt: float):
-        """Targets have a small chance of applying status effects per attack.
-        This teaches the agent to handle being stunned/slowed."""
+        """Roll status effects only for accepted target-to-agent hits."""
         stage = self.cfg.curriculum_stage
         if stage < 3:
             return  # No status effects in early stages.
 
-        for t in self.targets:
-            if not t.alive:
-                continue
+        accepted_hits = [
+            event for event in self._step_damage_events
+            if (event.attacker_kind == "target"
+                and event.victim_kind == "agent"
+                and event.damage > 0.0)
+        ]
+        for event in accepted_hits:
+            target = next(
+                (
+                    candidate for candidate in self.targets
+                    if candidate.target_id == event.attacker_id
+                ),
+                None,
+            )
 
-            dist = np.linalg.norm(self.agent.pos - t.pos)
+            if event.delivery == "melee" and self.rng.random() < 0.08:
+                self.status_effects.apply_stun(
+                    0.4 + self.rng.uniform(0.0, 0.3))
+                self._record_status_event(
+                    "target", event.attacker_id, self.agent, "stun",
+                    source_name=event.source_name,
+                    intended_target_id=event.intended_target_id)
 
-            # Melee targets can stun on close hits.
-            if t.combat_role == "melee" and dist < t.melee_range * 1.5:
-                if t.melee_cooldown_remaining <= 0 and self.rng.random() < 0.08:
-                    self.status_effects.apply_stun(0.4 + self.rng.uniform(0, 0.3))
-                    self._record_status_event(
-                        "target", t.target_id, self.agent, "stun",
-                        source_name="TargetStatus")
+            if (event.delivery in ("projectile", "arc_projectile")
+                    and target is not None
+                    and target.combat_role in ("ranged", "mixed")
+                    and self.rng.random() < 0.05):
+                self.status_effects.apply_slow(
+                    1.0 + self.rng.uniform(0.0, 1.0),
+                    strength=self.rng.uniform(0.2, 0.5))
+                self._record_status_event(
+                    "target", event.attacker_id, self.agent, "slow",
+                    source_name=event.source_name,
+                    intended_target_id=event.intended_target_id)
 
-            # Ranged targets can slow.
-            if t.combat_role in ("ranged", "mixed"):
-                if t.attack_cooldown_remaining <= 0 and self.rng.random() < 0.05:
-                    self.status_effects.apply_slow(
-                        1.0 + self.rng.uniform(0, 1.0),
-                        strength=self.rng.uniform(0.2, 0.5))
-                    self._record_status_event(
-                        "target", t.target_id, self.agent, "slow",
-                        source_name="TargetStatus")
-
-            # Any target can apply a generic debuff (simulates poison, scold, etc.)
-            if self.rng.random() < 0.02 * dt:
-                debuff_names = ["poison", "scold", "weaken", "blind", "mark", "burn"]
-                debuff_name = self.rng.choice(debuff_names)
+            if self.rng.random() < 0.02:
+                debuff_name = self.rng.choice(DEBUFF_NAMES)
                 self.status_effects.apply_debuff(
                     debuff_name,
                     duration=self.rng.uniform(2.0, 5.0),
                     strength=self.rng.uniform(0.1, 0.4))
                 self._record_status_event(
-                    "target", t.target_id, self.agent, debuff_name,
-                    source_name="TargetStatus")
+                    "target", event.attacker_id, self.agent, debuff_name,
+                    source_name=event.source_name,
+                    intended_target_id=event.intended_target_id)
 
     # ═════════════════════════════════════════════════════════════
     #  Threat Tracking
@@ -701,7 +710,7 @@ class CombatEnvExtended(CombatEnv):
         obs[3] = 1.0 if se.is_stunned else 0.0             # stunned
         obs[4] = 1.0 if se.slowed.active else 0.0          # slowed
         for i in range(6):                                   # debuff slots
-            obs[5 + i] = se.debuff_slots[i].strength if se.debuff_slots[i].active else 0.0
+            obs[5 + i] = 1.0 if se.debuff_slots[i].active else 0.0
         # [Audit §1.8] C++ TraceHeightAboveGround returns ~88 UU for a
         # grounded ACharacter. 88/500 ≈ 0.176.
         obs[14] = 0.176                                      # height above ground
