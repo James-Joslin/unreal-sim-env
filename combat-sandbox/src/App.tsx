@@ -12,17 +12,16 @@ ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/di
 // ═══════════════════════════════════════════════════════════════════
 //  Constants (match C++ / Python exactly)
 // ═══════════════════════════════════════════════════════════════════
-const OBS_SIZE = 249;
-const FRAME_STACK = 3;
+const OBS_SIZE = 215;
 const MOVEMENT_ACTIONS = 9;
-const COMBAT_ACTIONS = 9;
+const COMBAT_ACTIONS = 7;
 const TARGET_ACTIONS = 5;
 const DT = 0.2; // decision interval
 const S = 0.7071067811865476; // 1/√2
 const MOVE_DIRS = [[0, 0], [0, -1], [S, -S], [1, 0], [S, S], [0, 1], [-S, S], [-1, 0], [-S, -S]];
 const SPATIAL_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315];
-const LOCK_NAMES = ["", "Firing", "Reloading", "Dodging", "Melee", "Switching", "WindUp", "Reposition"];
-const COMBAT_NAMES = ["None", "Fire", "Reload", "Sw0", "Sw1", "Melee", "Block", "Dodge", "Reposition"];
+const LOCK_NAMES = ["", "Firing", "Reloading", "Dodging", "Melee", "Switching", "WindUp"];
+const COMBAT_NAMES = ["None", "Fire", "Reload", "Sw0", "Sw1", "Melee", "Block"];
 
 // ═══════════════════════════════════════════════════════════════════
 //  Weapon Presets (match Python WEAPON_PRESETS["heavy"])
@@ -39,7 +38,6 @@ interface WeaponPreset {
     projSpeed: number;
     optMin?: number;
     optMax?: number;
-    maxArcHeight?: number;
     canArc: boolean;
   }[];
   melee: { damage: number; range: number; cooldown: number };
@@ -73,7 +71,6 @@ export interface Weapon {
   projSpeed: number;
   optMin?: number;
   optMax?: number;
-  maxArcHeight?: number;
   canArc: boolean;
   ammo: number;
   cdRemain: number;
@@ -143,13 +140,6 @@ export interface AgentState {
   dodgeDir: [number, number];
   dodgeDuration: number;
   dodgeCooldown: number;
-  isRepositioning: boolean;
-  repositionRemain: number;
-  repositionCd: number;
-  repositionDir: [number, number];
-  repositionDuration: number;
-  repositionCooldown: number;
-  repositionSpeedMultiplier: number;
   isSwitching: boolean;
   switchRemain: number;
   switchTarget: number;
@@ -352,8 +342,6 @@ function createSim(presetName: string = "heavy", arenaSize = 2500, numTargets = 
       barrier: 0, defence: 25, atkStat: 10, critChance: 0.05, critMult: 1.5,
       weapons, activeWeapon: 0, melee: { ...wp.melee, cdRemain: 0 },
       isDodging: false, dodgeRemain: 0, dodgeCd: 0, dodgeDir: [0, 0], dodgeDuration: 0.3, dodgeCooldown: 2.0,
-      isRepositioning: false, repositionRemain: 0, repositionCd: 0, repositionDir: [0, 0],
-      repositionDuration: 0.6, repositionCooldown: 3.0, repositionSpeedMultiplier: 1.75,
       isSwitching: false, switchRemain: 0, switchTarget: 0, switchTime: 0.2,
       isWindingUp: false, windUpRemain: 0, pendingFire: null,
       lockRemain: 0, lockDuration: 0, lockReason: 0, combatTime: 0,
@@ -397,6 +385,7 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
   }
 
   pl.pos = [playerPos[0], playerPos[1]];
+  ag.activeTargetIdx = tIdx;
 
   // Dynamic targeting: sync the player's position, facing, velocity, and HP to the target representing them
   const playerTarget = sim.targets.find(t => t.role === "player");
@@ -407,15 +396,6 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
     playerTarget.facing = [pl.facing[0], pl.facing[1]];
     playerTarget.hp = pl.hp;
     playerTarget.alive = pl.hp > 0;
-  }
-
-  // Target actions address the four scored observation slots. Action 4 is
-  // Keep Current, so it must not be treated as a fifth array index.
-  if (tIdx >= 0 && tIdx < TARGET_ACTIONS - 1) {
-    const scored = sim.targets.filter(t => t.alive)
-      .sort((a, b) => scoreTarget(sim, b) - scoreTarget(sim, a));
-    const selected = scored[tIdx];
-    if (selected) ag.activeTargetIdx = sim.targets.indexOf(selected);
   }
 
   // Update player weapon
@@ -451,14 +431,6 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
   if (ag.lockRemain > 0) ag.lockRemain = Math.max(0, ag.lockRemain - dt);
   if (ag.dodgeRemain > 0) { ag.dodgeRemain -= dt; if (ag.dodgeRemain <= 0) ag.isDodging = false; }
   if (ag.dodgeCd > 0) ag.dodgeCd = Math.max(0, ag.dodgeCd - dt);
-  if (ag.repositionRemain > 0) {
-    ag.repositionRemain -= dt;
-    if (ag.repositionRemain <= 0) {
-      ag.repositionRemain = 0;
-      ag.isRepositioning = false;
-    }
-  }
-  if (ag.repositionCd > 0) ag.repositionCd = Math.max(0, ag.repositionCd - dt);
   if (ag.isSwitching) { ag.switchRemain -= dt; if (ag.switchRemain <= 0) { ag.isSwitching = false; ag.activeWeapon = ag.switchTarget; } }
   if (ag.isWindingUp) { ag.windUpRemain -= dt; if (ag.windUpRemain <= 0) ag.isWindingUp = false; }
   ag.melee.cdRemain = Math.max(0, ag.melee.cdRemain - dt);
@@ -481,17 +453,11 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
 
   // Agent movement
   const isLocked = ag.lockRemain > 0;
-  if (!isLocked && !ag.isDodging && !ag.isRepositioning && !ag.isSwitching) {
+  if (!isLocked && !ag.isDodging && !ag.isSwitching) {
     const dir = MOVE_DIRS[mIdx] || [0, 0];
     ag.vel = [dir[0] * ag.maxSpeed, dir[1] * ag.maxSpeed];
   }
   if (ag.isDodging) ag.vel = [ag.dodgeDir[0] * 600, ag.dodgeDir[1] * 600];
-  else if (ag.isRepositioning) {
-    ag.vel = [
-      ag.repositionDir[0] * ag.maxSpeed * ag.repositionSpeedMultiplier,
-      ag.repositionDir[1] * ag.maxSpeed * ag.repositionSpeedMultiplier,
-    ];
-  }
 
   ag.pos[0] += ag.vel[0] * dt;
   ag.pos[1] += ag.vel[1] * dt;
@@ -538,24 +504,6 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
       target.hp -= hpDamage; if (target.hp <= 0) { target.hp = 0; target.alive = false; }
       ag.melee.cdRemain = ag.melee.cooldown;
       setLock(ag, ag.melee.cooldown, 4);
-    } else if (cIdx === 7 && !ag.isDodging && ag.dodgeCd <= 0) {
-      // Dodge is explicit-only. Use the selected movement direction, falling
-      // back away from the target when the movement head selects Hold.
-      const selectedDir = MOVE_DIRS[mIdx] as [number, number] | undefined;
-      const away = norm([ag.pos[0] - target.pos[0], ag.pos[1] - target.pos[1]]);
-      ag.dodgeDir = selectedDir && mIdx !== 0 ? [selectedDir[0], selectedDir[1]] : away;
-      ag.isDodging = true;
-      ag.dodgeRemain = ag.dodgeDuration;
-      ag.dodgeCd = ag.dodgeCooldown;
-      setLock(ag, ag.dodgeDuration + 0.1, 3);
-    } else if (cIdx === 8 && mIdx !== 0 && !ag.isRepositioning && ag.repositionCd <= 0) {
-      // Reposition is a fast, collidable move with no invulnerability.
-      const selectedDir = MOVE_DIRS[mIdx] as [number, number];
-      ag.repositionDir = [selectedDir[0], selectedDir[1]];
-      ag.isRepositioning = true;
-      ag.repositionRemain = ag.repositionDuration;
-      ag.repositionCd = ag.repositionCooldown;
-      setLock(ag, ag.repositionDuration, 7);
     }
   }
 
@@ -982,13 +930,14 @@ function calculateFrameReward(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Build 249-float Observation
+//  Build 215-float Observation
 // ═══════════════════════════════════════════════════════════════════
 const TIER_PROFILES = {
   micro: { name: "Micro", frameStack: 3, decisionInterval: 0.4, spatialTraces: 4, sizeLabel: "Combat_Micro.onnx" },
   small: { name: "Small", frameStack: 3, decisionInterval: 0.3, spatialTraces: 8, sizeLabel: "Combat_Small.onnx" },
   medium: { name: "Medium", frameStack: 3, decisionInterval: 0.2, spatialTraces: 8, sizeLabel: "Combat_Medium.onnx" },
   large: { name: "Large", frameStack: 3, decisionInterval: 0.15, spatialTraces: 8, sizeLabel: "Combat_Large.onnx" },
+  xl: { name: "XL", frameStack: 3, decisionInterval: 0.1, spatialTraces: 12, sizeLabel: "Combat_XL.onnx" },
 };
 
 function softmaxSample(logits: number[], mask: boolean[], temp = 1.0): number {
@@ -1020,7 +969,7 @@ function softmaxSample(logits: number[], mask: boolean[], temp = 1.0): number {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Build 249-float Observation
+//  Build 215-float Observation
 // ═══════════════════════════════════════════════════════════════════
 function buildObservation(
   sim: SimState,
@@ -1058,7 +1007,7 @@ function buildObservation(
   obs[idx++] = ag.lockRemain > 0 ? 1 : 0;
   const lockProg = ag.lockRemain > 0 ? clamp(1 - ag.lockRemain / Math.max(ag.lockDuration, 0.01), 0, 1) : 0;
   obs[idx++] = lockProg;
-  obs[idx++] = ag.lockRemain > 0 ? ag.lockReason / 7.0 : 0;
+  obs[idx++] = ag.lockRemain > 0 ? ag.lockReason / 6.0 : 0;
   obs[idx++] = ag.isDodging ? 1 : 0;
   obs[idx++] = ag.dodgeCd <= 0 ? 1 : 0;
   obs[idx++] = ag.isDodging ? 1 : 0;
@@ -1142,18 +1091,13 @@ function buildObservation(
     const relVel: [number, number] = [ag.vel[0] - tVel[0], ag.vel[1] - tVel[1]];
     const toTarget: [number, number] = [rel[0] / d, rel[1] / d];
     obs[idx++] = clamp(dot(relVel, toTarget) / 1000, -1, 1);
-    // Character type, mana, commitment and gap-closer threat are not
-    // simulated by this lightweight browser environment.
-    idx += 4;
-    obs[idx++] = (!ag.isRepositioning && ag.repositionCd <= 0) ? 1 : 0;
+    idx++;
   } else {
-    // Reposition readiness remains self-owned even without a live target.
-    idx += 23;
-    obs[idx++] = (!ag.isRepositioning && ag.repositionCd <= 0) ? 1 : 0;
+    idx += 20;
   }
 
   for (let si = 0; si < 4; si++) {
-    const base = 74 + si * 17;
+    const base = 70 + si * 13;
     if (si < sortedTargets.length) {
       const t = sortedTargets[si];
       const rel = [t.pos[0] - ag.pos[0], t.pos[1] - ag.pos[1]];
@@ -1181,12 +1125,10 @@ function buildObservation(
       obs[base + 10] = clamp(t.vel[0] / 600, -1, 1);
       obs[base + 11] = clamp(t.vel[1] / 600, -1, 1);
       obs[base + 12] = clamp(dot(t.facing, toAg), 0, 1);
-      // [+13..+16] character type, mana, commitment and gap-closer threat
-      // intentionally stay zero: the browser sandbox does not simulate them.
     }
   }
-  idx = 142;
-  idx = 187; // Allied robots are not simulated; their occupied flags stay 0.
+  idx = 122;
+  idx = 158; // Allied robots skipped
 
   for (const ang of SPATIAL_ANGLES) {
     const rad = ang * Math.PI / 180;
@@ -1266,7 +1208,7 @@ function buildObservation(
 
   obs[idx++] = clamp(dist(ag.pos, ag.spawnPos || [0, 0]) / (ag.leashRange || 2000), 0, 1);
 
-  // ── Extended Threat: Projectiles 2 and 3 (227-232) ──
+  // ── Extended Threat: Projectiles 2 and 3 (198-203) ──
   // Collect up to 3 nearest threatening projectiles
   const threatProjs: { dist: number; dir: [number, number] }[] = [];
   for (const p of sim.projectiles) {
@@ -1280,22 +1222,22 @@ function buildObservation(
     threatProjs.push({ dist: d / 600, dir: vd });
   }
   threatProjs.sort((a, b) => a.dist - b.dist);
-  // Proj 2 (indices 227-229)
+  // Proj 2 (indices 198-200)
   if (threatProjs.length > 1) {
     obs[idx++] = threatProjs[1].dist;
     obs[idx++] = threatProjs[1].dir[0];
     obs[idx++] = threatProjs[1].dir[1];
   } else { idx += 3; }
-  // Proj 3 (indices 230-232)
+  // Proj 3 (indices 201-203)
   if (threatProjs.length > 2) {
     obs[idx++] = threatProjs[2].dist;
     obs[idx++] = threatProjs[2].dir[0];
     obs[idx++] = threatProjs[2].dir[1];
   } else { idx += 3; }
-  // Threat count (index 233)
+  // Threat count (index 204)
   obs[idx++] = clamp(threatProjs.length / 5, 0, 1);
 
-  // ── Can Hit Target per Weapon (234-237) ──
+  // ── Can Hit Target per Weapon (205-208) ──
   const tgt = sim.targets[ag.activeTargetIdx];
   const tgtDist = tgt && tgt.alive ? dist(ag.pos, tgt.pos) : 9999;
   const tgtLOS = tgt && tgt.alive ? checkLOS(ag.pos, tgt.pos, sim.obstacles) : false;
@@ -1318,18 +1260,18 @@ function buildObservation(
     } else { idx++; }
   }
 
-  // ── Total Ammo Fraction (238) ──
+  // ── Total Ammo Fraction (209) ──
   const totalAmmo = ag.weapons.length > 0
     ? ag.weapons.reduce((s, w) => s + w.ammo / w.maxAmmo, 0) / ag.weapons.length
     : 0;
   obs[idx++] = clamp(totalAmmo, 0, 1);
 
-  // ── Targets Killed Fraction (239) ──
+  // ── Targets Killed Fraction (210) ──
   const totalHostiles = sim.targets.length;
   const killedHostiles = sim.targets.filter(t => !t.alive).length;
   obs[idx++] = totalHostiles > 0 ? killedHostiles / totalHostiles : 0;
 
-  // ── Arc Clearance per Weapon (240-243) ──
+  // ── Arc Clearance per Weapon (211-214) ──
   for (let wi = 0; wi < 4; wi++) {
     if (wi < ag.weapons.length) {
       const w = ag.weapons[wi];
@@ -1340,14 +1282,6 @@ function buildObservation(
     } else { idx++; }
   }
 
-  // ── Player Patterns (244-248) ──
-  // The sandbox does not yet model the production EMA tracker, so these are
-  // explicit unsupported zeroes rather than fabricated approximations.
-  idx += 5;
-
-  if (idx !== OBS_SIZE) {
-    throw new Error(`Observation builder wrote ${idx} fields; expected ${OBS_SIZE}.`);
-  }
   return obs;
 }
 
@@ -1369,10 +1303,8 @@ function buildActionMask(sim: SimState) {
     if (ag.weapons.length > 0 && ag.activeWeapon !== 0) c[3] = true;
     if (ag.weapons.length > 1 && ag.activeWeapon !== 1) c[4] = true;
     c[5] = true;
-    c[6] = true;
-    if (!ag.isDodging && ag.dodgeCd <= 0) c[7] = true;
-    if (!ag.isRepositioning && ag.repositionCd <= 0) c[8] = true;
   }
+  c[6] = true;
 
   const t = new Array(TARGET_ACTIONS).fill(false);
   const alive = sim.targets.filter(x => x.alive);
@@ -1385,86 +1317,37 @@ function buildActionMask(sim: SimState) {
 // ═══════════════════════════════════════════════════════════════════
 //  ONNX Inference
 // ═══════════════════════════════════════════════════════════════════
-interface LoadedModel {
-  session: any;
-  frameStack: number;
-  hiddenSize: number;
-  hidden: Float32Array;
-}
-
 async function loadOnnxModel(file: File) {
   const buf = await file.arrayBuffer();
   const session = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
-  const requiredInputs = ["observation", "hidden_in"];
-  const requiredOutputs = ["movement_logits", "combat_logits", "target_logits", "hidden_out"];
-
-  for (const name of requiredInputs) {
-    if (!session.inputNames.includes(name)) {
-      await session.release();
-      throw new Error(`Unsupported model: missing input '${name}'.`);
-    }
-  }
-  for (const name of requiredOutputs) {
-    if (!session.outputNames.includes(name)) {
-      await session.release();
-      throw new Error(`Unsupported model: missing output '${name}'.`);
-    }
-  }
-
-  const obsMeta: any = session.inputMetadata[session.inputNames.indexOf("observation")];
-  const hiddenMeta: any = session.inputMetadata[session.inputNames.indexOf("hidden_in")];
-  const expectedInput = OBS_SIZE * FRAME_STACK;
-  const obsWidth = obsMeta?.isTensor ? obsMeta.shape?.[obsMeta.shape.length - 1] : undefined;
-  const hiddenSize = hiddenMeta?.isTensor ? hiddenMeta.shape?.[hiddenMeta.shape.length - 1] : undefined;
-  if (obsWidth !== expectedInput) {
-    await session.release();
-    throw new Error(`Unsupported model observation width ${String(obsWidth)}; expected ${expectedInput}.`);
-  }
-  if (!Number.isInteger(hiddenSize) || hiddenSize <= 0) {
-    await session.release();
-    throw new Error("Unsupported model: hidden_in must have shape [1, batch, hidden_size].");
-  }
-
-  const model: LoadedModel = {
-    session,
-    frameStack: FRAME_STACK,
-    hiddenSize,
-    hidden: new Float32Array(hiddenSize),
-  };
-
-  // A real dry run validates all independent-head widths before accepting the
-  // upload; incompatible legacy models fail here instead of sampling nonsense.
+  let fs = 1;
   try {
-    await runInference(model, new Float32Array(expectedInput), model.hidden);
-    return model;
-  } catch (error) {
-    await session.release();
-    throw error;
+    const dummy = new Float32Array(OBS_SIZE);
+    const t = new ort.Tensor("float32", dummy, [1, OBS_SIZE]);
+    await session.run({ [session.inputNames[0]]: t });
+  } catch {
+    for (const tryFs of [8, 4, 3, 1]) {
+      try {
+        const dummy = new Float32Array(OBS_SIZE * tryFs);
+        const t = new ort.Tensor("float32", dummy, [1, OBS_SIZE * tryFs]);
+        await session.run({ [session.inputNames[0]]: t });
+        fs = tryFs; break;
+      } catch { continue; }
+    }
   }
+  return { session, frameStack: fs };
 }
 
-async function runInference(model: LoadedModel, obsBuffer: Float32Array, hidden = model.hidden) {
-  if (obsBuffer.length !== OBS_SIZE * FRAME_STACK) {
-    throw new Error(`Observation length ${obsBuffer.length}; expected ${OBS_SIZE * FRAME_STACK}.`);
-  }
-  if (hidden.length !== model.hiddenSize) {
-    throw new Error(`Hidden-state length ${hidden.length}; expected ${model.hiddenSize}.`);
-  }
-
+async function runInference(session: any, obsBuffer: Float32Array) {
   const tensor = new ort.Tensor("float32", obsBuffer, [1, obsBuffer.length]);
-  const hiddenTensor = new ort.Tensor("float32", hidden, [1, 1, model.hiddenSize]);
-  const results = await model.session.run({ observation: tensor, hidden_in: hiddenTensor });
-  const m = Array.from(results.movement_logits.data as Float32Array);
-  const c = Array.from(results.combat_logits.data as Float32Array);
-  const t = Array.from(results.target_logits.data as Float32Array);
-  const hiddenOut = new Float32Array(results.hidden_out.data as Float32Array);
-  if (m.length !== MOVEMENT_ACTIONS || c.length !== COMBAT_ACTIONS || t.length !== TARGET_ACTIONS) {
-    throw new Error(`Action head widths ${m.length}/${c.length}/${t.length}; expected 9/9/5.`);
-  }
-  if (hiddenOut.length !== model.hiddenSize) {
-    throw new Error(`hidden_out length ${hiddenOut.length}; expected ${model.hiddenSize}.`);
-  }
-  return { m, c, t, hidden: hiddenOut };
+  const inputName = session.inputNames[0];
+  const results = await session.run({ [inputName]: tensor });
+  const names = session.outputNames;
+  return {
+    m: Array.from(results[names[0]].data as Float32Array),
+    c: Array.from(results[names[1]].data as Float32Array),
+    t: Array.from(results[names[2]].data as Float32Array),
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1646,7 +1529,7 @@ export default function CombatSandbox() {
   const [overlays, setOverlays] = useState({ facing: true, range: true, los: true });
 
   // C++ Alignment States for Registry/Decision / Sampling Modes
-  const [selectedTier, setSelectedTier] = useState<"micro" | "small" | "medium" | "large">("medium");
+  const [selectedTier, setSelectedTier] = useState<"micro" | "small" | "medium" | "large" | "xl">("medium");
   const [sampleStrategy, setSampleStrategy] = useState<"greedy" | "stochastic">("greedy");
   const [temperature, setTemperature] = useState<number>(1.0);
 
@@ -1691,9 +1574,9 @@ export default function CombatSandbox() {
   // Stable references for the animation frame loop
   const pausedRef = useRef(false);
   const overlaysRef = useRef(overlays);
-  const modelInfoRef = useRef<LoadedModel | null>(null);
+  const modelInfoRef = useRef<{ session: any; frameStack: number } | null>(null);
 
-  const selectedTierRef = useRef<"micro" | "small" | "medium" | "large">("medium");
+  const selectedTierRef = useRef<"micro" | "small" | "medium" | "large" | "xl">("medium");
   const sampleStrategyRef = useRef<"greedy" | "stochastic">("greedy");
   const tempRef = useRef<number>(1.0);
   const prevTargetVelRef = useRef<Record<number, [number, number]>>({});
@@ -1713,7 +1596,6 @@ export default function CombatSandbox() {
     playerPosRef.current = [selArenaSize * 0.2, selArenaSize * 0.12];
     if (modelInfoRef.current) {
       frameStackBufRef.current = createFrameStack(modelInfoRef.current.frameStack);
-      modelInfoRef.current.hidden.fill(0);
     }
 
     // Reset reward lists and accumulators
@@ -1742,26 +1624,21 @@ export default function CombatSandbox() {
   const downloadRecordedCSV = () => {
     if (recordedStepsRef.current.length === 0) return;
 
-    // 258 fields total: 5 metadata + 249 observation values + 3 actions + 1 reward.
+    // 224 fields total: 5 metadata + 215 observation vector + 3 action vector + 1 reward
     const csvHeaders = [
       "EncounterID", "EnemyName", "Archetype", "Frame", "CombatTime",
       ...Array.from({ length: 21 }, (_, i) => `Self_${i}`),
       ...Array.from({ length: 22 }, (_, i) => `Weapon_${i}`),
       ...Array.from({ length: 7 }, (_, i) => `Archetype_${i}`),
-      ...Array.from({ length: 24 }, (_, i) => `PrimaryTarget_${i}`),
-      ...Array.from({ length: 68 }, (_, i) => `Hostile_${i}`),
-      ...Array.from({ length: 45 }, (_, i) => `Allied_${i}`),
+      ...Array.from({ length: 20 }, (_, i) => `PrimaryTarget_${i}`),
+      ...Array.from({ length: 52 }, (_, i) => `Hostile_${i}`),
+      ...Array.from({ length: 36 }, (_, i) => `Allied_${i}`),
       ...Array.from({ length: 8 }, (_, i) => `SpatialRing_${i}`),
       ...Array.from({ length: 8 }, (_, i) => `Cover_${i}`),
       ...Array.from({ length: 8 }, (_, i) => `ThreatSensing_${i}`),
       ...Array.from({ length: 9 }, (_, i) => `Navmesh_${i}`),
       ...Array.from({ length: 6 }, (_, i) => `GroupSummary_${i}`),
       "SpawnLeash",
-      ...Array.from({ length: 7 }, (_, i) => `ExtendedThreat_${i}`),
-      ...Array.from({ length: 4 }, (_, i) => `CanHit_${i}`),
-      "TotalAmmo", "TargetsKilled",
-      ...Array.from({ length: 4 }, (_, i) => `ArcClearance_${i}`),
-      ...Array.from({ length: 5 }, (_, i) => `PlayerPattern_${i}`),
       "Action_Move", "Action_Combat", "Action_Target",
       "StepReward"
     ];
@@ -1975,11 +1852,7 @@ export default function CombatSandbox() {
             const stacked = getStacked(frameStackBufRef.current);
 
             // Asynchronous non-blocking neural inference
-            const activeModel = modelInfoRef.current;
-            runInference(activeModel, stacked).then(logits => {
-              // Carry recurrent state across decisions, just as the runtime
-              // does. resetSim() zeroes this state at the episode boundary.
-              if (modelInfoRef.current === activeModel) activeModel.hidden = logits.hidden;
+            runInference(modelInfoRef.current.session, stacked).then(logits => {
               const mask = buildActionMask(currentSim);
 
               // Expose logits and masks for the action probability heatmap
@@ -2098,8 +1971,7 @@ export default function CombatSandbox() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // Load only the current named recurrent ONNX contract. Behavioural tier is
-  // selected explicitly because all four tiers share the same tensor shapes.
+  // Support Model upload with automatic C++ Model Tier profile detection
   const handleModelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return;
     setStatus("Loading ONNX Model...");
@@ -2108,7 +1980,16 @@ export default function CombatSandbox() {
       modelInfoRef.current = info;
       frameStackBufRef.current = createFrameStack(info.frameStack);
 
-      setStatus(`Loaded contract-compatible ONNX model (249 × ${info.frameStack}, hidden ${info.hiddenSize}). Tier remains ${selectedTier.toUpperCase()} because tensor shapes do not encode behavioural tier.`);
+      // Map frameStack to corresponding C++ Tier Profile
+      let autoTier: "micro" | "small" | "medium" | "large" | "xl" = "medium";
+      if (info.frameStack === 1) autoTier = "micro";
+      else if (info.frameStack === 2) autoTier = "small";
+      else if (info.frameStack === 3) autoTier = "medium";
+      else if (info.frameStack === 4) autoTier = "large";
+      else if (info.frameStack === 5) autoTier = "xl";
+
+      setSelectedTier(autoTier);
+      setStatus(`Loaded ONNX Model! Auto-aligned to C++ Profile Tier: ${autoTier.toUpperCase()} (Decision Interval: ${TIER_PROFILES[autoTier].decisionInterval}s, Frame Stack: ${info.frameStack})`);
     } catch (err: any) {
       setStatus(`Error: ${err.message}`);
       console.error(err);
@@ -2135,7 +2016,6 @@ export default function CombatSandbox() {
       let cumReward = 0;
       let kills = 0;
       let epStep = 0;
-      let hidden = new Float32Array(model.hiddenSize);
 
       // Fixed player position for consistency
       const fixedPlayerPos: [number, number] = [arenaSize * 0.2, arenaSize * 0.12];
@@ -2145,8 +2025,7 @@ export default function CombatSandbox() {
         pushFrame(fs, obs);
         const stacked = getStacked(fs);
 
-        const logits = await runInference(model, stacked, hidden);
-        hidden = logits.hidden;
+        const logits = await runInference(model.session, stacked);
         const mask = buildActionMask(sim);
         const action: [number, number, number] = [
           argmaxMasked(logits.m, mask.m),
@@ -2309,7 +2188,7 @@ export default function CombatSandbox() {
                         <select value={numObs} onChange={e => setNumObs(+e.target.value)} style={{ ...sel, display: "block", width: "100%", marginTop: 2, marginLeft: 0 }}>{[0, 2, 4, 6, 8, 12, 16].map(n => <option key={n} value={n}>{n}</option>)}</select>
                       </label>
                       <label style={{ color: "#8b949e", fontSize: 11 }}>Tier Profile
-                        <select value={selectedTier} onChange={e => setSelectedTier(e.target.value as any)} style={{ ...sel, display: "block", width: "100%", marginTop: 2, marginLeft: 0 }}><option value="micro">Micro (2.5Hz)</option><option value="small">Small (3.3Hz)</option><option value="medium">Medium (5Hz)</option><option value="large">Large (6.6Hz)</option></select>
+                        <select value={selectedTier} onChange={e => setSelectedTier(e.target.value as any)} style={{ ...sel, display: "block", width: "100%", marginTop: 2, marginLeft: 0 }}><option value="micro">Micro (2.5Hz)</option><option value="small">Small (3.3Hz)</option><option value="medium">Medium (5Hz)</option><option value="large">Large (6.6Hz)</option><option value="xl">XL (10Hz)</option></select>
                       </label>
                     </div>
                     <div style={{ display: "flex", gap: 12, alignItems: "center", borderTop: "1px solid #21262d", paddingTop: 6 }}>

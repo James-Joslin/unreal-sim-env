@@ -35,6 +35,19 @@ from frame_stack import stacked_obs_size
 from training.base_trainer import BaseTrainer
 from training.normalizers import RunningNormalizer, ReturnNormalizer
 
+
+def freeze_skipped_hidden(hidden_in, hidden_out, skip_inference):
+    """Preserve recurrent state for envs where production skips inference."""
+    if hidden_in is None or hidden_out is None:
+        return hidden_out
+    skip = torch.as_tensor(
+        skip_inference, dtype=torch.bool, device=hidden_out.device)
+    if not skip.any():
+        return hidden_out
+    frozen = hidden_out.clone()
+    frozen[:, skip, :] = hidden_in[:, skip, :]
+    return frozen
+
 from .config import PPOConfig, get_stage_config, get_stage_summary, PPOStageConfig
 from .actor_critic import ActorCritic
 from .buffer import VecRolloutBuffer
@@ -421,10 +434,8 @@ class PPOTrainer(BaseTrainer):
                     # Production skips ONNX while an action lock owns the
                     # decision. Keep those envs' recurrent state unchanged
                     # even though the vectorized Python batch was evaluated.
-                    if current_skip_inference.any():
-                        new_hidden = new_hidden.clone()
-                        new_hidden[:, current_skip_inference, :] = \
-                            hidden[:, current_skip_inference, :]
+                    new_hidden = freeze_skipped_hidden(
+                        hidden, new_hidden, current_skip_inference)
                     hidden = new_hidden
                     for i in range(self.num_envs):
                         if dones[i] or truncateds[i]:

@@ -415,6 +415,7 @@ class SimProjectile:
     # Arc projectile fields.
     is_arc: bool = False
     max_arc_height: float = 400.0     # From weapon's MaxArcableObstacleHeight
+    arc_height: float = 400.0         # C++ EnemyProjectile_Arc control-point Z offset
     arc_start: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     arc_apex: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     arc_end: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
@@ -485,8 +486,6 @@ class SimProjectile:
         for actor in check_list:
             if hasattr(actor, "alive") and not actor.alive:
                 continue
-            if hasattr(actor, "is_dodging") and actor.is_dodging:
-                continue
             t_hit = _ray_circle_intersect_t(
                 old_pos, direction, actor.pos, self.hit_radius, seg_len)
             if t_hit is not None:
@@ -507,6 +506,14 @@ class SimProjectile:
             return hits
 
         actor = hit_obj
+        if getattr(actor, "is_invulnerable", False):
+            # The projectile still collides and is consumed; only damage and
+            # on-hit effects are rejected by the production damage pipeline.
+            self.alive = False
+            self.did_hit = True
+            self.hit_actor = actor
+            return hits
+
         hp_before = max(0.0, float(actor.hp))
         dmg, actor.barrier, was_crit = compute_damage(
             self.damage, self.attack_stat,
@@ -525,78 +532,105 @@ class SimProjectile:
         return hits
 
     def _tick_arc(self, dt, targets, agent, obstacles, arena_half, rng=None):
-        """Arc projectile — follows bezier curve."""
-        hits = []
-
+        """Arc projectile — swept XY collision with the C++ bezier height."""
+        previous_progress = min(
+            1.0, self.arc_elapsed / max(self.arc_flight_time, 0.01))
+        previous_pos = self.pos.copy()
         self.arc_elapsed += dt
         progress = min(1.0, self.arc_elapsed / max(self.arc_flight_time, 0.01))
 
-        # Quadratic bezier: P = (1-t)²·Start + 2(1-t)t·Apex + t²·End
         t = progress
         omt = 1.0 - t
-        self.pos = (omt * omt * self.arc_start
-                    + 2.0 * omt * t * self.arc_apex
-                    + t * t * self.arc_end)
+        new_pos = (omt * omt * self.arc_start
+                   + 2.0 * omt * t * self.arc_apex
+                   + t * t * self.arc_end)
 
-        # Update velocity direction for rendering trail.
-        if t < 0.99:
-            next_t = min(1.0, t + 0.01)
-            next_omt = 1.0 - next_t
-            next_pos = (next_omt * next_omt * self.arc_start
-                        + 2.0 * next_omt * next_t * self.arc_apex
-                        + next_t * next_t * self.arc_end)
-            delta = next_pos - self.pos
-            d = np.linalg.norm(delta)
-            if d > 0.1:
-                self.velocity = delta / d * self.speed
+        blocking_hit = None
+        for obstacle in obstacles:
+            segment_t = _ray_aabb_intersect_t(
+                previous_pos, new_pos, obstacle)
+            if segment_t is None:
+                continue
+            arc_t = previous_progress + (
+                progress - previous_progress) * float(segment_t)
+            projectile_height = (
+                2.0 * (1.0 - arc_t) * arc_t * self.arc_height)
+            if projectile_height <= obstacle.height:
+                if blocking_hit is None or segment_t < blocking_hit:
+                    blocking_hit = float(segment_t)
 
-        # Impact at end of flight.
+        if blocking_hit is not None:
+            self.pos = previous_pos + (
+                new_pos - previous_pos) * blocking_hit
+            self.alive = False
+            self.did_hit = True
+            return self._apply_arc_impact(targets, agent, rng)
+
+        self.pos = new_pos
+        delta = self.pos - previous_pos
+        distance = np.linalg.norm(delta)
+        if distance > 0.1:
+            self.velocity = delta / distance * self.speed
+
         if progress >= 1.0:
             self.alive = False
             self.did_hit = True
+            return self._apply_arc_impact(targets, agent, rng)
+        return []
 
-            if self.arc_impact_radius > 0:
-                # AoE damage — hit everything in radius.
-                check_list = targets if self.is_agent_projectile else [agent]
-                for actor in (check_list if isinstance(check_list, list) else [check_list]):
-                    if hasattr(actor, 'alive') and not actor.alive:
-                        continue
-                    dist = np.linalg.norm(self.pos - actor.pos)
-                    if dist < self.arc_impact_radius:
-                        falloff = 1.0 - (dist / self.arc_impact_radius) * 0.5
-                        hp_before = max(0.0, float(actor.hp))
-                        dmg, actor.barrier, was_crit = compute_damage(
-                            self.damage * falloff, self.attack_stat,
-                            actor.defence, actor.barrier,
-                            self.crit_chance, self.crit_multiplier, rng=rng)
-                        actor.hp = max(0.0, actor.hp - dmg)
-                        hp_lost = max(0.0, hp_before - actor.hp)
-                        killed = hp_before > 0.0 and actor.hp <= 0.0
-                        if killed:
-                            actor.alive = False
-                        hits.append((actor, hp_lost, was_crit, killed))
-            else:
-                # Point damage — check nearest valid target.
-                check_targets = targets if self.is_agent_projectile else [agent]
-                for actor in (check_targets if isinstance(check_targets, list) else [check_targets]):
-                    if hasattr(actor, 'alive') and not actor.alive:
-                        continue
-                    dist = np.linalg.norm(self.pos - actor.pos)
-                    if dist < self.hit_radius * 1.5:  # Slightly generous for arc landing
-                        hp_before = max(0.0, float(actor.hp))
-                        dmg, actor.barrier, was_crit = compute_damage(
-                            self.damage, self.attack_stat,
-                            actor.defence, actor.barrier,
-                            self.crit_chance, self.crit_multiplier, rng=rng)
-                        actor.hp = max(0.0, actor.hp - dmg)
-                        hp_lost = max(0.0, hp_before - actor.hp)
-                        killed = hp_before > 0.0 and actor.hp <= 0.0
-                        if killed:
-                            actor.alive = False
-                        hits.append((actor, hp_lost, was_crit, killed))
-                        self.hit_actor = actor
-                        break
+    def _apply_arc_impact(self, targets, agent, rng=None):
+        hits = []
+        actors = targets if self.is_agent_projectile else [agent]
+        actors = actors if isinstance(actors, list) else [actors]
 
+        if self.arc_impact_radius > 0.0:
+            for actor in actors:
+                if hasattr(actor, "alive") and not actor.alive:
+                    continue
+                distance = np.linalg.norm(self.pos - actor.pos)
+                if distance >= self.arc_impact_radius:
+                    continue
+                if getattr(actor, "is_invulnerable", False):
+                    continue
+                falloff = 1.0 - (
+                    distance / self.arc_impact_radius) * 0.5
+                hp_before = max(0.0, float(actor.hp))
+                damage, actor.barrier, was_crit = compute_damage(
+                    self.damage * falloff, self.attack_stat,
+                    actor.defence, actor.barrier,
+                    self.crit_chance, self.crit_multiplier, rng=rng)
+                actor.hp = max(0.0, actor.hp - damage)
+                hp_lost = max(0.0, hp_before - actor.hp)
+                killed = hp_before > 0.0 and actor.hp <= 0.0
+                if killed:
+                    actor.alive = False
+                hits.append((actor, hp_lost, was_crit, killed))
+            return hits
+
+        candidates = [
+            (float(np.linalg.norm(self.pos - actor.pos)), actor)
+            for actor in actors
+            if (not hasattr(actor, "alive") or actor.alive)
+        ]
+        candidates.sort(key=lambda item: item[0])
+        if not candidates or candidates[0][0] >= self.hit_radius * 1.5:
+            return hits
+
+        actor = candidates[0][1]
+        self.hit_actor = actor
+        if getattr(actor, "is_invulnerable", False):
+            return hits
+        hp_before = max(0.0, float(actor.hp))
+        damage, actor.barrier, was_crit = compute_damage(
+            self.damage, self.attack_stat,
+            actor.defence, actor.barrier,
+            self.crit_chance, self.crit_multiplier, rng=rng)
+        actor.hp = max(0.0, actor.hp - damage)
+        hp_lost = max(0.0, hp_before - actor.hp)
+        killed = hp_before > 0.0 and actor.hp <= 0.0
+        if killed:
+            actor.alive = False
+        hits.append((actor, hp_lost, was_crit, killed))
         return hits
 
 # ─────────────────────────────────────────────────────────────────
@@ -651,9 +685,17 @@ class Agent:
     is_dodging: bool = False
     dodge_remaining: float = 0.0
     dodge_cooldown_remaining: float = 0.0
-    dodge_duration: float = 0.4
-    dodge_cooldown: float = 2.0
-    dodge_speed: float = 800.0
+    dodge_duration: float = 0.35
+    dodge_cooldown: float = 2.5
+    dodge_distance: float = 400.0
+    dodge_ease_exponent: float = 2.0
+    dodge_invulnerability_duration: float = 0.15
+    dodge_elapsed: float = 0.0
+    dodge_invulnerability_remaining: float = 0.0
+    dodge_start_pos: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.float32))
+    dodge_end_pos: np.ndarray = field(
+        default_factory=lambda: np.zeros(2, dtype=np.float32))
     dodge_direction: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
 
     # Reposition state. Reposition is policy-controlled movement with no
@@ -723,16 +765,6 @@ class Agent:
                 self.is_switching = False
                 self.switch_remaining = 0
 
-        # Dodge countdown.
-        if self.is_dodging:
-            self.dodge_remaining -= dt
-            if self.dodge_remaining <= 0:
-                self.is_dodging = False
-                self.dodge_remaining = 0
-        if self.dodge_cooldown_remaining > 0:
-            self.dodge_cooldown_remaining = max(
-                0.0, self.dodge_cooldown_remaining - dt)
-
         # Reposition countdown/cooldown. This is deliberately independent of
         # dodge: it grants no invulnerability and only changes movement speed.
         if self.is_repositioning:
@@ -759,6 +791,10 @@ class Agent:
     def reposition_ready(self) -> bool:
         return (not self.is_repositioning
                 and self.reposition_cooldown_remaining <= 0)
+
+    @property
+    def is_invulnerable(self) -> bool:
+        return self.dodge_invulnerability_remaining > 0.0
 
     @property
     def action_lock_progress(self) -> float:
@@ -1174,12 +1210,25 @@ def _sphere_sweep_aabb_t(
     return max(tmin, 0.0)
 
 
+def _blocking_obstacle_height(
+    start: np.ndarray, end: np.ndarray, obstacles,
+) -> float:
+    """Return the tallest obstacle intersecting the direct firing segment."""
+    return max(
+        (
+            obstacle.height
+            for obstacle in obstacles
+            if _ray_aabb_intersect(start, end, obstacle)
+        ),
+        default=0.0,
+    )
+
+
 def is_behind_cover(agent_pos, target_pos, obstacles) -> Tuple[bool, float]:
-    """Check if LOS is blocked, and if so, estimate cover height."""
-    for obs in obstacles:
-        if _ray_aabb_intersect(agent_pos, target_pos, obs):
-            return True, obs.height
-    return False, 0.0
+    """Check whether LOS is blocked and return its limiting cover height."""
+    obstacle_height = _blocking_obstacle_height(
+        agent_pos, target_pos, obstacles)
+    return obstacle_height > 0.0, obstacle_height
 
 
 # Character body radius for spatial ring ray detection. Larger than
@@ -1521,6 +1570,8 @@ class CombatEnv(gym.Env):
         dt = self.cfg.decision_interval
         self.step_count += 1
         self._step_damage_events = []
+        dodge_cooldown_was_active = (
+            self.agent.dodge_cooldown_remaining > 0.0)
 
         # Snapshot pre-action state for reward. Current-step ledger events are
         # empty here and are populated by all damage/status paths below.
@@ -1581,36 +1632,26 @@ class CombatEnv(gym.Env):
                     effective_action = (
                         effective_move, effective_combat, effective_target)
             else:
-                self._execute_combat(effective_combat, dt)
+                combat_executed = self._execute_combat(
+                    effective_combat, effective_move, dt)
+                if (effective_combat == CombatAction.DODGE
+                        and not combat_executed):
+                    effective_combat = int(CombatAction.NONE)
+                    effective_action = (
+                        effective_move, effective_combat, effective_target)
 
         # Movement executes last. Dodge owns displacement while active; every
         # other action lock holds the cached movement through normal collision.
         if self.agent.is_dodging:
-            # During dodge, move in dodge direction (overrides player movement).
-            # Sub-step to prevent tunneling through thin walls.
-            dodge_delta = self.agent.dodge_direction * self.agent.dodge_speed * dt
-            dodge_dist = np.linalg.norm(dodge_delta)
-            max_step = AGENT_BODY_RADIUS * 0.9
-            num_sub = max(1, int(np.ceil(dodge_dist / max_step)))
-            step_delta = dodge_delta / num_sub
-            dodge_new_pos = self.agent.pos.copy()
-
-            for _ in range(num_sub):
-                dodge_new_pos = dodge_new_pos + step_delta
-                for obs in self.obstacles:
-                    if obs.contains_circle(dodge_new_pos[0], dodge_new_pos[1], AGENT_BODY_RADIUS):
-                        dodge_new_pos[0], dodge_new_pos[1] = obs.push_out_circle(
-                            dodge_new_pos[0], dodge_new_pos[1], AGENT_BODY_RADIUS)
-
-            half = self._arena_half
-            dodge_new_pos = np.clip(dodge_new_pos, -half + AGENT_BODY_RADIUS,
-                                    half - AGENT_BODY_RADIUS)
-            self.agent.pos = dodge_new_pos
+            self._advance_dodge_motion(dt)
         else:
             self._execute_movement(effective_move, dt)
 
-        # 2. Tick weapon cooldowns/reloads/wind-up/switch/dodge.
+        # 2. Tick weapon cooldowns/reloads/wind-up/switch.
         self.agent.tick_weapons(dt)
+        if dodge_cooldown_was_active:
+            self.agent.dodge_cooldown_remaining = max(
+                0.0, self.agent.dodge_cooldown_remaining - dt)
         self._resolve_pending_fire()  # [Audit §1.7] Spawn projectile when wind-up completes
         self.agent.combat_time += dt
         self.threat_table.decay(dt)  # [Audit §1.3] Decay accumulated threat over time
@@ -1650,6 +1691,10 @@ class CombatEnv(gym.Env):
             if self.render_mode is not None:
                 self._projectile_snapshots.append(self._snapshot_projectiles())
             self._tick_projectiles(proj_dt)
+            self.agent.dodge_invulnerability_remaining = max(
+                0.0,
+                self.agent.dodge_invulnerability_remaining - proj_dt,
+            )
         # Final snapshot after all substeps (surviving projectiles).
         if self.render_mode is not None:
             self._projectile_snapshots.append(self._snapshot_projectiles())
@@ -2033,6 +2078,167 @@ class CombatEnv(gym.Env):
     #  Action Execution
     # ═════════════════════════════════════════════════════════════
 
+    def _movement_index_to_world_dir(self, move_idx: int) -> np.ndarray:
+        """Map the movement head into the target-relative production frame."""
+        if move_idx == 0:
+            return np.zeros(2, dtype=np.float32)
+
+        target = self._current_target()
+        if target:
+            forward = target.pos - self.agent.pos
+            distance = np.linalg.norm(forward)
+            if distance > 1.0:
+                forward = forward / distance
+            else:
+                forward = np.array([1.0, 0.0], dtype=np.float32)
+        else:
+            forward = np.array([1.0, 0.0], dtype=np.float32)
+
+        right = np.array([forward[1], -forward[0]], dtype=np.float32)
+        angle = math.radians((move_idx - 1) * 45.0)
+        direction = forward * math.cos(angle) + right * math.sin(angle)
+        length = np.linalg.norm(direction)
+        return (direction / max(length, 1e-8)).astype(np.float32)
+
+    def _is_dodge_direction_clear(self, direction: np.ndarray) -> bool:
+        """Match EnemyDodgeComponent's 300 UU pre-dodge wall trace."""
+        end = self.agent.pos + direction * 300.0
+        return not any(
+            _ray_aabb_intersect(self.agent.pos, end, obstacle)
+            for obstacle in self.obstacles
+        )
+
+    def _resolve_dodge_direction(
+        self, move_idx: int, target: Optional[Target],
+    ) -> Optional[np.ndarray]:
+        """Resolve C++ Dodge priorities, then its perpendicular fallbacks."""
+        direction = self._movement_index_to_world_dir(move_idx)
+
+        if np.linalg.norm(direction) <= 0.01:
+            best_tta = float("inf")
+            best_velocity = None
+            for projectile in self._projectiles:
+                if not projectile.alive or projectile.is_agent_projectile:
+                    continue
+                speed = np.linalg.norm(projectile.velocity)
+                to_agent = self.agent.pos - projectile.pos
+                distance = np.linalg.norm(to_agent)
+                if speed <= 1e-8 or distance <= 1e-8:
+                    continue
+                incoming_dot = float(np.dot(
+                    projectile.velocity / speed, to_agent / distance))
+                if incoming_dot < 0.5:
+                    continue
+                tta = distance / speed
+                if tta < best_tta:
+                    best_tta = tta
+                    best_velocity = projectile.velocity / speed
+
+            if best_velocity is not None:
+                direction = np.array(
+                    [best_velocity[1], -best_velocity[0]],
+                    dtype=np.float32,
+                )
+                if target is not None:
+                    away = self.agent.pos - target.pos
+                    away_length = np.linalg.norm(away)
+                    if (away_length > 1e-8
+                            and np.dot(direction, away / away_length) < 0.0):
+                        direction = -direction
+
+        if np.linalg.norm(direction) <= 0.01 and target is not None:
+            direction = self.agent.pos - target.pos
+        if np.linalg.norm(direction) <= 0.01:
+            direction = -self.agent.facing
+
+        length = np.linalg.norm(direction)
+        if length <= 1e-8:
+            return None
+        direction = (direction / length).astype(np.float32)
+
+        left = np.array([direction[1], -direction[0]], dtype=np.float32)
+        for candidate in (direction, left, -left):
+            if self._is_dodge_direction_clear(candidate):
+                return candidate
+        return None
+
+    def _begin_dodge(self, move_idx: int, target: Optional[Target]) -> bool:
+        agent = self.agent
+        if (not agent or not agent.alive or agent.is_dodging
+                or agent.dodge_cooldown_remaining > 0.0):
+            return False
+
+        direction = self._resolve_dodge_direction(move_idx, target)
+        if direction is None:
+            return False
+
+        agent.is_dodging = True
+        agent.dodge_elapsed = 0.0
+        agent.dodge_remaining = agent.dodge_duration
+        agent.dodge_direction = direction
+        agent.dodge_start_pos = agent.pos.copy()
+        agent.dodge_end_pos = (
+            agent.dodge_start_pos + direction * agent.dodge_distance)
+        agent.dodge_invulnerability_remaining = (
+            agent.dodge_invulnerability_duration)
+        agent.velocity = np.zeros(2, dtype=np.float32)
+        agent.set_action_lock(agent.dodge_duration + 0.1, 3)
+
+        # Production zeros LockedMovementDirection while Dodge owns motion.
+        self._cached_movement_action = 0
+        return True
+
+    def _advance_dodge_motion(self, dt: float):
+        """Advance the 400 UU eased slide and begin cooldown on completion."""
+        agent = self.agent
+        if not agent.is_dodging:
+            return
+
+        agent.dodge_elapsed = min(
+            agent.dodge_duration, agent.dodge_elapsed + dt)
+        alpha = agent.dodge_elapsed / max(agent.dodge_duration, 1e-8)
+        eased_alpha = 1.0 - math.pow(
+            max(0.0, 1.0 - alpha), agent.dodge_ease_exponent)
+        desired = (
+            agent.dodge_start_pos
+            + (agent.dodge_end_pos - agent.dodge_start_pos) * eased_alpha
+        )
+
+        current = agent.pos.copy()
+        hit_t = 1.0
+        for obstacle in self.obstacles:
+            candidate_t = _sphere_sweep_aabb_t(
+                current, desired, obstacle, AGENT_BODY_RADIUS)
+            if candidate_t is not None:
+                hit_t = min(hit_t, float(candidate_t))
+        if hit_t < 1.0:
+            desired = current + (desired - current) * max(0.0, hit_t - 1e-4)
+
+        half = self._arena_half
+        agent.pos = np.clip(
+            desired,
+            -half + AGENT_BODY_RADIUS,
+            half - AGENT_BODY_RADIUS,
+        ).astype(np.float32)
+        agent.dodge_remaining = max(
+            0.0, agent.dodge_duration - agent.dodge_elapsed)
+
+        if agent.dodge_remaining <= 0.0:
+            agent.is_dodging = False
+            agent.dodge_cooldown_remaining = agent.dodge_cooldown
+
+    def _weapon_has_path(
+        self, slot: WeaponSlot, start: np.ndarray, end: np.ndarray,
+    ) -> bool:
+        if check_los(start, end, self.obstacles):
+            return True
+        obstacle_height = _blocking_obstacle_height(
+            start, end, self.obstacles)
+        return (
+            obstacle_height > 0.0
+            and slot.can_arc_over_height(obstacle_height)
+        )
+
     def _begin_reposition(self, move_idx: int) -> bool:
         """Start an explicit movement-head-directed Reposition."""
         a = self.agent
@@ -2062,21 +2268,7 @@ class CombatEnv(gym.Env):
             # Stop command — decelerate toward zero.
             desired = np.zeros(2, dtype=np.float32)
         else:
-            # Build target-facing reference frame.
-            target = self._current_target()
-            if target:
-                fwd = target.pos - a.pos
-                d = np.linalg.norm(fwd)
-                fwd = fwd / d if d > 1 else np.array([1.0, 0.0], dtype=np.float32)
-            else:
-                fwd = np.array([1.0, 0.0], dtype=np.float32)
-
-            right = np.array([fwd[1], -fwd[0]], dtype=np.float32)
-
-            # Map index 1-8 to angle: 0, 45, 90, ..., 315 degrees.
-            angle_deg = (move_idx - 1) * 45.0
-            angle_rad = math.radians(angle_deg)
-            direction = fwd * math.cos(angle_rad) + right * math.sin(angle_rad)
+            direction = self._movement_index_to_world_dir(move_idx)
             desired = direction * movement_max_speed
 
         # ── Acceleration physics (matches UE CharacterMovementComponent) ──
@@ -2182,18 +2374,18 @@ class CombatEnv(gym.Env):
                 self.current_target_idx = raw_idx
                 return
 
-    def _execute_combat(self, combat_idx: int, dt: float):
+    def _execute_combat(self, combat_idx: int, move_idx: int, dt: float):
         agent = self.agent
         if not agent.alive:
-            return
+            return False
 
         # Can't act during weapon switch.
         if agent.is_switching:
-            return
+            return False
 
         target = self._current_target()
         if not target or not target.alive:
-            return
+            return False
 
         action = CombatAction(combat_idx)
         if action == CombatAction.BLOCK:
@@ -2202,8 +2394,6 @@ class CombatEnv(gym.Env):
             agent.stop_blocking()
         slot = agent.active_slot()
         dist = np.linalg.norm(agent.pos - target.pos)
-        has_los = check_los(agent.pos, target.pos, self.obstacles)
-
         if action == CombatAction.FIRE:
             # [Audit §1.7] Single-stage fire: consume ammo and start cooldown
             # IMMEDIATELY on the Fire action, matching C++ TryFire().
@@ -2236,7 +2426,8 @@ class CombatEnv(gym.Env):
                         slot.fire_cooldown * 0.5,
                         1)  # reason=1 Firing  [Audit §1.1]
                     in_range = dist <= slot.weapon_range
-                    if in_range and (has_los or slot.can_arc):
+                    if in_range and self._weapon_has_path(
+                            slot, agent.pos, target.pos):
                         self._spawn_agent_projectile(slot, target, agent, dist)
 
         elif action == CombatAction.RELOAD:
@@ -2297,29 +2488,8 @@ class CombatEnv(gym.Env):
             agent.start_blocking()
 
         elif action == CombatAction.DODGE:
-            # Model-controlled dodge. The agent chooses WHEN to dodge
-            # (strategic: conserve cooldown for big threats). Direction
-            # is the current movement direction, or away from target
-            # if stationary. Matches C++ EnemyDodgeComponent.
-            if (not agent.is_dodging
-                    and agent.dodge_cooldown_remaining <= 0):
-                agent.is_dodging = True
-                agent.dodge_remaining = agent.dodge_duration
-
-                # Dodge direction: current movement, or away from target.
-                speed = np.linalg.norm(agent.velocity)
-                if speed > 10:
-                    dodge_dir = agent.velocity / speed
-                else:
-                    away = agent.pos - target.pos
-                    away_d = np.linalg.norm(away)
-                    dodge_dir = away / max(away_d, 1)
-
-                agent.dodge_direction = dodge_dir
-                agent.velocity = np.zeros(2, dtype=np.float32)
-                agent.dodge_cooldown_remaining = agent.dodge_cooldown
-                agent.set_action_lock(
-                    agent.dodge_duration + 0.1, 3)  # reason=3 Dodging
+            return self._begin_dodge(move_idx, target)
+        return True
 
     def _spawn_agent_projectile(self, slot: WeaponSlot, target, agent, dist: float,
                                 intended_target_id: int = -1):
@@ -2353,13 +2523,13 @@ class CombatEnv(gym.Env):
             # Arc projectile — bezier curve over obstacles.
             arc_start = agent.pos.copy()
             arc_end = predicted_pos.copy()
-            arc_height = max(200.0, dist * 0.3)
+            arc_height = 400.0
             midpoint = (arc_start + arc_end) / 2.0
-            # [Audit §5.2] Removed dead perpendicular code — only forward offset.
-            apex = midpoint + fire_dir * dist * 0.1
+            apex = midpoint.copy()
 
-            arc_length = (np.linalg.norm(apex - arc_start)
-                          + np.linalg.norm(arc_end - apex))
+            half_distance = np.linalg.norm(arc_end - arc_start) * 0.5
+            arc_length = 2.0 * math.sqrt(
+                half_distance * half_distance + arc_height * arc_height)
             flight_t = arc_length / max(slot.projectile_speed, 500.0)
 
             proj = SimProjectile(
@@ -2377,6 +2547,7 @@ class CombatEnv(gym.Env):
                 intended_target_id=intended_target_id,
                 is_arc=True,
                 max_arc_height=slot.max_arc_height,
+                arc_height=arc_height,
                 arc_start=arc_start.copy(),
                 arc_apex=apex.copy(),
                 arc_end=arc_end.copy(),
@@ -2437,8 +2608,8 @@ class CombatEnv(gym.Env):
 
         dist = np.linalg.norm(agent.pos - target.pos)
         in_range = dist <= slot.weapon_range
-        has_los = check_los(agent.pos, target.pos, self.obstacles)
-        if in_range and (has_los or slot.can_arc):
+        if in_range and self._weapon_has_path(
+                slot, agent.pos, target.pos):
             self._spawn_agent_projectile(
                 slot, target, agent, dist,
                 intended_target_id=int(pf.get('target_id', -1)))
@@ -2470,9 +2641,7 @@ class CombatEnv(gym.Env):
                     t.start_commitment(t.melee_commit_time)
                     t.focus_target_id = 0
 
-                    # [Audit §5.3] Full invulnerability during dodge,
-                    # matching C++ DodgeComponent.InvulnerabilityDuration.
-                    if a.is_dodging:
+                    if a.is_invulnerable:
                         continue
 
                     # Melee can hit even when not facing (swing is wide).
@@ -2826,7 +2995,7 @@ class CombatEnv(gym.Env):
 
         obs[idx] = 1.0 if a.is_dodging else 0.0; idx += 1     # 18 is dodging
         obs[idx] = 1.0 if a.dodge_cooldown_remaining <= 0 else 0.0; idx += 1  # 19 dodge ready
-        obs[idx] = 1.0 if a.is_dodging else 0.0; idx += 1     # 20 invulnerable
+        obs[idx] = 1.0 if a.is_invulnerable else 0.0; idx += 1  # 20 invulnerable
 
         # ── Weapon State (22) ────────────────────────────────────
         slot = a.active_slot()
@@ -3058,7 +3227,7 @@ class CombatEnv(gym.Env):
                 if abs(d) > 1e-6:
                     wall = effective_half if d > 0 else -effective_half
                     t_wall = (wall - a.pos[axis]) / d
-                    if 0 < t_wall < blocked_dist:
+                    if 0 <= t_wall < blocked_dist:
                         blocked_dist = t_wall
 
             obs[idx] = blocked_dist; idx += 1
@@ -3204,14 +3373,16 @@ class CombatEnv(gym.Env):
         # when target is behind cover). Answers "should I switch?" directly.
         target = self._current_target()
         target_dist = np.linalg.norm(a.pos - target.pos) if target and target.alive else 9999
-        target_has_los = check_los(a.pos, target.pos, self.obstacles) if target and target.alive else False
-        target_behind_cover = not target_has_los and target is not None and target.alive
 
         for wi in range(4):
             if wi < len(a.weapons):
                 w = a.weapons[wi]
                 in_range = target_dist <= w.weapon_range
-                has_path = target_has_los if not w.can_arc else (target_has_los or target_behind_cover)
+                has_path = (
+                    self._weapon_has_path(w, a.pos, target.pos)
+                    if target and target.alive
+                    else False
+                )
                 can_hit = w.has_ammo() and in_range and has_path and not w.is_reloading
                 obs[idx] = 1.0 if can_hit else 0.0
             idx += 1                                           # 234-237
