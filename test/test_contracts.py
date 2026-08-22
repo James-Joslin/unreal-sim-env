@@ -20,9 +20,11 @@ from combat_sim import (  # noqa: E402
     Obstacle,
     SimProjectile,
     Target,
+    WeaponSlot,
     make_curriculum_env,
 )
 from combat_extensions import (  # noqa: E402
+    DEBUFF_NAMES,
     AlliedRobot,
     make_extended_curriculum_env,
 )
@@ -263,6 +265,64 @@ class CombatActionContractTests(unittest.TestCase):
         self.env.step(np.array([1, 7, 4]))
         self.assertTrue(self.env.agent.is_dodging)
 
+    def test_explicit_dodge_matches_production_slide_and_cooldown(self):
+        start = self.env.agent.pos.copy()
+
+        obs, _, _, _, info = self.env.step(
+            np.array([1, CombatAction.DODGE, 4]))
+
+        first_alpha = self.env.cfg.decision_interval / 0.35
+        first_distance = 400.0 * (1.0 - (1.0 - first_alpha) ** 2)
+        self.assertEqual(info["executed_action"], (1, 7, 4))
+        self.assertTrue(self.env.agent.is_dodging)
+        self.assertAlmostEqual(
+            np.linalg.norm(self.env.agent.pos - start),
+            first_distance,
+            places=3,
+        )
+        self.assertAlmostEqual(self.env.agent.dodge_remaining, 0.15, places=5)
+        self.assertEqual(self.env.agent.dodge_cooldown_remaining, 0.0)
+        self.assertEqual(self.env.agent.action_lock_reason, 3)
+        self.assertEqual(obs[18], 1.0)
+        self.assertEqual(obs[20], 0.0)
+
+        _, _, _, _, locked_info = self.env.step(np.array([8, 7, 0]))
+        completed_pos = self.env.agent.pos.copy()
+        self.assertEqual(locked_info["executed_action"], (0, 0, 4))
+        self.assertFalse(self.env.agent.is_dodging)
+        self.assertAlmostEqual(
+            np.linalg.norm(completed_pos - start), 400.0, places=3)
+        self.assertAlmostEqual(
+            self.env.agent.dodge_cooldown_remaining, 2.5, places=5)
+
+        self.env.step(np.array([8, 7, 0]))
+        np.testing.assert_allclose(self.env.agent.pos, completed_pos)
+        self.assertAlmostEqual(
+            self.env.agent.dodge_cooldown_remaining, 2.3, places=5)
+
+    def test_target_selection_precedes_combat_and_movement(self):
+        original = Target(
+            pos=np.array([1000.0, 0.0], dtype=np.float32),
+            hp=100.0, max_hp=100.0, target_id=10,
+        )
+        selected = Target(
+            pos=np.array([0.0, 100.0], dtype=np.float32),
+            hp=100.0, max_hp=100.0, target_id=20,
+        )
+        self.env.targets = [original, selected]
+        self.env.current_target_idx = 0
+        self.env._target_action_slots = (20, 10)
+        self.env._target_slot_scores = {20: 100.0, 10: 50.0}
+        self.env.agent.melee.cooldown_remaining = 0.0
+        self.env.agent.velocity[:] = 0.0
+
+        self.env.step(np.array([1, CombatAction.MELEE, 0]))
+
+        self.assertEqual(original.hp, 100.0)
+        self.assertLess(selected.hp, 100.0)
+        self.assertGreater(self.env.agent.pos[1], 0.0)
+        self.assertAlmostEqual(self.env.agent.pos[0], 0.0, places=4)
+
     def test_block_applies_once_scales_movement_and_clears(self):
         base_defence = self.env.agent.defence
         self.env.agent.velocity = np.array(
@@ -481,6 +541,180 @@ class ExtendedTransitionTests(unittest.TestCase):
 
         self.assertAlmostEqual(obs[154], 0.4)
 
+    def test_ally_combat_action_uses_nine_action_normalization(self):
+        ally = AlliedRobot(current_combat_action=8)
+        self.env.allies = [ally]
+
+        obs = self.env._build_observation()
+
+        self.assertEqual(obs[155], 1.0)
+
+
+class ProjectileCollisionTests(unittest.TestCase):
+    def test_nearer_actor_wins_over_farther_wall(self):
+        target = Target(
+            pos=np.array([50.0, 0.0], dtype=np.float32),
+            hp=100.0, max_hp=100.0, defence=0.0,
+        )
+        projectile = SimProjectile(
+            pos=np.zeros(2, dtype=np.float32),
+            velocity=np.array([1000.0, 0.0], dtype=np.float32),
+            damage=10.0,
+            is_agent_projectile=True,
+            hit_radius=10.0,
+        )
+        wall = Obstacle(150.0, 0.0, 10.0, 50.0, 300.0)
+
+        hits = projectile.tick(
+            0.2, [target], None, [wall], arena_half=1000.0)
+
+        self.assertEqual(len(hits), 1)
+        self.assertIs(hits[0][0], target)
+        self.assertLess(target.hp, 100.0)
+
+    def test_dodge_invulnerability_consumes_projectile_without_damage(self):
+        env = make_curriculum_env(2, "ranged")
+        try:
+            env.reset(seed=777)
+            env.agent.pos = np.zeros(2, dtype=np.float32)
+            env.agent.dodge_invulnerability_remaining = 0.1
+            hp_before = env.agent.hp
+            projectile = SimProjectile(
+                pos=np.array([-100.0, 0.0], dtype=np.float32),
+                velocity=np.array([1000.0, 0.0], dtype=np.float32),
+                damage=100.0,
+                is_agent_projectile=False,
+                hit_radius=30.0,
+            )
+
+            hits = projectile.tick(
+                0.2, [], env.agent, [], arena_half=1000.0)
+
+            self.assertEqual(hits, [])
+            self.assertFalse(projectile.alive)
+            self.assertEqual(env.agent.hp, hp_before)
+        finally:
+            env.close()
+
+    def _arc_impact(self, obstacle_height):
+        target = Target(
+            pos=np.array([500.0, 0.0], dtype=np.float32),
+            hp=100.0, max_hp=100.0, defence=0.0,
+        )
+        projectile = SimProjectile(
+            pos=np.array([-500.0, 0.0], dtype=np.float32),
+            speed=1000.0,
+            damage=20.0,
+            is_agent_projectile=True,
+            is_arc=True,
+            arc_height=400.0,
+            arc_start=np.array([-500.0, 0.0], dtype=np.float32),
+            arc_apex=np.array([0.0, 0.0], dtype=np.float32),
+            arc_end=np.array([500.0, 0.0], dtype=np.float32),
+            arc_flight_time=1.0,
+            arc_impact_radius=100.0,
+        )
+        obstacle = Obstacle(
+            0.0, 0.0, 20.0, 50.0, float(obstacle_height))
+        hits = projectile.tick(
+            1.0, [target], None, [obstacle], arena_half=1000.0)
+        return target, hits
+
+    def test_arc_clears_low_cover_but_hits_tall_building(self):
+        low_target, low_hits = self._arc_impact(100.0)
+        tall_target, tall_hits = self._arc_impact(300.0)
+
+        self.assertEqual(len(low_hits), 1)
+        self.assertLess(low_target.hp, 100.0)
+        self.assertEqual(tall_hits, [])
+        self.assertEqual(tall_target.hp, 100.0)
+
+    def test_arc_path_contract_drives_observation_and_reward(self):
+        env = make_curriculum_env(3, "ranged")
+        try:
+            env.reset(seed=778)
+            env.agent.pos = np.zeros(2, dtype=np.float32)
+            env.agent.weapons = [
+                WeaponSlot(
+                    can_arc=True,
+                    max_arc_height=400.0,
+                    weapon_range=2000.0,
+                )
+            ]
+            env.agent.active_weapon = 0
+            env.targets[0].pos = np.array([1000.0, 0.0], dtype=np.float32)
+            env.obstacles = [Obstacle(
+                500.0, 0.0, 20.0, 50.0, 100.0)]
+
+            low_obs = env._build_observation()
+            low_state = env._build_combat_state()
+            env.obstacles = [Obstacle(
+                500.0, 0.0, 20.0, 50.0, 500.0)]
+            tall_obs = env._build_observation()
+            tall_state = env._build_combat_state()
+
+            self.assertEqual(low_obs[234], 1.0)
+            self.assertTrue(low_state.can_arc_over_target_cover)
+            self.assertEqual(tall_obs[234], 0.0)
+            self.assertFalse(tall_state.can_arc_over_target_cover)
+        finally:
+            env.close()
+
+
+class StatusEffectContractTests(unittest.TestCase):
+    class _AlwaysProcRng:
+        @staticmethod
+        def random():
+            return 0.0
+
+        @staticmethod
+        def uniform(low, high):
+            return low
+
+        @staticmethod
+        def choice(values):
+            return values[0]
+
+    def setUp(self):
+        self.env = make_extended_curriculum_env(3, "ranged")
+        self.env.reset(seed=779)
+        self.env.rng = self._AlwaysProcRng()
+
+    def tearDown(self):
+        self.env.close()
+
+    def test_statuses_require_an_accepted_hit(self):
+        self.env._step_damage_events = []
+        self.env._maybe_apply_status_effects(
+            self.env.cfg.decision_interval)
+        self.assertFalse(self.env.status_effects.is_stunned)
+        self.assertFalse(any(
+            slot.active for slot in self.env.status_effects.debuff_slots))
+
+        target = self.env.targets[0]
+        target.combat_role = "melee"
+        self.env._record_damage_event(
+            "target", target.target_id, self.env.agent, 10.0,
+            source_name="TargetMelee", delivery="melee",
+            intended_target_id=0)
+        self.env._maybe_apply_status_effects(
+            self.env.cfg.decision_interval)
+
+        self.assertTrue(self.env.status_effects.is_stunned)
+        self.assertTrue(self.env.status_effects.debuff_slots[0].active)
+        self.assertEqual(DEBUFF_NAMES[0], "poison")
+
+    def test_debuff_observation_is_fixed_order_and_binary(self):
+        self.env.status_effects.apply_debuff(
+            "frostbite", duration=2.0, strength=0.1)
+
+        obs = self.env._build_observation()
+
+        self.assertEqual(tuple(DEBUFF_NAMES), (
+            "poison", "scold", "shock",
+            "frostbite", "weakness", "curse",
+        ))
+        self.assertEqual(obs[5 + DEBUFF_NAMES.index("frostbite")], 1.0)
 
 class ReturnNormalizerTests(unittest.TestCase):
     def test_vector_env_returns_do_not_contaminate_each_other(self):
