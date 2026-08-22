@@ -18,7 +18,7 @@ function softmax(logits: number[], mask: boolean[]): number[] {
   return exps.map((v) => (sum > 0 ? v / sum : 0));
 }
 
-function ProbBar({ label, prob, chosen, masked }: { label: string; prob: number; chosen: boolean; masked: boolean }) {
+function ProbBar({ label, prob, chosen, masked }: { key?: React.Key; label: string; prob: number; chosen: boolean; masked: boolean }) {
   const pct = prob * 100;
   const color = masked
     ? "rgba(80,80,80,0.3)"
