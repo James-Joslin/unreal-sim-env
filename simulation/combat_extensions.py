@@ -777,10 +777,15 @@ class CombatEnvExtended(CombatEnv):
 # ─────────────────────────────────────────────────────────────────
 
 def make_extended_curriculum_env(stage: int, archetype: str = "ranged",
-                                 render_mode: str = None) -> CombatEnvExtended:
+                                 render_mode: str = None,
+                                 behavior_profiles=None,
+                                 behavior_profile_offset: int = 0) -> CombatEnvExtended:
     """Drop-in replacement for make_curriculum_env that uses the extended env."""
     # Use the base factory to get the config, then wrap in extended.
-    base_env = make_curriculum_env(stage, archetype, render_mode)
+    base_env = make_curriculum_env(
+        stage, archetype, render_mode,
+        behavior_profiles=behavior_profiles,
+        behavior_profile_offset=behavior_profile_offset)
     cfg = base_env.cfg
     base_env.close()
 

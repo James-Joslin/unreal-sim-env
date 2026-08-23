@@ -51,7 +51,7 @@ interface Props {
   obs: Float32Array | null;
 }
 
-function ObsValue({ value, prevValue, label, idx }: { value: number; prevValue: number; label?: string; idx: number }) {
+function ObsValue({ value, prevValue, label, idx }: { key?: React.Key; value: number; prevValue: number; label?: string; idx: number }) {
   const changed = Math.abs(value - prevValue) > 0.001;
   const direction = value > prevValue ? "up" : value < prevValue ? "down" : "same";
 

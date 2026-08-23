@@ -49,6 +49,12 @@ import numpy as np
 from gymnasium import spaces
 
 from reward import CombatRewardFunction, CombatState, get_reward_function_for_stage
+from behavior_profiles import (
+    BehaviorProfile,
+    behavior_condition,
+    normalize_profile_set,
+    profile_objective_reward,
+)
 
 # ─────────────────────────────────────────────────────────────────
 #  Constants (match NeuralCombatTypes.h)
@@ -228,6 +234,132 @@ class DamageEventLedger:
         return event_id
 
 
+@dataclass
+class BehaviorTelemetry:
+    """Reward-independent episode behavior measurements."""
+    credible_fire_opportunities: int = 0
+    credible_fire_conversions: int = 0
+    combat_idle_time: float = 0.0
+    shots_in_optimal_band: int = 0
+    shots_reachable_outside_optimal: int = 0
+    shots_physically_unreachable: int = 0
+    arc_opportunities: int = 0
+    arc_conversions: int = 0
+    predictive_aoe_opportunities: int = 0
+    predictive_aoe_conversions: int = 0
+    projectile_impacts: int = 0
+    projectile_damage_impacts: int = 0
+    projectile_impact_latency_total: float = 0.0
+    weapon_switches: int = 0
+    useful_weapon_switches: int = 0
+    switches_during_arc_opportunity: int = 0
+    switches_during_credible_opportunity: int = 0
+    near_wall_time: float = 0.0
+    corner_time: float = 0.0
+    dead_target_wait_time: float = 0.0
+    damage_dealt: float = 0.0
+    damage_taken: float = 0.0
+    damage_dealt_fraction: float = 0.0
+    damage_taken_fraction: float = 0.0
+
+    def observe(self, prev, action, curr, dt: float, damage_events=()):
+        _, combat_action, _ = (int(value) for value in action)
+        if prev.credible_fire_opportunity:
+            self.credible_fire_opportunities += 1
+            if combat_action == int(CombatAction.FIRE):
+                self.credible_fire_conversions += 1
+            elif combat_action in (int(CombatAction.NONE), int(CombatAction.BLOCK)):
+                self.combat_idle_time += dt
+
+        if prev.arc_fire_opportunity:
+            self.arc_opportunities += 1
+            if combat_action == int(CombatAction.FIRE):
+                self.arc_conversions += 1
+        if prev.predictive_aoe_opportunity:
+            self.predictive_aoe_opportunities += 1
+            if combat_action == int(CombatAction.FIRE):
+                self.predictive_aoe_conversions += 1
+
+        if combat_action == int(CombatAction.FIRE) and prev.can_fire:
+            if not prev.target_physically_reachable:
+                self.shots_physically_unreachable += 1
+            elif prev.in_optimal_range:
+                self.shots_in_optimal_band += 1
+            else:
+                self.shots_reachable_outside_optimal += 1
+
+        if curr.weapon_switched:
+            self.weapon_switches += 1
+            if curr.credible_fire_opportunity:
+                self.useful_weapon_switches += 1
+                self.switches_during_credible_opportunity += 1
+            if curr.arc_fire_opportunity:
+                self.switches_during_arc_opportunity += 1
+        if curr.near_wall:
+            self.near_wall_time += dt
+        if curr.in_corner:
+            self.corner_time += dt
+        if not curr.target_alive and curr.alive_hostiles > 0:
+            self.dead_target_wait_time += dt
+
+        self.damage_dealt += sum(
+            event.damage for event in damage_events
+            if event.attacker_kind == "agent"
+            and event.victim_kind == "target")
+        self.damage_taken += sum(
+            event.damage for event in damage_events
+            if event.victim_kind == "agent")
+        self.damage_dealt_fraction += curr.total_damage_all_targets
+        self.damage_taken_fraction += curr.damage_taken_this_step
+
+    def record_projectile_resolution(self, projectile, hits):
+        if not projectile.did_hit:
+            return
+        self.projectile_impacts += 1
+        self.projectile_impact_latency_total += projectile.age
+        if any(hit[1] > 0.0 for hit in hits):
+            self.projectile_damage_impacts += 1
+
+    def as_dict(self):
+        opportunities = max(self.credible_fire_opportunities, 1)
+        arc_opportunities = max(self.arc_opportunities, 1)
+        predictive_opportunities = max(self.predictive_aoe_opportunities, 1)
+        impacts = max(self.projectile_impacts, 1)
+        switches = max(self.weapon_switches, 1)
+        return {
+            "credible_fire_opportunities": self.credible_fire_opportunities,
+            "credible_fire_conversions": self.credible_fire_conversions,
+            "credible_fire_conversion_rate": (
+                self.credible_fire_conversions / opportunities),
+            "combat_idle_time": self.combat_idle_time,
+            "shots_in_optimal_band": self.shots_in_optimal_band,
+            "shots_reachable_outside_optimal": self.shots_reachable_outside_optimal,
+            "shots_physically_unreachable": self.shots_physically_unreachable,
+            "arc_opportunities": self.arc_opportunities,
+            "arc_conversion_rate": self.arc_conversions / arc_opportunities,
+            "predictive_aoe_opportunities": self.predictive_aoe_opportunities,
+            "predictive_aoe_conversion_rate": (
+                self.predictive_aoe_conversions / predictive_opportunities),
+            "projectile_impacts": self.projectile_impacts,
+            "projectile_damage_impacts": self.projectile_damage_impacts,
+            "mean_projectile_impact_latency": (
+                self.projectile_impact_latency_total / impacts),
+            "weapon_switches": self.weapon_switches,
+            "useful_weapon_switch_rate": self.useful_weapon_switches / switches,
+            "switches_during_credible_opportunity": (
+                self.switches_during_credible_opportunity),
+            "switches_during_arc_opportunity": (
+                self.switches_during_arc_opportunity),
+            "near_wall_time": self.near_wall_time,
+            "corner_time": self.corner_time,
+            "dead_target_switch_latency": self.dead_target_wait_time,
+            "damage_dealt": self.damage_dealt,
+            "damage_taken": self.damage_taken,
+            "damage_dealt_fraction": self.damage_dealt_fraction,
+            "damage_taken_fraction": self.damage_taken_fraction,
+        }
+
+
 # ─────────────────────────────────────────────────────────────────
 #  Data Structures
 # ─────────────────────────────────────────────────────────────────
@@ -245,8 +377,12 @@ class WeaponSlot:
     reload_time: float = 2.0
     fire_cooldown: float = 0.3
     projectile_speed: float = 3000.0   # UU/s — all weapons fire projectiles
+    projectile_lifetime: float = 10.0  # AEnemyProjectileBase::Lifetime
     wind_up_time: float = 0.0
     can_arc: bool = False
+    arc_height: float = 400.0
+    impact_radius: float = 0.0
+    damage_falloff: float = 0.5
     max_arc_height: float = 400.0     # MaxArcableObstacleHeight — tallest obstacle we can arc over (0=unlimited)
     min_arc_clearance: float = 200.0  # MinArcClearance — vertical clearance needed above obstacle
     is_ranged: bool = True
@@ -273,6 +409,17 @@ class WeaponSlot:
     def ammo_fraction(self) -> float:
         return self.current_ammo / self.max_ammo if self.max_ammo > 0 else 1.0
 
+    def predict_aim_point(self, start, target_pos, target_velocity):
+        return predict_firing_solution(
+            start, target_pos, target_velocity,
+            self.wind_up_time, self.projectile_speed,
+            self.can_arc, self.arc_height)
+
+    def can_physically_reach(self, start, aim_point) -> bool:
+        return projectile_physically_reachable(
+            start, aim_point, self.projectile_speed,
+            self.projectile_lifetime, self.can_arc, self.arc_height)
+
     def tick(self, dt: float):
         if self.is_reloading:
             self.reload_remaining -= dt
@@ -282,6 +429,55 @@ class WeaponSlot:
                 self.reload_remaining = 0.0
         if self.cooldown_remaining > 0:
             self.cooldown_remaining = max(0.0, self.cooldown_remaining - dt)
+
+
+def projectile_path_length(start, end, can_arc=False, arc_height=0.0) -> float:
+    distance = float(np.linalg.norm(np.asarray(end) - np.asarray(start)))
+    if not can_arc:
+        return distance
+    return 2.0 * math.sqrt(
+        (distance * 0.5) ** 2 + max(0.0, float(arc_height)) ** 2)
+
+
+def estimate_projectile_flight_time(
+        start, target_pos, target_velocity, wind_up_time,
+        projectile_speed, can_arc=False, arc_height=0.0) -> float:
+    """Three fixed-point iterations; exactly mirrors FEnemyFiringSolution."""
+    if projectile_speed <= 1e-6:
+        return 0.0
+    start = np.asarray(start, dtype=np.float32)
+    target_pos = np.asarray(target_pos, dtype=np.float32)
+    target_velocity = np.asarray(target_velocity, dtype=np.float32)
+    wind_up_time = max(0.0, float(wind_up_time))
+    aim_point = target_pos + target_velocity * wind_up_time
+    flight_time = projectile_path_length(
+        start, aim_point, can_arc, arc_height) / projectile_speed
+    for _ in range(3):
+        aim_point = target_pos + target_velocity * (wind_up_time + flight_time)
+        flight_time = projectile_path_length(
+            start, aim_point, can_arc, arc_height) / projectile_speed
+    return max(0.0, float(flight_time))
+
+
+def predict_firing_solution(
+        start, target_pos, target_velocity, wind_up_time,
+        projectile_speed, can_arc=False, arc_height=0.0) -> np.ndarray:
+    flight_time = estimate_projectile_flight_time(
+        start, target_pos, target_velocity, wind_up_time,
+        projectile_speed, can_arc, arc_height)
+    return (np.asarray(target_pos, dtype=np.float32)
+            + np.asarray(target_velocity, dtype=np.float32)
+            * (max(0.0, float(wind_up_time)) + flight_time)).astype(np.float32)
+
+
+def projectile_physically_reachable(
+        start, aim_point, projectile_speed, projectile_lifetime,
+        can_arc=False, arc_height=0.0) -> bool:
+    if projectile_speed <= 1e-6 or projectile_lifetime <= 0.0:
+        return False
+    flight_time = projectile_path_length(
+        start, aim_point, can_arc, arc_height) / projectile_speed
+    return flight_time <= projectile_lifetime + 1e-6
 
 
 @dataclass
@@ -422,9 +618,11 @@ class SimProjectile:
     arc_flight_time: float = 1.0
     arc_elapsed: float = 0.0
     arc_impact_radius: float = 0.0  # 0 = point damage, >0 = AoE
+    arc_damage_falloff: float = 0.5
 
     # Collision.
-    hit_radius: float = 60.0         # Distance threshold for hit detection.
+    collision_radius: float = 15.0   # AEnemyProjectileBase::CollisionRadius
+    hit_radius: float = 60.0         # Projectile sphere + target capsule.
     hit_actor: object = None          # Set on hit for rendering flash.
     did_hit: bool = False
 
@@ -477,7 +675,8 @@ class SimProjectile:
         # Candidate tuple: (t, kind, object).  t is in [0, 1].
         candidates = []
         for obstacle in obstacles:
-            t_hit = _ray_aabb_intersect_t(old_pos, end_pos, obstacle)
+            t_hit = _sphere_sweep_aabb_t(
+                old_pos, end_pos, obstacle, self.collision_radius)
             if t_hit is not None:
                 candidates.append((float(t_hit), "obstacle", obstacle))
 
@@ -533,6 +732,9 @@ class SimProjectile:
 
     def _tick_arc(self, dt, targets, agent, obstacles, arena_half, rng=None):
         """Arc projectile — swept XY collision with the C++ bezier height."""
+        if self.age > self.max_lifetime:
+            self.alive = False
+            return []
         previous_progress = min(
             1.0, self.arc_elapsed / max(self.arc_flight_time, 0.01))
         previous_pos = self.pos.copy()
@@ -547,8 +749,8 @@ class SimProjectile:
 
         blocking_hit = None
         for obstacle in obstacles:
-            segment_t = _ray_aabb_intersect_t(
-                previous_pos, new_pos, obstacle)
+            segment_t = _sphere_sweep_aabb_t(
+                previous_pos, new_pos, obstacle, self.collision_radius)
             if segment_t is None:
                 continue
             arc_t = previous_progress + (
@@ -588,12 +790,13 @@ class SimProjectile:
                 if hasattr(actor, "alive") and not actor.alive:
                     continue
                 distance = np.linalg.norm(self.pos - actor.pos)
-                if distance >= self.arc_impact_radius:
+                if distance > self.arc_impact_radius:
                     continue
                 if getattr(actor, "is_invulnerable", False):
                     continue
                 falloff = 1.0 - (
-                    distance / self.arc_impact_radius) * 0.5
+                    distance / self.arc_impact_radius) * (
+                        1.0 - self.arc_damage_falloff)
                 hp_before = max(0.0, float(actor.hp))
                 damage, actor.barrier, was_crit = compute_damage(
                     self.damage * falloff, self.attack_stat,
@@ -1207,6 +1410,21 @@ def _sphere_sweep_aabb_t(
             tmin = max(tmin, t1); tmax = min(tmax, t2)
             if tmin > tmax:
                 return None
+
+    starts_penetrating = (
+        bx1 < x1 < bx2 and by1 < y1 < by2
+    )
+    if tmin <= 1e-8 and not starts_penetrating:
+        # The slab test returns t=0 for a body tangent to the expanded
+        # obstacle whether it moves into or away from the wall. UE reports
+        # an initial hit for penetration/entry, not for separating contact.
+        sample_x = x1 + dx * 1e-6
+        sample_y = y1 + dy * 1e-6
+        enters_box = (
+            bx1 < sample_x < bx2 and by1 < sample_y < by2
+        )
+        if not enters_box:
+            return None
     return max(tmin, 0.0)
 
 
@@ -1291,6 +1509,15 @@ class WeaponPreset:
     melee: dict = field(default_factory=dict)
 
 # Standard weapon presets matching the design doc.
+HEAVY_MISSILE_MECHANICS = {
+    # Measured from BP_Missiles / BP_EnemyMissile production CDOs.
+    "projectile_speed": 5053.8667,
+    "projectile_lifetime": 10.0,
+    "arc_height": 2247.2354,
+    "impact_radius": 509.8804,
+    "damage_falloff": 0.5,
+}
+
 WEAPON_PRESETS = {
     "scout": WeaponPreset(
         slots=[dict(name="Laser", base_damage=8, weapon_range=1200, max_ammo=20,
@@ -1304,7 +1531,8 @@ WEAPON_PRESETS = {
                  wind_up_time=0.5, projectile_speed=2000),  # Slow heavy round.
             dict(name="Missiles", base_damage=25, weapon_range=1800, max_ammo=4,
                  fire_cooldown=1.5, reload_time=4.0, can_arc=True, max_arc_height=400,
-                 optimal_min=600, optimal_max=1400, projectile_speed=1200),  # Arcing over cover up to 400 UU.
+                 optimal_min=600, optimal_max=1400,
+                 **HEAVY_MISSILE_MECHANICS),
         ],
         melee=dict(damage=40, range=250, cooldown=1.5)),
     "sniper": WeaponPreset(
@@ -1351,6 +1579,9 @@ class CombatEnvConfig:
     target_speed_fraction: float = 0.6  # how actively targets move (0=stationary, 1=full speed)
     engagement_distance: float = 1500.0
     squad_size_buckets: Optional[Tuple[int, ...]] = None
+    randomize_weapon_mechanics: bool = False
+    behavior_profiles: Optional[Tuple[str, ...]] = None
+    behavior_profile_offset: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1424,9 +1655,19 @@ class CombatEnv(gym.Env):
         self._step_damage_events: List[DamageEvent] = []
         self._agent_kills = 0
         self._next_projectile_id = 1
+        self.behavior_telemetry = BehaviorTelemetry()
+        self.behavior_profile = None
+        self._behavior_profiles = (
+            normalize_profile_set(self.cfg.behavior_profiles)
+            if self.cfg.behavior_profiles else tuple())
+        self._behavior_profile_cursor = int(self.cfg.behavior_profile_offset)
+        self.episode_weapon_preset = self.cfg.weapon_preset
+        self.current_scenario_id = ""
+        self._episode_counter = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        self._episode_counter += 1
         if seed is not None:
             self.rng.seed(seed)  # [Audit §4.2] Propagate seed to per-env RNG
         self.step_count = 0
@@ -1438,12 +1679,16 @@ class CombatEnv(gym.Env):
         self._step_damage_events = []
         self._agent_kills = 0
         self._next_projectile_id = 1
+        self.behavior_telemetry = BehaviorTelemetry()
         self.reward_fn.reset()
         self._projectiles = []
         self.threat_table.reset()  # [Audit §1.3]
         self._player_patterns = PlayerPatternTracker()
 
-        self._select_episode_matchup(seed)
+        options = options or {}
+        self._select_episode_matchup(
+            seed, forced_squad_size=options.get("squad_size"))
+        self._select_behavior_profile(seed, options.get("behavior_profile"))
 
         # Build arena.
         self._build_arena()
@@ -1451,12 +1696,20 @@ class CombatEnv(gym.Env):
         # Randomize weapon each episode if weapon_pool is set.
         # This ensures all parallel envs experience all weapons,
         # reducing advantage estimate variance in PPO.
-        if self.cfg.weapon_pool:
-            self.cfg.weapon_preset = self.rng.choice(self.cfg.weapon_pool)
+        forced_loadout = options.get("weapon_preset")
+        if forced_loadout is not None:
+            if forced_loadout not in WEAPON_PRESETS:
+                raise ValueError(f"Unknown weapon preset '{forced_loadout}'")
+            self.episode_weapon_preset = forced_loadout
+        elif self.cfg.weapon_pool:
+            self.episode_weapon_preset = self.rng.choice(self.cfg.weapon_pool)
+        else:
+            self.episode_weapon_preset = self.cfg.weapon_preset
         
         self._spawn_agent()
         self._spawn_targets()          # MOVED BEFORE _prev_target_hps
         self._publish_target_action_slots()
+        self.current_scenario_id = self._scenario_id(seed)
 
         self._prev_target_hps = {
             t.target_id: t.hp_fraction() for t in self.targets
@@ -1469,6 +1722,16 @@ class CombatEnv(gym.Env):
         info = {
             "action_mask": action_mask,
             "skip_inference": action_mask["skip_inference"],
+            "behavior_profile_id": (
+                int(self.behavior_profile)
+                if self.behavior_profile is not None else -1),
+            "behavior_condition": (
+                behavior_condition(self.behavior_profile)
+                if self.behavior_profile is not None
+                else np.zeros(4, dtype=np.float32)),
+            "weapon_preset": self.episode_weapon_preset,
+            "squad_size_bucket": self.episode_squad_size,
+            "scenario_id": self.current_scenario_id,
         }
         return obs, info
 
@@ -1712,6 +1975,16 @@ class CombatEnv(gym.Env):
         # 7. Compute reward.
         reward, info = self.reward_fn.compute(
             prev_state, effective_action, curr_state)
+        if self.behavior_profile is not None:
+            profile_reward, profile_components = profile_objective_reward(
+                self.behavior_profile, prev_state, effective_action, curr_state)
+            reward += profile_reward
+            info.update(profile_components)
+            info["behavior_profile_reward"] = profile_reward
+            info["total"] = info.get("total", 0.0) + profile_reward
+        self.behavior_telemetry.observe(
+            prev_state, effective_action, curr_state, dt,
+            self._step_damage_events)
         info["executed_action"] = effective_action
         info["executed_movement_action"] = effective_move
         info["executed_combat_action"] = effective_combat
@@ -1741,6 +2014,24 @@ class CombatEnv(gym.Env):
         # tracked correctly. Previously infos[i].get("is_win", False)
         # always returned False because no code ever set this key.
         info["is_win"] = all(not t.alive for t in self.targets)
+        info["behavior_profile_id"] = (
+            int(self.behavior_profile)
+            if self.behavior_profile is not None else -1)
+        info["behavior_condition"] = (
+            behavior_condition(self.behavior_profile)
+            if self.behavior_profile is not None
+            else np.zeros(4, dtype=np.float32))
+        info["weapon_preset"] = self.episode_weapon_preset
+        info["squad_size_bucket"] = self.episode_squad_size
+        info["scenario_id"] = self.current_scenario_id
+        if done or truncated:
+            terminal_metrics = self.behavior_telemetry.as_dict()
+            terminal_metrics.update({
+                "win": float(info["is_win"]),
+                "kills": self._agent_kills,
+                "episode_length": self.step_count,
+            })
+            info["behavior_metrics"] = terminal_metrics
 
         # Track per-target HP for next step's multi-target damage reward.
         self._prev_target_hps = {
@@ -1785,9 +2076,18 @@ class CombatEnv(gym.Env):
     #  Arena Setup
     # ═════════════════════════════════════════════════════════════
 
-    def _select_episode_matchup(self, seed=None):
+    def _select_episode_matchup(self, seed=None, forced_squad_size=None):
         """Select one exactly stratified, deterministic stage-7 bucket."""
         buckets = self.cfg.squad_size_buckets
+        if forced_squad_size is not None:
+            squad_size = int(forced_squad_size)
+            if squad_size < 1 or (buckets and squad_size not in buckets):
+                raise ValueError(
+                    f"Invalid squad-size bucket {forced_squad_size}")
+            self.cfg.num_enemies = squad_size
+            self.cfg.num_targets = squad_size
+            self.episode_squad_size = squad_size
+            return
         if buckets:
             if any(size < 1 for size in buckets):
                 raise ValueError("squad_size_buckets must contain positive sizes")
@@ -1809,6 +2109,34 @@ class CombatEnv(gym.Env):
                 if self.cfg.num_enemies == self.cfg.num_targets
                 else 0
             )
+
+    def _select_behavior_profile(self, seed=None, forced_profile=None):
+        if forced_profile is not None:
+            profile = normalize_profile_set((forced_profile,))[0]
+            if self._behavior_profiles and profile not in self._behavior_profiles:
+                raise ValueError(
+                    f"Profile {profile.name.lower()} is not enabled for this env")
+            self.behavior_profile = profile
+            return
+        if not self._behavior_profiles:
+            self.behavior_profile = None
+            return
+        if seed is not None:
+            index = (int(seed) + self.cfg.behavior_profile_offset) % len(
+                self._behavior_profiles)
+        else:
+            index = self._behavior_profile_cursor % len(self._behavior_profiles)
+            self._behavior_profile_cursor += 1
+        self.behavior_profile = self._behavior_profiles[index]
+
+    def _scenario_id(self, seed):
+        seed_identity = (
+            str(seed) if seed is not None else f"auto{self._episode_counter}")
+        return (
+            f"s{self.cfg.curriculum_stage}:a{self.cfg.archetype}:"
+            f"seed{seed_identity}:"
+            f"loadout{self.episode_weapon_preset}:"
+            f"squad{self.episode_squad_size}")
 
     def _build_arena(self):
         """Build a randomised arena with varied obstacle types.
@@ -1878,7 +2206,7 @@ class CombatEnv(gym.Env):
 
     def _spawn_agent(self):
         half = self._effective_arena_size * 0.3
-        preset = WEAPON_PRESETS.get(self.cfg.weapon_preset,
+        preset = WEAPON_PRESETS.get(self.episode_weapon_preset,
                                      WEAPON_PRESETS["scout"])
 
         weapons = []
@@ -1887,11 +2215,11 @@ class CombatEnv(gym.Env):
             w.current_ammo = w.max_ammo
             weapons.append(w)
             
-        # Randomise weapon parameters for range generalisation.
-        # The model must learn to READ the range observation and adapt,
-        # not memorise "stay at 1000 UU" for a specific preset.
-        # Only apply in stages 4+ (once basic weapon mechanics are stable).
-        if self.cfg.curriculum_stage >= 4:
+        # Optional domain-randomisation experiment. Disabled for ordinary PPO
+        # because production mechanics are authoritative and fixed-loadout
+        # parity probes must receive exact Blueprint values.
+        if (self.cfg.randomize_weapon_mechanics
+                and self.cfg.curriculum_stage >= 4):
             for w in weapons:
                 range_scale = self.rng.uniform(0.6, 1.8)
                 w.weapon_range *= range_scale
@@ -2403,6 +2731,8 @@ class CombatEnv(gym.Env):
                 # Consume ammo immediately (matches C++ UEWLC::TryFire line 174).
                 slot.current_ammo -= 1
                 slot.cooldown_remaining = slot.fire_cooldown
+                aim_point = slot.predict_aim_point(
+                    agent.pos, target.pos, target.velocity)
 
                 if slot.wind_up_time > 0.0:
                     # Wind-up weapon: lock for wind_up + fire_cooldown.
@@ -2413,10 +2743,10 @@ class CombatEnv(gym.Env):
                     agent.set_action_lock(
                         slot.wind_up_time + slot.fire_cooldown,
                         6)  # reason=6 WindUp  [Audit §1.1]
-                    # Store target data for deferred projectile spawn.
+                    # Store the action-time solution. Production keeps this
+                    # world-space aim point fixed through the wind-up.
                     agent._pending_fire = {
-                        'target_pos': target.pos.copy(),
-                        'target_vel': target.velocity.copy(),
+                        'aim_point': aim_point,
                         'target_id': target.target_id,
                         'slot_idx': agent.active_weapon,
                     }
@@ -2425,10 +2755,9 @@ class CombatEnv(gym.Env):
                     agent.set_action_lock(
                         slot.fire_cooldown * 0.5,
                         1)  # reason=1 Firing  [Audit §1.1]
-                    in_range = dist <= slot.weapon_range
-                    if in_range and self._weapon_has_path(
-                            slot, agent.pos, target.pos):
-                        self._spawn_agent_projectile(slot, target, agent, dist)
+                    self._spawn_agent_projectile(
+                        slot, aim_point, agent,
+                        intended_target_id=target.target_id)
 
         elif action == CombatAction.RELOAD:
             if slot and not slot.is_reloading and slot.current_ammo < slot.max_ammo:
@@ -2491,39 +2820,22 @@ class CombatEnv(gym.Env):
             return self._begin_dodge(move_idx, target)
         return True
 
-    def _spawn_agent_projectile(self, slot: WeaponSlot, target, agent, dist: float,
+    def _spawn_agent_projectile(self, slot: WeaponSlot, aim_point, agent,
                                 intended_target_id: int = -1):
-        """Spawn a projectile from the agent toward the target.
-        
-        Extracted from _execute_combat so it can be reused by
-        _resolve_pending_fire for deferred wind-up shots.
-        """
-        if intended_target_id < 0:
-            intended_target_id = int(getattr(target, "target_id", -1))
+        """Spawn toward the deterministic action-time firing solution."""
         projectile_id = self._next_projectile_id
         self._next_projectile_id += 1
-
-        # Lead the target: aim at predicted position.
-        flight_time = dist / max(slot.projectile_speed, 500.0)
-        predicted_pos = target.pos + target.velocity * flight_time
-
-        fire_dir = predicted_pos - agent.pos
+        aim_point = np.asarray(aim_point, dtype=np.float32)
+        fire_dir = aim_point - agent.pos
         fire_dist = np.linalg.norm(fire_dir)
         if fire_dist > 1:
             fire_dir = fire_dir / fire_dist
 
-        # Add slight inaccuracy (spread).
-        spread = self.rng.uniform(-0.05, 0.05)
-        cos_s, sin_s = math.cos(spread), math.sin(spread)
-        fx, fy = fire_dir[0], fire_dir[1]
-        fire_dir = np.array([fx * cos_s - fy * sin_s,
-                             fx * sin_s + fy * cos_s], dtype=np.float32)
-
         if slot.can_arc:
             # Arc projectile — bezier curve over obstacles.
             arc_start = agent.pos.copy()
-            arc_end = predicted_pos.copy()
-            arc_height = 400.0
+            arc_end = aim_point.copy()
+            arc_height = slot.arc_height
             midpoint = (arc_start + arc_end) / 2.0
             apex = midpoint.copy()
 
@@ -2540,8 +2852,9 @@ class CombatEnv(gym.Env):
                 attack_stat=agent.attack_stat,
                 crit_chance=agent.crit_chance,
                 crit_multiplier=agent.crit_multiplier,
+                max_lifetime=slot.projectile_lifetime,
                 is_agent_projectile=True,
-                target_pos=predicted_pos.copy(),
+                target_pos=aim_point.copy(),
                 projectile_id=projectile_id,
                 source_name=slot.name,
                 intended_target_id=intended_target_id,
@@ -2552,8 +2865,8 @@ class CombatEnv(gym.Env):
                 arc_apex=apex.copy(),
                 arc_end=arc_end.copy(),
                 arc_flight_time=flight_t,
-                arc_impact_radius=150.0,
-                hit_radius=35.0,
+                arc_impact_radius=slot.impact_radius,
+                arc_damage_falloff=slot.damage_falloff,
             )
         else:
             # Straight/beam projectile.
@@ -2565,12 +2878,12 @@ class CombatEnv(gym.Env):
                 attack_stat=agent.attack_stat,
                 crit_chance=agent.crit_chance,
                 crit_multiplier=agent.crit_multiplier,
+                max_lifetime=slot.projectile_lifetime,
                 is_agent_projectile=True,
-                target_pos=predicted_pos.copy(),
+                target_pos=aim_point.copy(),
                 projectile_id=projectile_id,
                 source_name=slot.name,
                 intended_target_id=intended_target_id,
-                hit_radius=25.0,
             )
 
         self._projectiles.append(proj)
@@ -2598,21 +2911,9 @@ class CombatEnv(gym.Env):
             return
         slot = agent.weapons[slot_idx]
 
-        # Build a lightweight target-like object from the stored data
-        # so _spawn_agent_projectile can lead the shot.
-        class _DeferredTarget:
-            def __init__(self, pos, velocity):
-                self.pos = pos
-                self.velocity = velocity
-        target = _DeferredTarget(pf['target_pos'], pf['target_vel'])
-
-        dist = np.linalg.norm(agent.pos - target.pos)
-        in_range = dist <= slot.weapon_range
-        if in_range and self._weapon_has_path(
-                slot, agent.pos, target.pos):
-            self._spawn_agent_projectile(
-                slot, target, agent, dist,
-                intended_target_id=int(pf.get('target_id', -1)))
+        self._spawn_agent_projectile(
+            slot, pf['aim_point'], agent,
+            intended_target_id=int(pf.get('target_id', -1)))
 
     def _target_attacks_agent(self, dt: float):
         """Targets attack the agent with melee and/or ranged weapons.
@@ -2820,6 +3121,7 @@ class CombatEnv(gym.Env):
     def _tick_projectiles(self, dt: float):
         """Advance projectiles and preserve asynchronous causal attribution."""
         for proj in self._projectiles:
+            was_alive = proj.alive
             hits = proj.tick(dt, self.targets, self.agent,
                              self.obstacles, self._arena_half, rng=self.rng)
             delivery = "arc_projectile" if proj.is_arc else "projectile"
@@ -2835,6 +3137,9 @@ class CombatEnv(gym.Env):
                     projectile_id=proj.projectile_id,
                     intended_target_id=proj.intended_target_id,
                     was_crit=was_crit, killed=killed)
+            if was_alive and not proj.alive:
+                self.behavior_telemetry.record_projectile_resolution(
+                    proj, hits)
 
         self._projectiles = [p for p in self._projectiles if p.alive]
 
@@ -3368,22 +3673,25 @@ class CombatEnv(gym.Env):
         obs[idx] = min(threat_count / 5.0, 1.0); idx += 1     # 233 threat count
 
         # ── Weapon Can-Hit-Target (4) ───────────────────────────
-        # Per weapon slot: 1.0 if weapon has ammo, target in range,
-        # and path to target exists (LOS for direct, or arc for arc weapons
-        # when target is behind cover). Answers "should I switch?" directly.
+        # Per weapon slot: ammo + physical reach + valid delivery path.
+        # Nominal range remains separately observable as tactical guidance.
         target = self._current_target()
-        target_dist = np.linalg.norm(a.pos - target.pos) if target and target.alive else 9999
 
         for wi in range(4):
             if wi < len(a.weapons):
                 w = a.weapons[wi]
-                in_range = target_dist <= w.weapon_range
+                aim_point = (
+                    w.predict_aim_point(a.pos, target.pos, target.velocity)
+                    if target and target.alive else a.pos)
+                reachable = w.can_physically_reach(a.pos, aim_point)
                 has_path = (
                     self._weapon_has_path(w, a.pos, target.pos)
                     if target and target.alive
                     else False
                 )
-                can_hit = w.has_ammo() and in_range and has_path and not w.is_reloading
+                can_hit = (
+                    w.has_ammo() and reachable and has_path
+                    and not w.is_reloading)
                 obs[idx] = 1.0 if can_hit else 0.0
             idx += 1                                           # 234-237
 
@@ -3453,6 +3761,21 @@ class CombatEnv(gym.Env):
 
         has_los = check_los(a.pos, target.pos, self.obstacles) if target else False
         blocked, cover_h = is_behind_cover(a.pos, target.pos, self.obstacles) if target else (False, 0)
+        aim_point = (
+            slot.predict_aim_point(a.pos, target.pos, target.velocity)
+            if slot and target else a.pos)
+        physically_reachable = bool(
+            slot and target and slot.can_physically_reach(a.pos, aim_point))
+        valid_path = bool(
+            has_los or (
+                slot and blocked and slot.can_arc_over_height(cover_h)))
+        credible_fire_opportunity = bool(
+            target and target.alive and physically_reachable and valid_path)
+        arc_fire_opportunity = bool(
+            credible_fire_opportunity and blocked and slot and slot.can_arc)
+        predictive_aoe_opportunity = bool(
+            credible_fire_opportunity and slot and slot.impact_radius > 0.0
+            and target and np.linalg.norm(target.velocity) > 10.0)
 
         in_optimal = False
         if slot and target:
@@ -3574,6 +3897,10 @@ class CombatEnv(gym.Env):
             target_distance=dist,
             has_los=has_los,
             target_in_range=(dist <= slot.weapon_range) if slot and target else False,
+            target_physically_reachable=physically_reachable,
+            credible_fire_opportunity=credible_fire_opportunity,
+            arc_fire_opportunity=arc_fire_opportunity,
+            predictive_aoe_opportunity=predictive_aoe_opportunity,
             target_behind_cover=blocked,
             target_cover_height=cover_h if blocked else 0.0,
             target_behind_low_cover=(blocked and cover_h < 300),
@@ -4057,7 +4384,9 @@ class CombatEnv(gym.Env):
 # ─────────────────────────────────────────────────────────────────
 
 def make_curriculum_env(stage: int, archetype: str = "ranged",
-                       render_mode: str = None) -> CombatEnv:
+                       render_mode: str = None,
+                       behavior_profiles=None,
+                       behavior_profile_offset: int = 0) -> CombatEnv:
     """Create an environment configured for a specific curriculum stage."""
 
     configs = {
@@ -4164,6 +4493,9 @@ def make_curriculum_env(stage: int, archetype: str = "ranged",
     cfg = configs.get(stage, configs[3])
     cfg.curriculum_stage = stage
     cfg.archetype = archetype
+    cfg.behavior_profiles = (
+        tuple(behavior_profiles) if behavior_profiles else None)
+    cfg.behavior_profile_offset = int(behavior_profile_offset)
     return CombatEnv(cfg, render_mode=render_mode)
 
 

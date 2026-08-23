@@ -112,6 +112,10 @@ class CombatState:
     target_distance: float = 500.0
     has_los: bool = True
     target_in_range: bool = True
+    target_physically_reachable: bool = True
+    credible_fire_opportunity: bool = True
+    arc_fire_opportunity: bool = False
+    predictive_aoe_opportunity: bool = False
     target_behind_cover: bool = False
     target_cover_height: float = 0.0     # Height of obstacle blocking LOS (0 = clear)
     target_behind_low_cover: bool = False # Low blocked + high clear = arc opportunity
@@ -738,16 +742,11 @@ class CombatRewardFunction:
         # A FIRE action receives a small immediate reward when the shot is
         # genuinely viable. This bridges the temporal credit gap for slow
         # heavy/arc projectiles whose impact reward arrives later.
-        line_viable = (
-            prev.has_los
-            or (prev.active_weapon_can_arc and prev.can_arc_over_target_cover)
-        )
         valid_fire_opportunity = (
             prev.target_alive
             and prev.can_fire
-            and prev.target_in_range
             and prev.active_ammo_fraction > 0.0
-            and line_viable
+            and prev.credible_fire_opportunity
         )
 
         r_fire_intent = 0.0
@@ -923,7 +922,7 @@ class CombatRewardFunction:
                 r += self.w.switch_to_loaded
                 info["switch_to_loaded"] = self.w.switch_to_loaded
 
-        # Wasted shot: fired but target was out of range or no LOS.
+        # Wasted shot: fired at a physically unreachable or blocked solution.
         # Exception: arc weapons that CAN clear the blocking cover are
         # exempt from the LOS penalty. Uses the height-aware check so
         # firing missiles at a target behind a 500 UU wall IS penalised,
@@ -932,7 +931,8 @@ class CombatRewardFunction:
             if curr.total_damage_all_targets <= 0.0:
                 los_blocked_for_weapon = (
                     not prev.has_los and not prev.can_arc_over_target_cover)
-                if not prev.target_in_range or los_blocked_for_weapon:
+                if (not prev.target_physically_reachable
+                        or los_blocked_for_weapon):
                     r += self.w.wasted_shot
                     info["wasted_shot"] = self.w.wasted_shot
             else:
@@ -1032,7 +1032,7 @@ class CombatRewardFunction:
         # higher DPS — the agent should prefer them when LOS is clear.
         if (combat_action == CombatAction.FIRE and prev.can_fire
                 and not curr.active_weapon_can_arc
-                and curr.has_los and curr.target_in_range):
+                and curr.has_los and curr.target_physically_reachable):
             r += self.w.direct_fire_with_los
             info["direct_fire_los"] = self.w.direct_fire_with_los
 
@@ -1041,7 +1041,7 @@ class CombatRewardFunction:
         # their intended purpose (over cover), not as a fallback.
         if (curr.active_weapon_can_arc and curr.has_los
                 and curr.has_direct_weapon_with_ammo
-                and curr.target_in_range):
+                and curr.target_physically_reachable):
             r += self.w.holding_arc_with_los
             info["holding_arc_with_los"] = self.w.holding_arc_with_los
 
@@ -1421,10 +1421,7 @@ class CombatRewardFunction:
         # reward almost impossible to trigger.
         if (combat_action == CombatAction.FIRE
                 and prev.can_fire
-                and prev.target_in_range
-                and (prev.has_los
-                     or (prev.active_weapon_can_arc
-                         and prev.can_arc_over_target_cover))):
+                and prev.credible_fire_opportunity):
             r += self.w.tank_suppression
             info["tank_suppression"] = self.w.tank_suppression
 
