@@ -316,15 +316,29 @@ class VecFrameStackEnv:
                 # Save the terminal stacked observation BEFORE resetting.
                 terminal_obs = np.concatenate(list(self._frame_buffers[i]))
                 all_infos[i]["terminal_observation"] = terminal_obs
+                if "behavior_profile_id" in all_infos[i]:
+                    all_infos[i]["terminal_behavior_profile_id"] = \
+                        all_infos[i]["behavior_profile_id"]
+                if "behavior_condition" in all_infos[i]:
+                    all_infos[i]["terminal_behavior_condition"] = np.array(
+                        all_infos[i]["behavior_condition"], copy=True)
+                if "scenario_id" in all_infos[i]:
+                    all_infos[i]["terminal_scenario_id"] = \
+                        all_infos[i]["scenario_id"]
 
                 # Auto-reset. Capture the new info (contains action mask).
                 new_obs, new_info = env.reset()
                 self._frame_buffers[i].clear()
                 for _ in range(self.frame_stack):
                     self._frame_buffers[i].append(new_obs.copy())
-                # Replace action_mask with the new episode's mask.
-                if "action_mask" in new_info:
-                    all_infos[i]["action_mask"] = new_info["action_mask"]
+                # Next-decision fields belong to the reset episode. Terminal
+                # profile/telemetry remain available under terminal_* fields.
+                for key in (
+                        "action_mask", "skip_inference",
+                        "behavior_profile_id", "behavior_condition",
+                        "weapon_preset", "squad_size_bucket", "scenario_id"):
+                    if key in new_info:
+                        all_infos[i][key] = new_info[key]
 
             all_obs[i] = np.concatenate(list(self._frame_buffers[i]))
 

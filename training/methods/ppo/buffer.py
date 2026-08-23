@@ -23,11 +23,12 @@ class VecRolloutBuffer:
     """
 
     def __init__(self, num_steps: int, num_envs: int, obs_size: int,
-                 gru_hidden: int = 0):
+                 gru_hidden: int = 0, behavior_condition_dim: int = 0):
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.obs_size = obs_size
         self.gru_hidden = gru_hidden
+        self.behavior_condition_dim = behavior_condition_dim
         self.total = num_steps * num_envs
 
         self.obs = np.zeros(
@@ -61,6 +62,12 @@ class VecRolloutBuffer:
         if gru_hidden > 0:
             self.hiddens = np.zeros(
                 (num_steps, num_envs, gru_hidden), dtype=np.float32)
+        if behavior_condition_dim > 0:
+            self.behavior_conditions = np.zeros(
+                (num_steps, num_envs, behavior_condition_dim),
+                dtype=np.float32)
+            self.behavior_profile_ids = np.zeros(
+                (num_steps, num_envs), dtype=np.int64)
 
         # Auxiliary prediction labels (target movement direction, 9 classes).
         self.target_move_labels = np.zeros(
@@ -105,6 +112,11 @@ class VecRolloutBuffer:
         }
         if self.gru_hidden > 0:
             flat["hiddens"] = self.hiddens.reshape(self.total, self.gru_hidden)
+        if self.behavior_condition_dim > 0:
+            flat["behavior_conditions"] = self.behavior_conditions.reshape(
+                self.total, self.behavior_condition_dim)
+            flat["behavior_profile_ids"] = self.behavior_profile_ids.reshape(
+                self.total)
         return flat
 
     def sample_minibatches(self, batch_size: int):
@@ -135,4 +147,9 @@ class VecRolloutBuffer:
             # the same hidden context as the rollout collection phase.
             if "hiddens" in flat:
                 batch["hiddens"] = torch.from_numpy(flat["hiddens"][idx])
+            if "behavior_conditions" in flat:
+                batch["behavior_conditions"] = torch.from_numpy(
+                    flat["behavior_conditions"][idx])
+                batch["behavior_profile_ids"] = torch.from_numpy(
+                    flat["behavior_profile_ids"][idx])
             yield batch

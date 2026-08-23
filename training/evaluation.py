@@ -32,6 +32,7 @@ def evaluate(
     obs_normalizer=None,
     base_seed: int = 42,
     is_actor_critic: bool = True,
+    behavior_profile=None,
 ) -> Dict[str, float]:
     """Run evaluation with deterministic scenarios.
 
@@ -39,7 +40,9 @@ def evaluate(
     Set is_actor_critic=True for models returning (m, c, t, value),
     or False for policy-only models returning (m, c, t).
     """
-    raw_env = make_extended_curriculum_env(stage, archetype)
+    raw_env = make_extended_curriculum_env(
+        stage, archetype,
+        behavior_profiles=(behavior_profile,) if behavior_profile is not None else None)
     env = FrameStackEnvWrapper(raw_env, frame_stack=frame_stack)
     model.eval()
 
@@ -47,11 +50,16 @@ def evaluate(
     lengths = []
     wins = []
     kills = []
+    behavior_metrics = []
 
     for ep_idx in range(num_episodes):
         # Seed the environment's per-instance RNG, not only module globals.
         # This keeps every evaluation checkpoint on the exact same arenas.
-        obs, _ = env.reset(seed=base_seed + ep_idx)
+        obs, reset_info = env.reset(seed=base_seed + ep_idx)
+        condition = None
+        if getattr(model, "behavior_conditioned", False):
+            condition = torch.from_numpy(
+                reset_info["behavior_condition"]).float().unsqueeze(0).to(device)
         ep_reward = 0.0
         ep_length = 0
         done = False
@@ -89,8 +97,12 @@ def evaluate(
                             mask_dict["c_mask"]).unsqueeze(0).to(device)
                         t_mask_t = torch.from_numpy(
                             mask_dict["t_mask"]).unsqueeze(0).to(device)
+                        select_kwargs = {}
+                        if getattr(model, "behavior_conditioned", False):
+                            select_kwargs["behavior_condition"] = condition
                         result = model.select_actions(
-                            obs_t, (m_mask_t, c_mask_t, t_mask_t), hidden)
+                            obs_t, (m_mask_t, c_mask_t, t_mask_t), hidden,
+                            **select_kwargs)
                         if len(result) == 4:
                             m_a, c_a, t_a, hidden = result
                         else:
@@ -118,11 +130,14 @@ def evaluate(
                         c = c_l.argmax(1).item()
                         t = t_l.argmax(1).item()
 
-            obs, reward, done, truncated, _ = env.step(np.array([m, c, t]))
+            obs, reward, done, truncated, step_info = env.step(
+                np.array([m, c, t]))
             ep_reward += reward
             ep_length += 1
             if truncated:
                 break
+        if "behavior_metrics" in step_info:
+            behavior_metrics.append(step_info["behavior_metrics"])
 
         targets_killed = sum(1 for t in raw_env.targets if not t.alive)
         is_win = targets_killed == num_targets
@@ -141,5 +156,11 @@ def evaluate(
         "mean_kills": np.mean(kills),
         "reward_ci95": 1.96 * np.std(rewards) / max(np.sqrt(len(rewards)), 1),
     }
+    if behavior_metrics:
+        metric_keys = behavior_metrics[0].keys()
+        stats["behavior_metrics"] = {
+            key: float(np.mean([metrics[key] for metrics in behavior_metrics]))
+            for key in metric_keys
+        }
 
     return stats

@@ -23,6 +23,8 @@ WHAT A METHOD GETS FOR FREE
 
 import os
 import time
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime
@@ -51,6 +53,12 @@ from frame_stack import (
 
 from .normalizers import RunningNormalizer
 from .evaluation import evaluate
+from behavior_profiles import (
+    BEHAVIOR_CONDITION_DIM,
+    BEHAVIOR_CONDITIONING_VERSION,
+    PROFILE_SCHEMA,
+    normalize_profile_set,
+)
 
 
 DEFAULT_FRAME_STACK = 3
@@ -77,6 +85,7 @@ class BaseTrainer(ABC):
         bc_checkpoint: Optional[str] = None,
         output_dir: str = "checkpoints",
         total_timesteps: Optional[int] = None,
+        behavior_profiles=None,
     ):
         self.stage = stage
         self.archetype = str(archetype).lower()
@@ -90,6 +99,15 @@ class BaseTrainer(ABC):
         self.bc_checkpoint = bc_checkpoint
         self.output_dir = output_dir
         self.total_timesteps = total_timesteps
+        resolved_profiles = (
+            normalize_profile_set(behavior_profiles)
+            if behavior_profiles else tuple())
+        self.behavior_profiles = tuple(
+            profile.name.lower() for profile in resolved_profiles)
+        self.behavior_conditioned = bool(self.behavior_profiles)
+        if self.behavior_conditioned and self.tier != "large":
+            raise ValueError(
+                "The conditioned teacher spike requires the full Large contract")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.input_size = stacked_obs_size(frame_stack)
@@ -167,8 +185,12 @@ class BaseTrainer(ABC):
     def create_vec_env(self) -> VecFrameStackEnv:
         """Create a vectorized environment with frame stacking."""
         env_fns = [
-            lambda s=self.stage, a=self.archetype: make_extended_curriculum_env(s, a)
-            for _ in range(self.num_envs)
+            lambda index=index, s=self.stage, a=self.archetype: (
+                make_extended_curriculum_env(
+                    s, a,
+                    behavior_profiles=self.behavior_profiles or None,
+                    behavior_profile_offset=index))
+            for index in range(self.num_envs)
         ]
         return VecFrameStackEnv(env_fns, frame_stack=self.frame_stack)
 
@@ -205,22 +227,58 @@ class BaseTrainer(ABC):
         ], dtype=bool)
         return torch.from_numpy(skip).to(self.device)
 
+    def extract_behavior_conditions(self, infos_list):
+        if not self.behavior_conditioned:
+            return None, None
+        conditions = np.stack([
+            np.asarray(info["behavior_condition"], dtype=np.float32)
+            for info in infos_list
+        ])
+        profile_ids = np.asarray([
+            int(info["behavior_profile_id"]) for info in infos_list
+        ], dtype=np.int64)
+        if conditions.shape != (self.num_envs, BEHAVIOR_CONDITION_DIM):
+            raise ValueError(
+                f"Invalid behavior condition batch {conditions.shape}")
+        return (
+            torch.from_numpy(conditions).to(self.device),
+            profile_ids,
+        )
+
     def run_eval(self, global_step: int, eval_episodes: int = 50,
                  eval_base_seed: int = 42, batch_total: int = 0) -> Dict:
         """Run evaluation and log results. Returns eval stats dict."""
-        eval_stats = evaluate(
-            self.model, self.stage, self.archetype,
-            eval_episodes, self.device,
-            self.frame_stack, self.obs_normalizer,
-            base_seed=eval_base_seed,
-            is_actor_critic=True,
-        )
+        profiles = self.behavior_profiles or (None,)
+        per_profile = {}
+        for profile in profiles:
+            stats = evaluate(
+                self.model, self.stage, self.archetype,
+                eval_episodes, self.device,
+                self.frame_stack, self.obs_normalizer,
+                base_seed=eval_base_seed,
+                is_actor_critic=True,
+                behavior_profile=profile,
+            )
+            per_profile[profile or "unconditioned"] = stats
+        eval_stats = {
+            key: float(np.mean([stats[key] for stats in per_profile.values()]))
+            for key in (
+                "mean_reward", "std_reward", "mean_length", "win_rate",
+                "mean_kills", "reward_ci95")
+        }
+        eval_stats["per_profile"] = per_profile
 
         self.writer.add_scalar("eval/mean_reward", eval_stats["mean_reward"], global_step)
         self.writer.add_scalar("eval/std_reward", eval_stats["std_reward"], global_step)
         self.writer.add_scalar("eval/win_rate", eval_stats["win_rate"], global_step)
         self.writer.add_scalar("eval/mean_kills", eval_stats["mean_kills"], global_step)
         self.writer.add_scalar("eval/mean_length", eval_stats["mean_length"], global_step)
+        for profile, stats in per_profile.items():
+            self.writer.add_scalar(
+                f"eval_profile/{profile}_win_rate", stats["win_rate"], global_step)
+            for metric, value in stats.get("behavior_metrics", {}).items():
+                self.writer.add_scalar(
+                    f"behavior/{profile}_{metric}", value, global_step)
 
         # Live correlation plot.
         self.eval_history.append(
@@ -296,7 +354,30 @@ class BaseTrainer(ABC):
             frame_stack=self.frame_stack,
             tier=self.tier,
             obs_normalizer=self.obs_normalizer,
+            extra_metadata=self._checkpoint_metadata(),
         )
+
+    def _checkpoint_metadata(self):
+        if not self.behavior_conditioned:
+            return {}
+        normalizer_hash = None
+        if self.obs_normalizer is not None:
+            payload = json.dumps(
+                self.obs_normalizer.state_dict(), sort_keys=True,
+                default=lambda value: np.asarray(value).tolist()).encode()
+            normalizer_hash = hashlib.sha256(payload).hexdigest()
+        return {
+            "model_type": "behavior_conditioned_actor_critic",
+            "behavior_conditioning_version": BEHAVIOR_CONDITIONING_VERSION,
+            "profile_schema": PROFILE_SCHEMA,
+            "supported_profiles": self.behavior_profiles,
+            "teacher_capacity": "large",
+            "teacher_feature_visibility": "full",
+            "teacher_action_availability": "full",
+            "mechanics_parity_version": "projectile_v2",
+            "observation_contract_version": "neural_obs_249_v1",
+            "normalizer_hash": normalizer_hash,
+        }
 
     def load_checkpoint(self, path: str) -> dict:
         """Load a checkpoint. Returns the raw checkpoint dict.
@@ -339,6 +420,9 @@ class BaseTrainer(ABC):
         print(f"Frame stack: {self.frame_stack}, "
               f"input size: {self.input_size}")
         print(f"Envs: {self.num_envs}")
+        if self.behavior_conditioned:
+            print(f"Behavior profiles: {', '.join(self.behavior_profiles)} "
+                  f"({PROFILE_SCHEMA}, training-only input)")
         print(f"Logs: {self.log_dir}")
 
     # ─── Helper function to be called per training event to log metrics

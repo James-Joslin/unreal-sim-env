@@ -38,6 +38,7 @@ from combat_policy import (
 )
 
 from training.methods import METHOD_REGISTRY, get_trainer_class
+from behavior_profiles import PROFILE_NAMES
 
 
 def main():
@@ -87,6 +88,10 @@ Examples:
     parser.add_argument(
         "--num_envs", type=int, default=6,
         help="Number of parallel environments")
+    parser.add_argument(
+        "--behavior_profiles", nargs="+", choices=PROFILE_NAMES, default=None,
+        help="Enable the training-only categorical teacher condition. "
+             "Start with: reactive tactical")
 
     # ── Curriculum mode ──────────────────────────────────────────
     parser.add_argument(
@@ -111,6 +116,11 @@ Examples:
         help="Distillation training epochs per tier")
 
     args = parser.parse_args()
+    if args.behavior_profiles and args.method != "ppo":
+        parser.error("Behavior conditioning is currently implemented for PPO")
+    if args.behavior_profiles and args.distill:
+        parser.error(
+            "Conditioned distillation is gated until the two-profile spike passes")
 
     # ── List methods ─────────────────────────────────────────────
     if args.list_methods:
@@ -146,6 +156,7 @@ Examples:
         bc_checkpoint=args.bc_checkpoint,
         output_dir=args.output_dir,
         total_timesteps=args.timesteps,
+        behavior_profiles=args.behavior_profiles,
     )
 
     if args.curriculum:
@@ -198,6 +209,15 @@ Examples:
 def _run_distillation(teacher_path, output_dir, frame_stack,
                       archetype, num_episodes, epochs):
     """Delegate to the distillation module."""
+    import torch
+
+    checkpoint = torch.load(
+        teacher_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("model_type") == "behavior_conditioned_actor_critic":
+        raise RuntimeError(
+            "Conditioned teacher distillation remains gated until the "
+            "Reactive/Tactical same-seed behavior spike passes")
+
     from training.distillation import run_distillation
     run_distillation(
         teacher_path=teacher_path,

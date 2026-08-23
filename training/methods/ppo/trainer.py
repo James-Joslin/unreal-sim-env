@@ -76,7 +76,8 @@ class PPOTrainer(BaseTrainer):
     def build_model(self) -> nn.Module:
         """Create ActorCritic and optimizer with isolated learning rates."""
         model = ActorCritic(
-            obs_size=self.input_size, tier=self.tier
+            obs_size=self.input_size, tier=self.tier,
+            behavior_conditioned=self.behavior_conditioned,
         ).to(self.device)
         
         # Group parameters: encoder, backbone, and GRU are representation
@@ -106,6 +107,11 @@ class PPOTrainer(BaseTrainer):
         Maps: actor_encoder → encoder, actor_backbone → backbone.
         Drops: critic_encoder, critic_backbone, value_head.
         """
+        if self.behavior_conditioned:
+            raise RuntimeError(
+                "A conditioned teacher cannot be exported as a production "
+                "policy. Bake a fixed profile through the gated distillation "
+                "path after the conditioning spike passes.")
         policy = make_policy(self.tier, frame_stack=self.frame_stack)
         policy_state = policy.state_dict()
 
@@ -257,6 +263,16 @@ class PPOTrainer(BaseTrainer):
             is_ppo_checkpoint = "full_state_dict" in ckpt
 
             if is_ppo_checkpoint:
+                checkpoint_conditioned = (
+                    ckpt.get("model_type") ==
+                    "behavior_conditioned_actor_critic")
+                if checkpoint_conditioned != self.behavior_conditioned:
+                    raise ValueError(
+                        "Cannot mix conditioned and unconditioned PPO checkpoints")
+                if checkpoint_conditioned and tuple(
+                        ckpt.get("supported_profiles", ())) != self.behavior_profiles:
+                    raise ValueError(
+                        "Checkpoint behavior-profile schema does not match this run")
                 ckpt_stage = ckpt.get("stage", self.stage)
                 is_stage_transition = (ckpt_stage != self.stage)
 
@@ -280,6 +296,10 @@ class PPOTrainer(BaseTrainer):
                       f"(stage {ckpt_stage}, "
                       f"step {ckpt.get('step', '?')})")
             else:
+                if self.behavior_conditioned:
+                    raise ValueError(
+                        "The initial conditioned Large teacher must be fresh; "
+                        "an unconditioned BC/PPO warm start is not supported")
                 self.model.load_from_ppo_checkpoint(self.bc_checkpoint)
                 print(f"Warm-started from BC checkpoint: "
                       f"{self.bc_checkpoint}")
@@ -320,12 +340,17 @@ class PPOTrainer(BaseTrainer):
         gru_hidden = getattr(self.model, 'gru_hidden', 0)
         buffer = VecRolloutBuffer(
             cfg.num_steps, self.num_envs, self.input_size,
-            gru_hidden=gru_hidden)
+            gru_hidden=gru_hidden,
+            behavior_condition_dim=(
+                self.model.behavior_condition_dim
+                if self.behavior_conditioned else 0))
 
         # ── Training state ───────────────────────────────────────
         obs, initial_infos = vec_env.reset()
         current_masks = self.extract_masks(initial_infos)
         current_skip_inference = self.extract_skip_inference(initial_infos)
+        current_behavior_conditions, current_profile_ids = \
+            self.extract_behavior_conditions(initial_infos)
         global_step = 0
         episode_count = 0
         scheduler_step = 0
@@ -367,7 +392,8 @@ class PPOTrainer(BaseTrainer):
                         self.device)
 
                     result = self.model.get_action_and_value(
-                        obs_t, masks=current_masks, hidden=hidden)
+                        obs_t, masks=current_masks, hidden=hidden,
+                        behavior_condition=current_behavior_conditions)
 
                     # GRU models return 5 values, non-GRU return 4.
                     if len(result) == 5:
@@ -404,7 +430,11 @@ class PPOTrainer(BaseTrainer):
                                 term_obs).float().unsqueeze(0).to(
                                     self.device)
                             term_val = self.model.get_value(
-                                term_t).cpu().item()
+                                term_t,
+                                behavior_condition=(
+                                    current_behavior_conditions[i:i + 1]
+                                    if current_behavior_conditions is not None
+                                    else None)).cpu().item()
                         rewards_normed[i] += cfg.gamma * term_val
 
                 buffer.obs[step] = obs_normed
@@ -419,6 +449,10 @@ class PPOTrainer(BaseTrainer):
                 buffer.m_masks[step] = current_masks[0].cpu().numpy()
                 buffer.c_masks[step] = current_masks[1].cpu().numpy()
                 buffer.t_masks[step] = current_masks[2].cpu().numpy()
+                if self.behavior_conditioned:
+                    buffer.behavior_conditions[step] = \
+                        current_behavior_conditions.cpu().numpy()
+                    buffer.behavior_profile_ids[step] = current_profile_ids
 
                 # Store auxiliary prediction labels from env infos.
                 for i in range(self.num_envs):
@@ -444,6 +478,8 @@ class PPOTrainer(BaseTrainer):
                 # Update masks for NEXT step from env infos.
                 current_masks = self.extract_masks(infos)
                 current_skip_inference = self.extract_skip_inference(infos)
+                current_behavior_conditions, current_profile_ids = \
+                    self.extract_behavior_conditions(infos)
 
                 ep_rewards += rewards
                 ep_lengths += 1
@@ -455,6 +491,9 @@ class PPOTrainer(BaseTrainer):
                                     "terminal_observation",
                                     "is_win",
                                     "target_move_label",
+                                    "behavior_profile_id",
+                                    "terminal_behavior_profile_id",
+                                    "squad_size_bucket",
                                 }:
                             ep_components[i][key] = \
                                 ep_components[i].get(key, 0.0) + val
@@ -499,7 +538,13 @@ class PPOTrainer(BaseTrainer):
             with torch.no_grad():
                 obs_t = torch.from_numpy(obs_normed).float().to(
                     self.device)
-                last_values = self.model.get_value(obs_t).cpu().numpy()
+                if self.behavior_conditioned:
+                    last_values = self.model.get_value(
+                        obs_t,
+                        behavior_condition=current_behavior_conditions
+                    ).cpu().numpy()
+                else:
+                    last_values = self.model.get_value(obs_t).cpu().numpy()
 
             buffer.compute_gae(last_values, cfg.gamma, cfg.gae_lambda)
 
@@ -559,11 +604,16 @@ class PPOTrainer(BaseTrainer):
                         # [batch, gru_hidden] → [1, batch, gru_hidden]
                         b_hidden = batch["hiddens"].to(
                             self.device).unsqueeze(0)
+                    b_behavior_condition = None
+                    if "behavior_conditions" in batch:
+                        b_behavior_condition = batch[
+                            "behavior_conditions"].to(self.device)
 
                     new_lp, (m_ent, c_ent, t_ent), new_val, pred_logits = \
                         self.model.evaluate_actions(
                             b_obs, b_m, b_c, b_t,
-                            masks=b_masks, hidden=b_hidden)
+                            masks=b_masks, hidden=b_hidden,
+                            behavior_condition=b_behavior_condition)
 
                     ratio = (new_lp - b_old_lp).exp()
                     pg_loss1 = -b_adv * ratio

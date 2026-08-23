@@ -21,6 +21,7 @@ from combat_sim import (  # noqa: E402
     SimProjectile,
     Target,
     WeaponSlot,
+    _sphere_sweep_aabb_t,
     make_curriculum_env,
 )
 from combat_extensions import (  # noqa: E402
@@ -29,6 +30,33 @@ from combat_extensions import (  # noqa: E402
     make_extended_curriculum_env,
 )
 from normalizers import ReturnNormalizer  # noqa: E402
+
+
+class SpatialSweepContractTests(unittest.TestCase):
+    def test_tangent_body_can_sweep_away_but_not_into_wall(self):
+        wall = Obstacle(0.0, 0.0, 50.0, 100.0)
+        touching = np.array([80.0, 0.0], dtype=np.float32)
+
+        self.assertIsNone(_sphere_sweep_aabb_t(
+            touching,
+            np.array([180.0, 0.0], dtype=np.float32),
+            wall,
+            30.0,
+        ))
+        self.assertEqual(_sphere_sweep_aabb_t(
+            touching,
+            np.array([-20.0, 0.0], dtype=np.float32),
+            wall,
+            30.0,
+        ), 0.0)
+
+        penetrating = np.array([79.9, 0.0], dtype=np.float32)
+        self.assertEqual(_sphere_sweep_aabb_t(
+            penetrating,
+            np.array([180.0, 0.0], dtype=np.float32),
+            wall,
+            30.0,
+        ), 0.0)
 
 
 class TargetActionSlotTests(unittest.TestCase):

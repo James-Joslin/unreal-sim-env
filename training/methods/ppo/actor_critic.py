@@ -19,6 +19,7 @@ from combat_policy import (
     TIER_CONFIGS, BEHAVIOR_TIER_DEFINITIONS, layer_init, resolve_tier,
     build_feature_visibility, StructuredEncoder, DeltaEncoder,
 )
+from behavior_profiles import BEHAVIOR_CONDITION_DIM
 
 TARGET_MOVE_CLASSES = 9  # stationary + 8 compass directions
 
@@ -42,7 +43,8 @@ class ActorCritic(nn.Module):
     The critic path: encoder → backbone → value_head (no GRU).
     """
 
-    def __init__(self, obs_size=OBS_SIZE, hidden=128, tier="large"):
+    def __init__(self, obs_size=OBS_SIZE, hidden=128, tier="large",
+                 behavior_conditioned=False):
         super().__init__()
         tier = resolve_tier(tier)
         cfg = TIER_CONFIGS[tier]
@@ -58,6 +60,9 @@ class ActorCritic(nn.Module):
         self.tier = tier
         self.backbone_hidden = backbone_hidden
         self.gru_hidden = gru_hidden
+        self.behavior_conditioned = bool(behavior_conditioned)
+        self.behavior_condition_dim = (
+            BEHAVIOR_CONDITION_DIM if self.behavior_conditioned else 0)
         self.register_buffer(
             "feature_visibility", build_feature_visibility(tier))
         behavior = BEHAVIOR_TIER_DEFINITIONS[tier]
@@ -78,7 +83,7 @@ class ActorCritic(nn.Module):
         self.critic_encoder = StructuredEncoder(entity_dim, unique_dim, attention_heads)
 
         channel_dim = self.actor_encoder.channel_dim
-        concat_dim = 3 * channel_dim
+        concat_dim = 3 * channel_dim + self.behavior_condition_dim
 
         # Backbones (separate).
         self.actor_backbone = _build_backbone(
@@ -122,10 +127,23 @@ class ActorCritic(nn.Module):
         emb_flat = encoder(channels_flat)
         return emb_flat.view(batch, 3 * encoder.channel_dim)
 
-    def _actor_features(self, obs, hidden):
+    def _append_behavior_condition(self, features, condition):
+        if not self.behavior_conditioned:
+            return features
+        if condition is None:
+            raise ValueError("Behavior-conditioned model requires a condition")
+        if condition.ndim != 2 or condition.shape != (
+                features.shape[0], self.behavior_condition_dim):
+            raise ValueError(
+                "Behavior condition must have shape "
+                f"[{features.shape[0]}, {self.behavior_condition_dim}]")
+        return torch.cat((features, condition.to(features.dtype)), dim=-1)
+
+    def _actor_features(self, obs, hidden, behavior_condition=None):
         """Encode through actor path + GRU. Returns (gru_output, new_hidden)."""
         backbone_out = self.actor_backbone(
-            self._encode(obs, self.actor_encoder))
+            self._append_behavior_condition(
+                self._encode(obs, self.actor_encoder), behavior_condition))
         gru_in = backbone_out.unsqueeze(1)
         gru_out, hidden_out = self.gru(gru_in, hidden)
         return gru_out.squeeze(1), hidden_out
@@ -141,14 +159,17 @@ class ActorCritic(nn.Module):
 
     # ─── get_action_and_value (training rollout) ─────────────────
 
-    def get_action_and_value(self, obs, masks=None, hidden=None):
+    def get_action_and_value(self, obs, masks=None, hidden=None,
+                             behavior_condition=None):
         batch = obs.shape[0]
         if hidden is None:
             hidden = self.init_hidden(batch, obs.device)
 
-        actor_feat, hidden_out = self._actor_features(obs, hidden)
+        actor_feat, hidden_out = self._actor_features(
+            obs, hidden, behavior_condition)
         critic_feat = self.critic_backbone(
-            self._encode(obs, self.critic_encoder))
+            self._append_behavior_condition(
+                self._encode(obs, self.critic_encoder), behavior_condition))
 
         m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
         if masks is not None:
@@ -171,14 +192,16 @@ class ActorCritic(nn.Module):
     # ─── evaluate_actions (PPO update) ───────────────────────────
 
     def evaluate_actions(self, obs, m_act, c_act, t_act,
-                         masks=None, hidden=None):
+                         masks=None, hidden=None, behavior_condition=None):
         batch = obs.shape[0]
         if hidden is None:
             hidden = self.init_hidden(batch, obs.device)
 
-        actor_feat, _ = self._actor_features(obs, hidden)
+        actor_feat, _ = self._actor_features(
+            obs, hidden, behavior_condition)
         critic_feat = self.critic_backbone(
-            self._encode(obs, self.critic_encoder))
+            self._append_behavior_condition(
+                self._encode(obs, self.critic_encoder), behavior_condition))
 
         m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
 
@@ -201,12 +224,13 @@ class ActorCritic(nn.Module):
 
     # ─── select_actions (eval — masked independent argmax) ───────
 
-    def select_actions(self, obs, masks, hidden=None):
+    def select_actions(self, obs, masks, hidden=None, behavior_condition=None):
         batch = obs.shape[0]
         if hidden is None:
             hidden = self.init_hidden(batch, obs.device)
 
-        actor_feat, hidden_out = self._actor_features(obs, hidden)
+        actor_feat, hidden_out = self._actor_features(
+            obs, hidden, behavior_condition)
         m_mask, c_mask, t_mask = masks
 
         m_logits, c_logits, t_logits = self._policy_logits(actor_feat)
@@ -220,9 +244,10 @@ class ActorCritic(nn.Module):
             hidden_out,
         )
 
-    def get_value(self, obs):
+    def get_value(self, obs, behavior_condition=None):
         critic_feat = self.critic_backbone(
-            self._encode(obs, self.critic_encoder))
+            self._append_behavior_condition(
+                self._encode(obs, self.critic_encoder), behavior_condition))
         return self.value_head(critic_feat).squeeze(-1)
 
     # ─── Checkpoint loading ──────────────────────────────────────
