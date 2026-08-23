@@ -5,6 +5,7 @@ import { ActionProbabilityHeatmap } from "./components/ActionProbabilityHeatmap"
 import { ObservationGroupInspector } from "./components/ObservationGroupInspector";
 import { RewardBudgetBar } from "./components/RewardBudgetBar";
 import { BatchEpisodeRunner, EpisodeResult, BatchResults } from "./components/BatchEpisodeRunner";
+import { movementIndexToWorldDir, sweepAabbT } from "./simParity";
 
 // Configure WASM paths for onnxruntime-web
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
@@ -20,7 +21,6 @@ const TARGET_ACTIONS = 5;
 const DT = 0.2; // decision interval
 const PHYSICS_DT = 1 / 60;
 const S = 0.7071067811865476; // 1/√2
-const MOVE_DIRS = [[0, 0], [0, -1], [S, -S], [1, 0], [S, S], [0, 1], [-S, S], [-1, 0], [-S, -S]];
 const SPATIAL_ANGLES = [0, 45, 90, 135, 180, 225, 270, 315];
 const LOCK_NAMES = ["", "Firing", "Reloading", "Dodging", "Melee", "Switching", "WindUp", "Repositioning"];
 const COMBAT_NAMES = ["None", "Fire", "Reload", "Sw0", "Sw1", "Melee", "Block", "Dodge", "Reposition"];
@@ -201,6 +201,9 @@ export interface AgentState {
   lockReason: number;
   combatTime: number;
   maxSpeed: number;
+  maxAcceleration: number;
+  brakingDeceleration: number;
+  movementDir: [number, number];
   spawnPos: [number, number];
   leashRange: number;
   activeTargetIdx: number;
@@ -336,15 +339,132 @@ function pushOutAABB(pos: [number, number], obstacles: Obstacle[], radius = 20):
     const cx = clamp(pos[0], o.x - o.hw, o.x + o.hw);
     const cy = clamp(pos[1], o.y - o.hh, o.y + o.hh);
     const dx = pos[0] - cx, dy = pos[1] - cy;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (d < radius && d > 0.01) {
-      pos[0] = cx + dx / d * radius;
-      pos[1] = cy + dy / d * radius;
-    } else if (d < 0.01) {
-      pos[0] = o.x + o.hw + radius;
+    if (dx * dx + dy * dy >= radius * radius) continue;
+
+    // Match Python Obstacle.push_out_circle: leave along the nearest
+    // face of the body-radius-expanded box so movement can slide on walls.
+    const expandedHw = o.hw + radius;
+    const expandedHh = o.hh + radius;
+    const centreDx = pos[0] - o.x;
+    const centreDy = pos[1] - o.y;
+    const penetrationX = expandedHw - Math.abs(centreDx);
+    const penetrationY = expandedHh - Math.abs(centreDy);
+    if (penetrationX < penetrationY) {
+      pos[0] = o.x + expandedHw * (centreDx > 0 ? 1 : -1);
+    } else {
+      pos[1] = o.y + expandedHh * (centreDy > 0 ? 1 : -1);
     }
   }
   return pos;
+}
+
+function isDodgeDirectionClear(pos: [number, number], direction: [number, number], obstacles: Obstacle[]): boolean {
+  const traceDistance = 300;
+  return !obstacles.some(o => rayAABB(
+    pos[0], pos[1], direction[0] * traceDistance, direction[1] * traceDistance,
+    o.x, o.y, o.hw, o.hh,
+  ) !== null);
+}
+
+function resolveDodgeDirection(sim: SimState, moveIndex: number, target?: Target): [number, number] | null {
+  const ag = sim.agent;
+  let direction = movementIndexToWorldDir(
+    moveIndex, ag.pos, target?.alive ? target.pos : null, ag.facing,
+  );
+
+  if (Math.hypot(direction[0], direction[1]) <= 0.01) {
+    let bestTta = Infinity;
+    let bestVelocity: [number, number] | null = null;
+    for (const projectile of sim.projectiles) {
+      if (projectile.isAgent) continue;
+      const speed = Math.hypot(projectile.vel[0], projectile.vel[1]);
+      const toAgent: [number, number] = [ag.pos[0] - projectile.pos[0], ag.pos[1] - projectile.pos[1]];
+      const distance = Math.hypot(toAgent[0], toAgent[1]);
+      if (speed <= 1e-8 || distance <= 1e-8) continue;
+      const incomingDot = dot(
+        [projectile.vel[0] / speed, projectile.vel[1] / speed],
+        [toAgent[0] / distance, toAgent[1] / distance],
+      );
+      const tta = distance / speed;
+      if (incomingDot >= 0.5 && tta < bestTta) {
+        bestTta = tta;
+        bestVelocity = [projectile.vel[0] / speed, projectile.vel[1] / speed];
+      }
+    }
+
+    if (bestVelocity) {
+      direction = [bestVelocity[1], -bestVelocity[0]];
+      if (target?.alive) {
+        const away = norm([ag.pos[0] - target.pos[0], ag.pos[1] - target.pos[1]]);
+        if (dot(direction, away) < 0) direction = [-direction[0], -direction[1]];
+      }
+    }
+  }
+
+  if (Math.hypot(direction[0], direction[1]) <= 0.01 && target?.alive) {
+    direction = norm([ag.pos[0] - target.pos[0], ag.pos[1] - target.pos[1]]);
+  }
+  if (Math.hypot(direction[0], direction[1]) <= 0.01) {
+    direction = [-ag.facing[0], -ag.facing[1]];
+  }
+
+  const length = Math.hypot(direction[0], direction[1]);
+  if (length <= 1e-8) return null;
+  direction = [direction[0] / length, direction[1] / length];
+  const left: [number, number] = [direction[1], -direction[0]];
+  for (const candidate of [direction, left, [-left[0], -left[1]] as [number, number]]) {
+    if (isDodgeDirectionClear(ag.pos, candidate, sim.obstacles)) return candidate;
+  }
+  return null;
+}
+
+function accelerateVelocity(
+  current: [number, number], desired: [number, number],
+  maxAcceleration: number, brakingDeceleration: number, maxSpeed: number, dt: number,
+): [number, number] {
+  const diff: [number, number] = [desired[0] - current[0], desired[1] - current[1]];
+  const diffMagnitude = Math.hypot(diff[0], diff[1]);
+  if (diffMagnitude < 0.01) return desired;
+
+  const currentSpeed = Math.hypot(current[0], current[1]);
+  const desiredSpeed = Math.hypot(desired[0], desired[1]);
+  const acceleration = desiredSpeed < 1 || desiredSpeed < currentSpeed
+    ? brakingDeceleration
+    : maxAcceleration;
+  const maxChange = acceleration * dt;
+  let result: [number, number] = diffMagnitude <= maxChange
+    ? desired
+    : [current[0] + diff[0] / diffMagnitude * maxChange, current[1] + diff[1] / diffMagnitude * maxChange];
+
+  const speed = Math.hypot(result[0], result[1]);
+  if (speed > maxSpeed) result = [result[0] / speed * maxSpeed, result[1] / speed * maxSpeed];
+  return result;
+}
+
+function advanceAgentCollision(ag: AgentState, obstacles: Obstacle[], half: number, dt: number) {
+  const start: [number, number] = [ag.pos[0], ag.pos[1]];
+  const totalDelta: [number, number] = [ag.vel[0] * dt, ag.vel[1] * dt];
+  const moveDistance = Math.hypot(totalDelta[0], totalDelta[1]);
+  const substeps = Math.max(1, Math.ceil(moveDistance / (AGENT_BODY_RADIUS * 0.9)));
+  const step: [number, number] = [totalDelta[0] / substeps, totalDelta[1] / substeps];
+  const effectiveHalf = half - AGENT_BODY_RADIUS;
+
+  for (let i = 0; i < substeps; i++) {
+    ag.pos[0] = clamp(ag.pos[0] + step[0], -effectiveHalf, effectiveHalf);
+    ag.pos[1] = clamp(ag.pos[1] + step[1], -effectiveHalf, effectiveHalf);
+    pushOutAABB(ag.pos, obstacles, AGENT_BODY_RADIUS);
+    ag.pos[0] = clamp(ag.pos[0], -effectiveHalf, effectiveHalf);
+    ag.pos[1] = clamp(ag.pos[1], -effectiveHalf, effectiveHalf);
+  }
+
+  const intended: [number, number] = [start[0] + totalDelta[0], start[1] + totalDelta[1]];
+  const pushed: [number, number] = [ag.pos[0] - intended[0], ag.pos[1] - intended[1]];
+  const pushMagnitude = Math.hypot(pushed[0], pushed[1]);
+  if (pushMagnitude > 0.1) {
+    const wallNormal: [number, number] = [pushed[0] / pushMagnitude, pushed[1] / pushMagnitude];
+    const intoWall = dot(ag.vel, wallNormal);
+    ag.vel = [ag.vel[0] - wallNormal[0] * intoWall, ag.vel[1] - wallNormal[1] * intoWall];
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -429,7 +549,8 @@ function createSim(presetName: string = "heavy", arenaSize = 2500, numTargets = 
       isSwitching: false, switchRemain: 0, switchTarget: 0, switchTime: 0.2,
       isWindingUp: false, windUpRemain: 0, pendingFire: null,
       lockRemain: 0, lockDuration: 0, lockReason: 0, combatTime: 0,
-      maxSpeed: 450, spawnPos: [0, 0], leashRange: 2000,
+      maxSpeed: 450, maxAcceleration: 2048, brakingDeceleration: 2048,
+      movementDir: [0, 0], spawnPos: [0, 0], leashRange: 2000,
       activeTargetIdx: 0,
       cachedMovementAction: 0,
       archetype: archetype || (presetName === "tank" ? "tank" : presetName === "scout" ? "melee" : "ranged"),
@@ -549,28 +670,38 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
     }
   }
 
-  // Agent movement
+  // Agent movement. The movement head is target-relative in C++/Python;
+  // cache its world direction on the decision pulse and sustain it at 60 Hz.
+  const target = sim.targets[clamp(ag.activeTargetIdx, 0, sim.targets.length - 1)];
   const isLocked = ag.lockRemain > 0;
-  if (decisionPulse && !isLocked) ag.cachedMovementAction = mIdx;
+  if (decisionPulse && !isLocked) {
+    ag.cachedMovementAction = mIdx;
+    ag.movementDir = movementIndexToWorldDir(
+      mIdx, ag.pos, target?.alive ? target.pos : null, ag.facing,
+    );
+  }
   ag.isBlocking = !isLocked && cIdx === 6;
   if (decisionPulse && !isLocked && cIdx === 7 && ag.dodgeCd <= 0) {
-    const requested = MOVE_DIRS[mIdx] || [0, 0];
-    ag.dodgeDir = requested[0] || requested[1] ? [requested[0], requested[1]] : [-ag.facing[0], -ag.facing[1]];
-    ag.dodgeStartPos = [ag.pos[0], ag.pos[1]];
-    ag.dodgeEndPos = [ag.pos[0] + ag.dodgeDir[0] * ag.dodgeDistance, ag.pos[1] + ag.dodgeDir[1] * ag.dodgeDistance];
-    ag.isDodging = true; ag.dodgeElapsed = 0; ag.dodgeRemain = ag.dodgeDuration;
-    setLock(ag, ag.dodgeDuration, 3);
+    const dodgeDirection = resolveDodgeDirection(sim, mIdx, target);
+    if (dodgeDirection) {
+      ag.dodgeDir = dodgeDirection;
+      ag.dodgeStartPos = [ag.pos[0], ag.pos[1]];
+      ag.dodgeEndPos = [ag.pos[0] + ag.dodgeDir[0] * ag.dodgeDistance, ag.pos[1] + ag.dodgeDir[1] * ag.dodgeDistance];
+      ag.isDodging = true; ag.dodgeElapsed = 0; ag.dodgeRemain = ag.dodgeDuration;
+      ag.cachedMovementAction = 0;
+      ag.movementDir = [0, 0];
+      setLock(ag, ag.dodgeDuration + 0.1, 3);
+    }
   } else if (decisionPulse && !isLocked && cIdx === 8 && ag.repositionCd <= 0) {
-    const requested = MOVE_DIRS[mIdx] || [0, 0];
-    ag.dodgeDir = requested[0] || requested[1] ? [requested[0], requested[1]] : [-ag.facing[0], -ag.facing[1]];
-    ag.isRepositioning = true; ag.repositionRemain = ag.repositionDuration; ag.repositionCd = ag.repositionCooldown;
-    setLock(ag, ag.repositionDuration, 7);
+    // Reposition + Stay is a production no-op: no invented backward move,
+    // no cooldown, and no lock.
+    if (Math.hypot(ag.movementDir[0], ag.movementDir[1]) > 0.01) {
+      ag.dodgeDir = [ag.movementDir[0], ag.movementDir[1]];
+      ag.isRepositioning = true; ag.repositionRemain = ag.repositionDuration; ag.repositionCd = ag.repositionCooldown;
+      setLock(ag, ag.repositionDuration, 7);
+    }
   }
-  if (!isLocked && !ag.isDodging && !ag.isSwitching) {
-    const dir = MOVE_DIRS[mIdx] || [0, 0];
-    ag.vel = [dir[0] * ag.maxSpeed, dir[1] * ag.maxSpeed];
-  }
-  if (ag.isBlocking) ag.vel = [ag.vel[0] * ag.blockMoveMultiplier, ag.vel[1] * ag.blockMoveMultiplier];
+
   let dodgeOwnsMotion = false;
   if (ag.isDodging) {
     const oldPos: [number, number] = [ag.pos[0], ag.pos[1]];
@@ -584,7 +715,7 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
     let hitT = 1;
     const sweepX = desired[0] - oldPos[0], sweepY = desired[1] - oldPos[1];
     for (const o of sim.obstacles) {
-      const candidate = rayAABB(oldPos[0], oldPos[1], sweepX, sweepY, o.x, o.y, o.hw + AGENT_BODY_RADIUS, o.hh + AGENT_BODY_RADIUS);
+      const candidate = sweepAabbT(oldPos[0], oldPos[1], sweepX, sweepY, o.x, o.y, o.hw + AGENT_BODY_RADIUS, o.hh + AGENT_BODY_RADIUS);
       if (candidate !== null) hitT = Math.min(hitT, candidate);
     }
     ag.pos = hitT < 1
@@ -597,19 +728,23 @@ function tickSim(sim: SimState, action: [number, number, number], playerPos: [nu
     ag.dodgeRemain = Math.max(0, ag.dodgeDuration - ag.dodgeElapsed);
     if (ag.dodgeRemain <= 0) { ag.isDodging = false; ag.dodgeCd = ag.dodgeCooldown; }
     dodgeOwnsMotion = true;
-  } else if (ag.isRepositioning) {
-    ag.vel = [ag.dodgeDir[0] * ag.maxSpeed * ag.repositionSpeedMultiplier, ag.dodgeDir[1] * ag.maxSpeed * ag.repositionSpeedMultiplier];
   }
 
   if (!dodgeOwnsMotion) {
-    ag.pos[0] += ag.vel[0] * dt;
-    ag.pos[1] += ag.vel[1] * dt;
+    let movementMaxSpeed = ag.maxSpeed;
+    if (ag.isBlocking) movementMaxSpeed *= ag.blockMoveMultiplier;
+    if (ag.isRepositioning) movementMaxSpeed *= ag.repositionSpeedMultiplier;
+    const desiredVelocity: [number, number] = [
+      ag.movementDir[0] * movementMaxSpeed,
+      ag.movementDir[1] * movementMaxSpeed,
+    ];
+    ag.vel = accelerateVelocity(
+      ag.vel, desiredVelocity, ag.maxAcceleration,
+      ag.brakingDeceleration, movementMaxSpeed, dt,
+    );
+    advanceAgentCollision(ag, sim.obstacles, half, dt);
   }
-  ag.pos[0] = clamp(ag.pos[0], -half, half);
-  ag.pos[1] = clamp(ag.pos[1], -half, half);
-  pushOutAABB(ag.pos, sim.obstacles, 20);
 
-  const target = sim.targets[clamp(ag.activeTargetIdx, 0, sim.targets.length - 1)];
   if (target?.alive) {
     const d = dist(ag.pos, target.pos);
     if (d > 1) ag.facing = norm([target.pos[0] - ag.pos[0], target.pos[1] - ag.pos[1]]);
@@ -1451,7 +1586,7 @@ function buildObservation(
     const dx = Math.cos(rad) * 1500, dy = Math.sin(rad) * 1500;
     let minT = 1.0;
     for (const o of sim.obstacles) {
-      const t = rayAABB(ag.pos[0], ag.pos[1], dx, dy, o.x, o.y, o.hw + AGENT_BODY_RADIUS, o.hh + AGENT_BODY_RADIUS);
+      const t = sweepAabbT(ag.pos[0], ag.pos[1], dx, dy, o.x, o.y, o.hw + AGENT_BODY_RADIUS, o.hh + AGENT_BODY_RADIUS);
       if (t !== null && t < minT) minT = t;
     }
     const effectiveHalf = sim.half - AGENT_BODY_RADIUS;
@@ -2313,7 +2448,7 @@ export default function CombatSandbox() {
     const maxEpSteps = 400;
 
     for (let ep = 0; ep < n; ep++) {
-      const sim = createSim(preset, numTargets, numObs, arenaSize, archetype);
+      const sim = createSim(preset, arenaSize, numTargets, numObs, archetype);
       const fs = createFrameStack(model.frameStack);
       let hidden = new Float32Array(model.hiddenSize);
       const prevVelMap: Record<number, [number, number]> = {};
@@ -2613,7 +2748,8 @@ function scriptedAI(sim: SimState, playerPos: [number, number]): [number, number
   const moveDir: [number, number] = [toT[0] * approach * 0.6 + perpDir[0] * 0.4, toT[1] * approach * 0.6 + perpDir[1] * 0.4];
   let bestDot = -2;
   for (let i = 0; i < 9; i++) {
-    const dd = dot(MOVE_DIRS[i] as [number, number], norm(moveDir));
+    const candidate = movementIndexToWorldDir(i, ag.pos, t.pos, ag.facing);
+    const dd = dot(candidate, norm(moveDir));
     if (dd > bestDot) { bestDot = dd; mIdx = i; }
   }
 
