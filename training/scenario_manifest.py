@@ -52,7 +52,7 @@ def generate_scenario_manifest(
     manifest = {"schema": "behavior_scenarios_v1",
                 "train": [], "validation": [], "test": []}
     for stage in stages:
-        squads = (1, 2, 3, 4) if int(stage) == 7 else (0,)
+        squads = (1, 2, 3, 4) if int(stage) == 7 else (1,)
         for archetype in archetypes:
             for loadout in loadouts:
                 for squad in squads:
