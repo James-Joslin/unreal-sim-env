@@ -2,6 +2,172 @@
 
 Reinforcement-learning combat AI for Unreal Engine encounters. The agent is trained in a fast Python/Gymnasium simulation, evaluated through deterministic seeded scenarios, distilled into multiple ONNX deployment tiers, and then consumed by the UE/C++ runtime.
 
+## Command Runbook — Run in This Order
+
+The commands below are the current end-to-end workflow. This machine is CPU-only: the smoke tests and evaluation commands are deliberately bounded, while full curriculum training can take a long time. Run all commands from the repository root.
+
+### 1. Install and validate the Python environment
+
+```bash
+# Install the Python training and test dependencies.
+python -m pip install -r requirements-dev.txt
+
+# Required for CPU evaluation of the existing ONNX deployment models.
+python -m pip install onnxruntime
+
+# Verify mechanics, policy contracts, conditioning, manifests and evaluation.
+python -m pytest \
+  test/test_contracts.py \
+  test/test_behavior_conditioning.py \
+  test/test_policy_contract.py \
+  test/test_manifest_evaluation.py
+```
+
+### 2. Generate the frozen scenario manifest
+
+```bash
+# Creates stratified train/validation/test scenario identities. Generate this
+# once for an experiment; do not regenerate it while comparing candidates.
+python -m training.scenario_manifest \
+  --output scenario_manifest_v1.json \
+  --scenarios_per_cell 20
+```
+
+The final-test split must remain untouched until the teacher and student choices are final. Use `validation` for the gates below.
+
+### 3. Record the existing ONNX students as the baseline control
+
+```bash
+# CPU evaluation of all existing deployment tiers. Each manifest scenario is
+# forced to use its recorded loadout and Stage-7 squad-size bucket.
+python -m training.manifest_evaluation \
+  --manifest scenario_manifest_v1.json \
+  --split validation \
+  --model large=models/Combat_Large.onnx \
+  --model medium=models/Combat_Medium.onnx \
+  --model small=models/Combat_Small.onnx \
+  --model micro=models/Combat_Micro.onnx \
+  --action_seeds 0 1 2 \
+  --output_dir evaluation/baseline_students_v1
+```
+
+For a quick CPU plumbing check, append `--max_scenarios 2 --action_seeds 0`. This is not enough evidence for a behavior gate.
+
+### 4. Smoke-test the two-profile conditioned teacher
+
+```bash
+# Short CPU-only plumbing run. It checks rollout storage, profile lifecycle,
+# checkpointing and optimization; it does not establish behavior separation.
+python -m training.main \
+  --method ppo \
+  --stage 4 \
+  --tier large \
+  --num_envs 2 \
+  --timesteps 20000 \
+  --behavior_profiles reactive tactical \
+  --output_dir checkpoints/conditioned_rt_smoke
+```
+
+### 5. Train the real Reactive/Tactical teacher
+
+```bash
+# Fresh seven-stage conditioned teacher. Do not pass --bc_checkpoint or any
+# distillation option. On CPU this is a long-running experiment.
+python -m training.main \
+  --method ppo \
+  --curriculum \
+  --tier large \
+  --num_envs 4 \
+  --behavior_profiles reactive tactical \
+  --output_dir checkpoints/conditioned_rt_v1
+```
+
+`--timesteps` is ignored with `--curriculum`; use the single-stage command above for bounded smoke tests. Resume/warm-start behavior must not be used to seed this fresh conditioned teacher from an unconditioned checkpoint.
+
+### 6. Evaluate and gate the two-profile teacher
+
+```bash
+# Greedy plus three reproducible stochastic action seeds on identical
+# validation scenarios for both profiles.
+python -m training.manifest_evaluation \
+  --manifest scenario_manifest_v1.json \
+  --split validation \
+  --model rt_teacher=checkpoints/conditioned_rt_v1/ppo_stage7_best.pt \
+  --profiles reactive tactical \
+  --action_seeds 0 1 2 \
+  --output_dir evaluation/conditioned_rt_v1
+```
+
+Inspect `results.json` and `episodes.csv`. Proceed only if Reactive and Tactical both retain objective competence and show consistent same-scenario separation in raw Heavy and Scout telemetry. Reward totals alone do not pass the gate.
+
+### 7. Smoke-test all four profiles — Milestone 3 start
+
+```bash
+# Run only after the Reactive/Tactical gate passes. This is a bounded CPU
+# plumbing test for the four categorical conditions, not an accepted teacher.
+python -m training.main \
+  --method ppo \
+  --stage 4 \
+  --tier large \
+  --num_envs 2 \
+  --timesteps 20000 \
+  --behavior_profiles reactive competent tactical advanced \
+  --output_dir checkpoints/conditioned_four_smoke
+```
+
+### 8. Train the four-profile teacher — Milestone 3
+
+```bash
+# Full fresh curriculum run. Add and gate one measurable profile distinction at
+# a time; do not initialize from an unconditioned checkpoint.
+python -m training.main \
+  --method ppo \
+  --curriculum \
+  --tier large \
+  --num_envs 4 \
+  --behavior_profiles reactive competent tactical advanced \
+  --output_dir checkpoints/conditioned_four_v1
+```
+
+### 9. Evaluate the four-profile teacher
+
+```bash
+# Produces episode telemetry, per-cell/overall/equal-cell summaries, paired
+# profile deltas and 95% confidence intervals on CPU.
+python -m training.manifest_evaluation \
+  --manifest scenario_manifest_v1.json \
+  --split validation \
+  --model four_teacher=checkpoints/conditioned_four_v1/ppo_stage7_best.pt \
+  --profiles reactive competent tactical advanced \
+  --action_seeds 0 1 2 \
+  --output_dir evaluation/conditioned_four_v1
+```
+
+Do not use the final-test split for iterative tuning. Milestone 3 is complete only when all four profiles pass objective guardrails, remain behaviorally distinct, and express those differences appropriately across required loadouts and archetypes.
+
+### 10. Stop before Milestone 4 distillation
+
+Conditioned reference-student distillation is not implemented or authorized yet. The existing commands below are valid only for the older unconditioned pipeline and must not be run on a behavior-conditioned checkpoint:
+
+```bash
+# Legacy/unconditioned training followed by standard distillation.
+python -m training.main --method ppo --curriculum --distill
+
+# Legacy/unconditioned distillation from an existing teacher.
+python -m training.main \
+  --distill_only \
+  --teacher checkpoints/ppo_stage7_best.pt
+
+# Legacy/unconditioned amplified distillation.
+python -m training.distillation \
+  --teacher checkpoints/ppo_stage7_best.pt \
+  --mode amplified \
+  --rollouts 16 \
+  --top_k 0.25
+```
+
+Milestone 4 begins by implementing fixed-profile, target-contract-aware reference-student dataset generation and direct distillation after the four-profile teacher passes its gate.
+
 The current pipeline is centred around the modular `training.main` CLI and a PPO implementation backed by shared training infrastructure.
 
 ## What This Project Contains
@@ -13,31 +179,26 @@ The current pipeline is centred around the modular `training.main` CLI and a PPO
 - **Distillation + ONNX export** — standard logit matching or amplified best-of-N distillation into Micro, Small, Medium and Large tiers.
 - **Browser testing tool** — optional web-based debugging for ONNX inference, observation inspection and reward/action visualisation.
 
-## Quick Start
+## Optional Inspection Commands
 
 ```bash
-# Train a single curriculum stage with PPO
-python -m training.main --method ppo --stage 3 --tier large
+# Render a trained PyTorch checkpoint to video.
+python simulation/view_sim.py \
+  --stage 3 \
+  --model checkpoints/ppo_stage3_best.pt \
+  --render video
 
-# Run the full 7-stage curriculum
-python -m training.main --method ppo --curriculum
+# Render an ONNX deployment model to video using CPU inference.
+python simulation/view_sim.py \
+  --stage 3 \
+  --model models/Combat_Large.onnx \
+  --render video
 
-# Train through curriculum, then distill/export ONNX tiers
-python -m training.main --method ppo --curriculum --distill
-
-# Distill from an existing PPO checkpoint
-python -m training.main --distill_only --teacher checkpoints/ppo_stage7_best.pt
-
-# Amplified distillation directly from the distillation module
-python -m training.distillation --teacher checkpoints/ppo_stage7_best.pt \
-    --mode amplified --rollouts 16 --top_k 0.25
-
-# Visualise a trained checkpoint or ONNX model
-python simulation/view_sim.py --stage 3 --model checkpoints/ppo_best.pt --render video
-python simulation/view_sim.py --stage 3 --model models/v1/Combat_Large.onnx --render video
+# Inspect training curves while a run is active.
+python -m tensorboard.main --logdir runs
 ```
 
-See [`UPDATED_quickstart.md`](docs/quickstart.md) for dependencies, CLI notes and common commands.
+See [`UPDATED_quickstart.md`](docs/quickstart.md) for additional setup and CLI notes.
 
 ## Observation and Action Model
 
