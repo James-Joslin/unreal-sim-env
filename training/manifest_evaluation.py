@@ -172,17 +172,27 @@ def summarize(episodes):
     for row in episodes:
         key = (row["model"], row["scenario_id"], row["mode"], row["action_seed"])
         by_pair_key[key][row["profile"]] = row
-    for left_index, left in enumerate(profiles):
-        for right in profiles[left_index + 1:]:
-            matches = [pair for pair in by_pair_key.values()
-                       if left in pair and right in pair]
-            if not matches:
-                continue
-            entry = {"model": matches[0][left]["model"], "left": left, "right": right, "metrics": {}}
-            for metric in CORE_METRICS:
-                entry["metrics"][metric] = _mean_ci(
-                    [pair[right][metric] - pair[left][metric] for pair in matches])
-            paired.append(entry)
+    models = sorted({row["model"] for row in episodes})
+    for model in models:
+        for left_index, left in enumerate(profiles):
+            for right in profiles[left_index + 1:]:
+                matches = [
+                    pair for pair in by_pair_key.values()
+                    if left in pair and right in pair
+                    and pair[left]["model"] == model
+                ]
+                if not matches:
+                    continue
+                entry = {
+                    "model": model, "left": left, "right": right,
+                    "metrics": {},
+                }
+                for metric in CORE_METRICS:
+                    entry["metrics"][metric] = _mean_ci([
+                        pair[right][metric] - pair[left][metric]
+                        for pair in matches
+                    ])
+                paired.append(entry)
     aggregate_groups = defaultdict(list)
     for row in episodes:
         aggregate_groups[(row["model"], row["profile"], row["mode"])].append(row)
