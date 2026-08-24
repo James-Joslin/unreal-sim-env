@@ -232,7 +232,7 @@ def evaluate_manifest(manifest, split, model_specs, profiles, action_seeds,
         for profile in policy_profiles:
             for scenario in scenarios:
                 for greedy, seed in modes:
-                    episodes.append(run_episode(policy, scenario, profile, seed, greedy))
+                    episodes.append(run_episode(policy, label, scenario, profile, seed, greedy))
     return episodes, summarize(episodes)
 
 def _parse_model(value):
