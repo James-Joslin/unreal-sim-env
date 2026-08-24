@@ -171,6 +171,18 @@ class ProfileLifecycleTests(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "PyTorch is required for conditioning tests")
 class ConditionedModelTests(unittest.TestCase):
+    def test_single_frame_conditioned_model_uses_zero_temporal_deltas(self):
+        model = ActorCritic(
+            obs_size=249, tier="large", behavior_conditioned=True).eval()
+        obs = torch.randn(2, 249)
+
+        with torch.no_grad():
+            deltas = model.delta(obs)
+
+        self.assertTrue(torch.equal(deltas[:, 0], obs))
+        self.assertTrue(torch.equal(deltas[:, 1], torch.zeros_like(obs)))
+        self.assertTrue(torch.equal(deltas[:, 2], torch.zeros_like(obs)))
+
     def test_actor_and_critic_receive_direct_four_value_condition(self):
         model = ActorCritic(
             obs_size=249, tier="large", behavior_conditioned=True).eval()

@@ -551,6 +551,8 @@ class DeltaEncoder(nn.Module):
 
     def __init__(self, frame_stack: int = 3):
         super().__init__()
+        if frame_stack < 1:
+            raise ValueError("frame_stack must be at least 1")
         self.frame_stack = frame_stack
         self.obs_size = OBS_SIZE
 
@@ -559,6 +561,15 @@ class DeltaEncoder(nn.Module):
 
         # Reshape: [batch, N*249] → [batch, N, 249]
         frames = flat_obs.view(batch, self.frame_stack, self.obs_size)
+
+        # Repeat the oldest available frame when fewer than three frames were
+        # requested. This matches reset-time frame-stack padding and keeps the
+        # three output channels stable for every supported frame_stack value.
+        if self.frame_stack < 3:
+            frames = torch.cat(
+                (frames[:, :1].expand(-1, 3 - self.frame_stack, -1), frames),
+                dim=1,
+            )
 
         # Delta encoding. Frames are oldest-first: [t-2, t-1, t].
         current = frames[:, -1]                                         # t
